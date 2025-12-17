@@ -22,6 +22,7 @@ class DSLVerificationResult:
     dsl_code: Optional[str] = None
     parsed_ast: Optional[Any] = None
     error: Optional[str] = None
+    rejection_reason: Optional[str] = None  # Human-readable explanation for UNSAT
 
 
 class DSLLogicVerifier:
@@ -120,10 +121,13 @@ class DSLLogicVerifier:
                     parsed_ast=ast
                 )
             elif result == unsat:
+                # Generate human-readable rejection reason
+                rejection_reason = self._explain_unsat(dsl_code, ast)
                 return DSLVerificationResult(
                     status="UNSAT",
                     dsl_code=dsl_code,
-                    parsed_ast=ast
+                    parsed_ast=ast,
+                    rejection_reason=rejection_reason
                 )
             else:
                 return DSLVerificationResult(
@@ -140,6 +144,132 @@ class DSLLogicVerifier:
                 dsl_code=dsl_code,
                 parsed_ast=ast
             )
+    
+    def _explain_unsat(self, dsl_code: str, ast: Any) -> str:
+        """
+        Generate a human-readable explanation for why constraints are unsatisfiable.
+        
+        This analyzes the AST to identify conflicting constraints and generates
+        a user-friendly message.
+        
+        Args:
+            dsl_code: Original DSL code
+            ast: Parsed AST
+            
+        Returns:
+            Human-readable explanation string
+        """
+        # Extract constraint descriptions from AST
+        constraints = self._extract_constraints_from_ast(ast)
+        
+        if len(constraints) == 0:
+            return "The constraints are contradictory and cannot be satisfied."
+        
+        if len(constraints) == 1:
+            return f"Rule violated: {constraints[0]}"
+        
+        # Try to identify specific conflicts
+        conflict_msg = self._identify_conflicts(constraints)
+        if conflict_msg:
+            return conflict_msg
+        
+        # Default: List all constraints
+        constraint_list = "\n  - ".join(constraints)
+        return (
+            f"No valid solution exists. The following constraints are in conflict:\n"
+            f"  - {constraint_list}"
+        )
+    
+    def _extract_constraints_from_ast(self, ast: Any) -> List[str]:
+        """Extract human-readable constraint descriptions from AST."""
+        constraints = []
+        
+        if ast is None:
+            return constraints
+        
+        # Handle tuple format: (OPERATOR, operand1, operand2, ...)
+        if isinstance(ast, tuple) and len(ast) >= 1:
+            op = ast[0]
+            
+            # Comparison operators
+            if op in ("GT", "LT", "GE", "LE", "EQ", "NE"):
+                op_symbols = {"GT": ">", "LT": "<", "GE": ">=", "LE": "<=", "EQ": "==", "NE": "!="}
+                if len(ast) >= 3:
+                    left = self._format_operand(ast[1])
+                    right = self._format_operand(ast[2])
+                    constraints.append(f"{left} {op_symbols.get(op, op)} {right}")
+            
+            # Logical operators (recurse)
+            elif op in ("AND", "OR", "NOT", "IMPLIES"):
+                for operand in ast[1:]:
+                    constraints.extend(self._extract_constraints_from_ast(operand))
+            
+            # Arithmetic (just describe)
+            elif op in ("PLUS", "MINUS", "MUL", "DIV"):
+                constraints.append(f"Arithmetic: {dsl_code}")
+        
+        return constraints
+    
+    def _format_operand(self, operand: Any) -> str:
+        """Format an operand for display."""
+        if isinstance(operand, tuple):
+            # Nested expression
+            op = operand[0]
+            if op in ("PLUS", "MINUS", "MUL", "DIV"):
+                op_symbols = {"PLUS": "+", "MINUS": "-", "MUL": "*", "DIV": "/"}
+                if len(operand) >= 3:
+                    left = self._format_operand(operand[1])
+                    right = self._format_operand(operand[2])
+                    return f"({left} {op_symbols.get(op, op)} {right})"
+            return str(operand)
+        return str(operand)
+    
+    def _identify_conflicts(self, constraints: List[str]) -> Optional[str]:
+        """Try to identify specific conflicts between constraints."""
+        # Look for obvious contradictions like x > 5 AND x < 3
+        for i, c1 in enumerate(constraints):
+            for c2 in constraints[i+1:]:
+                # Check if same variable has conflicting bounds
+                if self._are_conflicting(c1, c2):
+                    return (
+                        f"Contradiction detected:\n"
+                        f"  Rule 1: {c1}\n"
+                        f"  Rule 2: {c2}\n"
+                        f"These constraints cannot both be true."
+                    )
+        return None
+    
+    def _are_conflicting(self, c1: str, c2: str) -> bool:
+        """Check if two constraints are obviously conflicting."""
+        # Simple heuristic: same variable with > and < that overlap
+        # E.g., "x > 5" and "x < 3"
+        import re
+        
+        # Pattern: variable > number
+        gt_pattern = r"(\w+)\s*>\s*([\d.]+)"
+        lt_pattern = r"(\w+)\s*<\s*([\d.]+)"
+        
+        gt1 = re.search(gt_pattern, c1)
+        lt1 = re.search(lt_pattern, c1)
+        gt2 = re.search(gt_pattern, c2)
+        lt2 = re.search(lt_pattern, c2)
+        
+        # Check x > a AND x < b where a >= b
+        if gt1 and lt2:
+            if gt1.group(1) == lt2.group(1):  # Same variable
+                lower = float(gt1.group(2))
+                upper = float(lt2.group(2))
+                if lower >= upper:
+                    return True
+        
+        if lt1 and gt2:
+            if lt1.group(1) == gt2.group(1):  # Same variable
+                upper = float(lt1.group(2))
+                lower = float(gt2.group(2))
+                if lower >= upper:
+                    return True
+        
+        return False
     
     def verify_from_natural_language(
         self,
