@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class APIResponse:
     """Structured API response"""
+    __test__ = False
     success: bool
     status_code: int
     data: Dict[Any, Any]

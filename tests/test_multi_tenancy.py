@@ -32,9 +32,10 @@ def test_org(test_session):
 @pytest.fixture
 def test_api_key(test_session, test_org):
     """Create a test API key"""
-    key_value, _ = generate_api_key(prefix="qwed") # Get plaintext key
+    key_value, key_hash = generate_api_key(prefix="qwed") # Get plaintext key and hash
     api_key = ApiKey(
-        key=key_value,
+        key_hash=key_hash,
+        key_preview=f"qwed_...",
         organization_id=test_org.id,
         name="Test Key",
         is_active=True
@@ -47,7 +48,7 @@ def test_generate_api_key():
     """Test API key generation"""
     key, _ = generate_api_key(prefix="qwed")
     assert key.startswith("qwed_")
-    assert len(key) == 69  # "qwed_" + 64 hex chars
+    assert len(key) == 48  # "qwed_" + roughly 43 chars from token_urlsafe(32)
 
 def test_valid_api_key(test_api_key, test_session):
     """Test authentication with valid API key"""
@@ -55,7 +56,9 @@ def test_valid_api_key(test_api_key, test_session):
     
     # Verify the key exists using proper SQLModel query
     from sqlmodel import select
-    statement = select(ApiKey).where(ApiKey.key == key_value)
+    from qwed_new.auth.security import hash_api_key
+    hashed_key = hash_api_key(key_value)
+    statement = select(ApiKey).where(ApiKey.key_hash == hashed_key)
     result = test_session.exec(statement).first()
     
     assert result is not None

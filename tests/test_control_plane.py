@@ -13,7 +13,14 @@ async def test_control_plane_math_routing(control_plane):
     Test that math queries are routed to Azure OpenAI.
     """
     # Mock internal components
-    control_plane.translator.translate = MagicMock()
+    mock_task = MagicMock()
+    mock_task.dict.return_value = {"confidence": 1.0, "expression": "21 + 21", "claimed_answer": 42.0, "reasoning": "Simple addition"}
+    mock_task.expression = "21 + 21"
+    mock_task.claimed_answer = 42.0
+    mock_task.confidence = 1.0
+    mock_task.reasoning = "Simple addition"
+    
+    control_plane.translator.translate = MagicMock(return_value=mock_task)
     control_plane.math_verifier.verify_math = MagicMock(return_value={
         "status": "VERIFIED", 
         "calculated_value": 42.0,
@@ -25,8 +32,8 @@ async def test_control_plane_math_routing(control_plane):
     result = await control_plane.process_natural_language(query)
     
     # Verify routing
+    assert result["status"] == "VERIFIED", f"Expected VERIFIED, got {result['status']}. Error: {result.get('error')}"
     assert result["provider_used"] == ProviderType.AZURE_OPENAI
-    assert result["status"] == "VERIFIED"
 
 @pytest.mark.asyncio
 async def test_control_plane_creative_routing(control_plane):
@@ -34,7 +41,14 @@ async def test_control_plane_creative_routing(control_plane):
     Test that creative queries are routed to Anthropic.
     """
     # Mock
-    control_plane.translator.translate = MagicMock()
+    mock_task = MagicMock()
+    mock_task.dict.return_value = {"confidence": 1.0, "expression": "story", "claimed_answer": None, "reasoning": "creative"}
+    mock_task.expression = "story"
+    mock_task.claimed_answer = None
+    mock_task.confidence = 1.0
+    mock_task.reasoning = "creative"
+    
+    control_plane.translator.translate = MagicMock(return_value=mock_task)
     control_plane.math_verifier.verify_math = MagicMock(return_value={"status": "VERIFIED", "is_correct": True})
     
     # Execute

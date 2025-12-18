@@ -43,6 +43,8 @@ class PolicyEngine:
         self.security_gateway = SecurityGateway()
         # Per-tenant rate limiters (keyed by organization_id)
         self.tenant_limiters: Dict[int, RateLimiter] = {}
+        # Global limiter for legacy/generic queries
+        self.global_limiter = RateLimiter(rate=60, per=60)
         
     def _get_tenant_limiter(self, organization_id: int, max_per_minute: int = 60) -> RateLimiter:
         """

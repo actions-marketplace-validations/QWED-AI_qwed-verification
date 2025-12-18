@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TestResult:
     """Structured test result"""
+    __test__ = False
     test_id: str
     test_name: str
     engine: str
@@ -49,6 +50,7 @@ class BaseTest:
     Base class for all QWED tests
     Provides common functionality and structure
     """
+    __test__ = False
     
     def __init__(self, test_id: str, test_name: str, engine: str, priority: str):
         self.test_id = test_id

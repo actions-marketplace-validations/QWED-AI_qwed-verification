@@ -111,7 +111,7 @@ class CodeVerifier:
                 "severity": "CRITICAL",
                 "type": "dangerous_function",
                 "function": func,
-                "message": f"Critical function '{func}' detected. This is blocked."
+                "description": f"Critical function '{func}' detected. This is blocked."
             } for func in critical_found])
         
         # 2. Check for dangerous attributes
@@ -121,7 +121,7 @@ class CodeVerifier:
                 "severity": "CRITICAL",
                 "type": "dangerous_attribute",
                 "attribute": attr,
-                "message": f"Dangerous attribute '{attr}' detected."
+                "description": f"Dangerous attribute '{attr}' detected."
             } for attr in attr_found])
         
         # 3. Check for warning-level functions
@@ -131,7 +131,7 @@ class CodeVerifier:
                 "severity": "WARNING",
                 "type": "context_dependent_function",
                 "function": func,
-                "message": f"Function '{func}' requires manual review."
+                "description": f"Function '{func}' requires manual review."
             } for func in warnings_found])
         
         # 4. Check for dangerous module imports
@@ -141,7 +141,7 @@ class CodeVerifier:
                 "severity": "WARNING",
                 "type": "dangerous_import",
                 "module": mod,
-                "message": f"Import of '{mod}' requires review."
+                "description": f"Import of '{mod}' requires review."
             } for mod in modules_found])
         
         # 5. Check for weak crypto with passwords
@@ -211,7 +211,7 @@ class CodeVerifier:
                         "severity": "CRITICAL",
                         "type": "weak_crypto_with_password",
                         "function": func,
-                        "message": f"Weak hash '{func}' used in password context. Use bcrypt/argon2."
+                        "description": f"Weak hash '{func}' used in password context. Use bcrypt/argon2."
                     })
         
         return issues
