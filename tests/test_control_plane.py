@@ -76,10 +76,16 @@ async def test_control_plane_rate_limit(control_plane):
     """
     Test rate limiting.
     """
-    # Exhaust tokens
-    control_plane.policy.global_limiter.tokens = 0
+    # Exhaust rate limit by making many requests
+    # Use a dedicated organization_id to avoid affecting other tests
+    test_org_id = 99999
     
-    result = await control_plane.process_natural_language("Simple query")
+    # Make 61 requests to exhaust the 60 req/min limit
+    for _ in range(61):
+        await control_plane.process_natural_language("Simple query", organization_id=test_org_id)
+    
+    # The next request should be blocked
+    result = await control_plane.process_natural_language("Simple query", organization_id=test_org_id)
     
     assert result["status"] == "BLOCKED"
     assert "Rate limit exceeded" in result["error"]
