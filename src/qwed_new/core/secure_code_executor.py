@@ -143,13 +143,22 @@ class SecureCodeExecutor:
             cpu_period=100000,
             cpu_quota=int(self.cpu_limit * 100000),
             network_mode="none",  # No internet access
-            remove=True,  # Auto-remove container after execution
-            detach=False,  # Wait for completion
-            stdout=True,
-            stderr=True,
+            remove=False,  # Keep so we can check status/logs
+            detach=True,  # Run in background
         )
         
-        return container
+        try:
+            # Wait for completion with timeout
+            # Note: docker-py wait() timeout is in seconds since v3.0.0
+            wait_result = container.wait(timeout=self.timeout)
+            return container
+        except Exception as e:
+            logger.warning(f"Container timeout or error: {e}")
+            try:
+                container.kill()
+            except:
+                pass
+            raise ExecutionError(f"Execution timed out after {self.timeout}s")
     
     def _is_safe_code(self, code: str) -> Tuple[bool, Optional[str]]:
         """
@@ -227,6 +236,15 @@ class SecureCodeExecutor:
         return f'''
 import json
 import sys
+import numpy as np
+
+# Custom encoder for NumPy types
+class QwedEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        return super().default(obj)
 
 # Load context
 with open('/workspace/context.json', 'r') as f:
@@ -254,9 +272,9 @@ try:
         with open('/workspace/result.json', 'w') as f:
             # Handle DataFrame results
             if hasattr(res, 'to_dict'):
-                json.dump({{'result': res.to_dict(orient='records')}}, f)
+                json.dump({{'result': res.to_dict(orient='records')}}, f, cls=QwedEncoder)
             else:
-                json.dump({{'result': res}}, f)
+                json.dump({{'result': res}}, f, cls=QwedEncoder)
     else:
         with open('/workspace/result.json', 'w') as f:
             json.dump({{'error': 'Code did not set result variable'}}, f)
