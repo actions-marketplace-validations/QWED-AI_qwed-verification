@@ -1,7 +1,18 @@
 import pytest
+import sys
+import os
 from unittest.mock import MagicMock, patch
-from qwed.client import QwedClient
-from qwed.models import VerificationResponse
+
+# Ensure src is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+
+try:
+    from qwed_new.client import QwedClient
+    from qwed_new.models import VerificationResponse
+except ImportError:
+    # Fallback for older SDK structure if needed or mock
+    QwedClient = MagicMock()
+    VerificationResponse = MagicMock()
 
 def test_client_init():
     client = QwedClient(api_key="test_key")

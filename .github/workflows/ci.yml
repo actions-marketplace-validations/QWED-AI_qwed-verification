@@ -50,4 +50,4 @@ jobs:
         DATABASE_URL: postgresql://qwed:qwed_secret@localhost:5432/qwed_db
         ACTIVE_PROVIDER: mock
       run: |
-        pytest -v
+        pytest tests/ -v
