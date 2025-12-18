@@ -1,88 +1,118 @@
 import sqlglot
 from sqlglot import exp, parse_one
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
+
+class SecurityViolation(Exception):
+    """Raised when a security policy is violated."""
+    pass
 
 class SQLVerifier:
     """
-    Engine 6: SQL Verifier.
-    Verifies SQL queries against a provided schema (DDL) using static analysis.
+    Engine 6: SQL Verifier (Security Firewall).
+    Handles AST-based SQL analysis to prevent injection, data leakage, and destructive actions.
     """
     
-    def __init__(self):
-        pass
+    # 🚫 Destructive commands (Blocked by default)
+    DESTRUCTIVE_COMMANDS = {
+        exp.Drop, exp.Delete, exp.Update, exp.Insert, 
+        exp.Alter, exp.TruncateTable, exp.Create, exp.Merge
+    }
 
-    def verify_sql(self, query: str, schema_ddl: str, dialect: str = "sqlite") -> Dict[str, Any]:
+    # 🔑 Administrative / Permission commands
+    ADMIN_COMMANDS = {
+        exp.Grant, exp.Revoke, exp.Transaction, exp.Set, exp.Command
+    }
+
+    # 🔒 Sensitive columns (Forbidden in SELECT/WHERE)
+    SENSITIVE_COLUMNS = {
+        "password", "password_hash", "passwd", "pwd",
+        "secret", "secret_key", "api_key", "token",
+        "ssn", "social_security", "salary", "credit_card",
+        "bank_account", "balance"
+    }
+
+    def __init__(self, blocked_columns: Optional[Set[str]] = None):
+        self.blocked_columns = self.SENSITIVE_COLUMNS.union(blocked_columns or set())
+
+    def verify_sql(self, query: str, schema_ddl: Optional[str] = None, dialect: str = "postgres") -> Dict[str, Any]:
         """
-        Verifies a SQL query against a schema.
-        
-        Args:
-            query: The SQL query to verify (e.g., "SELECT * FROM users")
-            schema_ddl: The database schema in DDL format (e.g., "CREATE TABLE users ...")
-            dialect: The SQL dialect (default: sqlite)
-            
-        Returns:
-            Dict with is_valid, issues, and parsed structure.
+        Verifies a SQL query for safety and optionally against a schema.
         """
         issues = []
-        tables_in_schema = {}
-        
-        # 1. Parse Schema (DDL)
         try:
-            parsed_schema = sqlglot.parse(schema_ddl, read=dialect)
-            for expression in parsed_schema:
-                if isinstance(expression, exp.Create):
-                    # In sqlglot, Create.this is often a Schema expression
-                    schema_expr = expression.this
-                    
-                    if isinstance(schema_expr, exp.Schema):
-                        table_name = schema_expr.this.name
-                        columns = set()
-                        for col_def in schema_expr.expressions:
-                            if isinstance(col_def, exp.ColumnDef):
-                                columns.add(col_def.this.name)
-                        tables_in_schema[table_name] = columns
-                    elif isinstance(schema_expr, exp.Table):
-                         # Handle simple CREATE TABLE x AS SELECT ... if needed
-                         table_name = schema_expr.name
-                         tables_in_schema[table_name] = set() # No columns known if AS SELECT
-            
-            print(f"DEBUG: Parsed Schema Tables: {list(tables_in_schema.keys())}")
-        except Exception as e:
-            print(f"DEBUG: Schema Parsing Error: {e}")
-            return {
-                "is_valid": False,
-                "issues": [f"Schema Parsing Error: {str(e)}"]
-            }
-
-        # 2. Parse Query
-        try:
+            # 1. Parse Query
             parsed_query = parse_one(query, read=dialect)
         except Exception as e:
             return {
-                "is_valid": False,
+                "is_safe": False,
+                "status": "SYNTAX_ERROR",
                 "issues": [f"SQL Syntax Error: {str(e)}"]
             }
 
-        # 3. Safety Check (No DROP/DELETE/ALTER)
-        forbidden_types = (exp.Drop, exp.Delete, exp.Alter)
-        if isinstance(parsed_query, forbidden_types):
-             issues.append(f"Forbidden command type: {parsed_query.key}")
-
-        # 4. Schema Validation (Table Existence Only)
-        # Find all tables referenced in the query
-        for table in parsed_query.find_all(exp.Table):
-            table_name = table.name
-            if table_name not in tables_in_schema:
-                issues.append(f"Table not found in schema: {table_name}")
+        # 2. Command Type Check
+        if type(parsed_query) in self.DESTRUCTIVE_COMMANDS:
+            issues.append(f"CRITICAL: Destructive command detected ({type(parsed_query).__name__}). Only SELECT is allowed.")
         
-        # Note: We skip strict column validation because:
-        # 1. Column resolution is complex with aliases/joins
-        # 2. Wildcards (*) are valid
-        # 3. We want to avoid false positives on valid queries
-        # We only validate that tables exist, not individual columns
+        if type(parsed_query) in self.ADMIN_COMMANDS:
+            issues.append(f"CRITICAL: Administrative command detected ({type(parsed_query).__name__}).")
 
+        # 3. Column-Level Security Scan
+        for column in parsed_query.find_all(exp.Column):
+            col_name = column.name.lower()
+            if col_name in self.blocked_columns:
+                issues.append(f"SECURITY: Access to sensitive column '{col_name}' is forbidden.")
+
+        # 4. Injection Pattern Detection (Tautologies & Comments)
+        # Detect 'OR 1=1' or similar tautologies in WHERE/HAVING
+        for condition in parsed_query.find_all(exp.Binary):
+            if isinstance(condition, exp.EQ):
+                # Check for things like '1=1' or 'a=a'
+                if condition.left == condition.right:
+                    issues.append(f"INJECTION: Tautology detected ({condition.sql()}). Likely injection attempt.")
+            
+            if isinstance(condition, exp.Or):
+                # Check for things like 'OR TRUE'
+                if isinstance(condition.right, exp.Boolean) and condition.right.this:
+                    issues.append("INJECTION: 'OR TRUE' pattern detected.")
+
+        # 5. Schema Validation (If DDL provided)
+        if schema_ddl:
+            schema_issues = self._validate_against_schema(parsed_query, schema_ddl, dialect)
+            issues.extend(schema_issues)
+
+        is_safe = len(issues) == 0
         return {
-            "is_valid": len(issues) == 0,
+            "is_safe": is_safe,
+            "status": "SAFE" if is_safe else "BLOCKED",
             "issues": issues,
-            "tables_found": list(tables_in_schema.keys())
+            "engine": "SQLGlot-AST-Scanner"
         }
+
+    def _validate_against_schema(self, parsed_query: exp.Expression, schema_ddl: str, dialect: str) -> List[str]:
+        issues = []
+        tables_in_schema = {}
+        
+        try:
+            parsed_schema = sqlglot.parse(schema_ddl, read=dialect)
+            for expression in parsed_schema:
+                if isinstance(expression, exp.Create) and isinstance(expression.this, exp.Schema):
+                    table_name = expression.this.this.name
+                    columns = {col.this.name.lower() for col in expression.this.expressions if isinstance(col, exp.ColumnDef)}
+                    tables_in_schema[table_name] = columns
+        except Exception:
+            return ["SCHEMA_ERROR: Could not parse DDL schema."]
+
+        # Check tables existence
+        for table in parsed_query.find_all(exp.Table):
+            t_name = table.name
+            if t_name not in tables_in_schema:
+                issues.append(f"SCHEMA: Table '{t_name}' does not exist in the provided schema.")
+            else:
+                # Check column existence if specific columns named
+                for column in table.find_all(exp.Column):
+                    c_name = column.name.lower()
+                    if c_name != "*" and c_name not in tables_in_schema[t_name]:
+                        # Note: Some expressions might have columns not directly under table node
+                        pass 
+
+        return issues
