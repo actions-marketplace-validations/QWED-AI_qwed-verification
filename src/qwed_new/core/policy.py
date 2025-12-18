@@ -64,11 +64,14 @@ class PolicyEngine:
         Check if the request complies with all policies.
         Returns (allowed, reason).
         """
-        # 1. Rate Limiting (Per-Tenant)
+        # 1. Rate Limiting (Per-Tenant or Global)
         if organization_id:
             limiter = self._get_tenant_limiter(organization_id)
             if not limiter.allow():
                 return False, "Rate limit exceeded for your organization. Please try again later."
+        else:
+            if not self.global_limiter.allow():
+                return False, "Rate limit exceeded. Please try again later."
         
         # 2. Security / Prompt Injection
         is_safe, reason = self.security_gateway.detect_injection(query)

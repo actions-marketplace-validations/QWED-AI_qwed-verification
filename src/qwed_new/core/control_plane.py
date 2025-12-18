@@ -53,7 +53,7 @@ class ControlPlane:
             logger.warning(f"Security block for org {organization_id}: {security_reason}")
             return {
                 "status": "BLOCKED",
-                "error": f"Security violation: {security_reason}",
+                "error": f"Security Policy Violation: {security_reason}",
                 "latency_ms": (time.time() - start_time) * 1000
             }
         
@@ -155,7 +155,7 @@ class ControlPlane:
             logger.warning(f"Security block (logic) for org {organization_id}: {security_reason}")
             result = {
                 "status": "BLOCKED",
-                "error": f"Security violation: {security_reason}",
+                "error": f"Security Policy Violation: {security_reason}",
                 "latency_ms": (time.time() - start_time) * 1000
             }
             if organization_id:

@@ -147,6 +147,7 @@ class SecureCodeExecutor:
             detach=False,  # Wait for completion
             stdout=True,
             stderr=True,
+            timeout=self.timeout
         )
         
         return container
@@ -163,8 +164,8 @@ class SecureCodeExecutor:
             verifier = CodeVerifier()
             result = verifier.verify_code(code, language="python")
             
-            if not result["is_safe"]:
-                issues = result.get("issues", [])
+            issues = result.get("issues", [])
+            if issues:
                 issue_summary = "; ".join([f"{i['type']}: {i['description']}" for i in issues[:3]])
                 return False, f"Code contains security issues: {issue_summary}"
             
@@ -250,12 +251,13 @@ try:
     
     # Save result (user code should set 'result' variable)
     if 'result' in globals():
+        res = globals()['result']
         with open('/workspace/result.json', 'w') as f:
             # Handle DataFrame results
-            if hasattr(result, 'to_dict'):
-                json.dump({{'result': result.to_dict(orient='records')}}, f)
+            if hasattr(res, 'to_dict'):
+                json.dump({{'result': res.to_dict(orient='records')}}, f)
             else:
-                json.dump({{'result': result}}, f)
+                json.dump({{'result': res}}, f)
     else:
         with open('/workspace/result.json', 'w') as f:
             json.dump({{'error': 'Code did not set result variable'}}, f)
