@@ -77,39 +77,60 @@ class TestVerificationCache:
 class TestRedisCache:
     """Test the RedisCache with mocked Redis client."""
     
-    @patch('qwed_new.core.redis_config.get_redis_client')
-    def test_redis_cache_fallback(self, mock_get_client):
+    def test_redis_cache_fallback(self):
         """Test fallback to in-memory when Redis unavailable."""
-        mock_get_client.return_value = None
+        # Import and mock BEFORE creating RedisCache
+        import qwed_new.core.redis_config as redis_config
+        original_get_client = redis_config.get_redis_client
         
-        from qwed_new.core.cache import RedisCache
+        # Force Redis to be unavailable
+        redis_config.get_redis_client = lambda: None
+        redis_config._redis_available = False
+        redis_config._redis_client = None
         
-        cache = RedisCache()
-        assert cache._fallback_cache is not None
-        
-        # Should work with fallback
-        cache.set("test", {"status": "SAT"})
-        result = cache.get("test")
-        assert result is not None
+        try:
+            # Now import RedisCache - it will see Redis as unavailable
+            from qwed_new.core.cache import RedisCache
+            
+            cache = RedisCache()
+            
+            # Should have fallback cache since Redis is unavailable
+            assert cache._fallback_cache is not None, "Fallback cache should be created when Redis unavailable"
+            
+            # Should work with fallback
+            cache.set("test", {"status": "SAT"})
+            result = cache.get("test")
+            assert result is not None, "Should get result from fallback cache"
+            assert result["status"] == "SAT"
+        finally:
+            # Restore original
+            redis_config.get_redis_client = original_get_client
+            redis_config._redis_available = None
+            redis_config._redis_client = None
     
-    @patch('qwed_new.core.redis_config.get_redis_client')
-    def test_redis_cache_operations(self, mock_get_client):
-        """Test Redis cache operations with mocked client."""
-        mock_client = MagicMock()
-        mock_client.get.return_value = '{"status": "SAT"}'
-        mock_get_client.return_value = mock_client
+    def test_redis_cache_stats_with_fallback(self):
+        """Test stats when using fallback cache."""
+        import qwed_new.core.redis_config as redis_config
+        original_get_client = redis_config.get_redis_client
         
-        from qwed_new.core.cache import RedisCache
+        redis_config.get_redis_client = lambda: None
+        redis_config._redis_available = False
+        redis_config._redis_client = None
         
-        # Need to reimport to pick up mock
-        import importlib
-        import qwed_new.core.cache as cache_module
-        importlib.reload(cache_module)
-        
-        cache = cache_module.RedisCache()
-        
-        # Note: With mocked client, we test the interface
-        # Actual Redis integration should be tested with real Redis
+        try:
+            from qwed_new.core.cache import RedisCache
+            
+            cache = RedisCache()
+            cache.set("q1", {"status": "SAT"})
+            cache.get("q1")  # hit
+            
+            stats = cache.stats
+            assert "backend" in stats
+            assert stats["backend"] == "in-memory (fallback)"
+        finally:
+            redis_config.get_redis_client = original_get_client
+            redis_config._redis_available = None
+            redis_config._redis_client = None
 
 
 class TestRateLimiter:
