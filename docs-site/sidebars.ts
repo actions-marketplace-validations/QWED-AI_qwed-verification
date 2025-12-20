@@ -55,6 +55,19 @@ const sidebars: SidebarsConfig = {
       label: 'API Reference',
       items: [
         'api/overview',
+        'api/endpoints',
+        'api/authentication',
+        'api/errors',
+        'api/rate-limits',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Advanced',
+      items: [
+        'advanced/attestations',
+        'advanced/agent-verification',
+        'advanced/self-hosting',
       ],
     },
   ],
