@@ -17,6 +17,10 @@ const sidebars: SidebarsConfig = {
       label: 'Verification Engines',
       items: [
         'engines/overview',
+        'engines/math',
+        'engines/logic',
+        'engines/code',
+        'engines/sql',
       ],
     },
     {
@@ -24,6 +28,10 @@ const sidebars: SidebarsConfig = {
       label: 'SDKs',
       items: [
         'sdks/overview',
+        'sdks/python',
+        'sdks/typescript',
+        'sdks/go',
+        'sdks/rust',
       ],
     },
     {
@@ -31,6 +39,8 @@ const sidebars: SidebarsConfig = {
       label: 'Integrations',
       items: [
         'integrations/langchain',
+        'integrations/llamaindex',
+        'integrations/crewai',
       ],
     },
     {
