@@ -17,26 +17,13 @@ const sidebars: SidebarsConfig = {
       label: 'Verification Engines',
       items: [
         'engines/overview',
-        'engines/math',
-        'engines/logic',
-        'engines/code',
-        'engines/sql',
-        'engines/fact',
-        'engines/stats',
       ],
     },
     {
       type: 'category',
       label: 'SDKs',
-      link: {
-        type: 'doc',
-        id: 'sdks/overview',
-      },
       items: [
-        'sdks/python',
-        'sdks/typescript',
-        'sdks/go',
-        'sdks/rust',
+        'sdks/overview',
       ],
     },
     {
@@ -44,45 +31,20 @@ const sidebars: SidebarsConfig = {
       label: 'Integrations',
       items: [
         'integrations/langchain',
-        'integrations/llamaindex',
-        'integrations/crewai',
       ],
     },
     {
       type: 'category',
       label: 'Protocol Specifications',
-      link: {
-        type: 'doc',
-        id: 'specs/overview',
-      },
       items: [
-        'specs/qwed-spec',
-        'specs/attestation',
-        'specs/agent',
+        'specs/overview',
       ],
     },
     {
       type: 'category',
       label: 'API Reference',
-      link: {
-        type: 'doc',
-        id: 'api/overview',
-      },
       items: [
-        'api/endpoints',
-        'api/authentication',
-        'api/errors',
-        'api/rate-limits',
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Advanced',
-      items: [
-        'advanced/attestations',
-        'advanced/agent-verification',
-        'advanced/custom-engines',
-        'advanced/self-hosting',
+        'api/overview',
       ],
     },
   ],
