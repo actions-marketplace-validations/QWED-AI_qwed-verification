@@ -17,6 +17,15 @@ class VerificationType(Enum):
     CODE = "code"
     FACT = "fact"
     SQL = "sql"
+    STATS = "stats"
+    CONSENSUS = "consensus"
+
+
+class VerificationMode(str, Enum):
+    """Verification depth modes for consensus."""
+    SINGLE = "single"      # Fast, single engine
+    HIGH = "high"          # 2 engines
+    MAXIMUM = "maximum"    # 3+ engines
 
 
 @dataclass
