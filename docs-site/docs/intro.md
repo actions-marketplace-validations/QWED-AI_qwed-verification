@@ -55,9 +55,23 @@ qwed verify-logic "(AND (GT x 5) (LT y 10))"
 - **Cryptographic Attestations** — JWT-based verification proofs
 - **Agent Verification** — Pre-execution checks for AI agents
 
+## 🆕 What's New in v2.0
+
+| Engine | Upgrade | Impact |
+|--------|---------|--------|
+| **Math** | Calculus, Matrix, Finance | 10x more use cases |
+| **Logic** | ForAll/Exists, BitVectors | Formal proofs |
+| **Code** | JS, Java, Go support | 4 languages |
+| **SQL** | Complexity limits | Production-ready |
+| **Fact** | TF-IDF matching | No LLM needed! |
+| **Image** | Deterministic size | 100% accurate |
+| **Consensus** | Async + Circuit breaker | Fault-tolerant |
+| **Stats** | Wasm sandbox | Works anywhere |
+
 ## Next Steps
 
 - [Installation Guide](/docs/getting-started/installation)
 - [Quick Start Tutorial](/docs/getting-started/quickstart)
 - [SDK Documentation](/docs/sdks/overview)
 - [Protocol Specifications](/docs/specs/overview)
+

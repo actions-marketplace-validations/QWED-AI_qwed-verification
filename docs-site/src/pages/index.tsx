@@ -177,14 +177,14 @@ console.log(batch.summary.successRate);`}</pre>
 
 function Engines() {
   const engines = [
-    { emoji: '🔢', name: 'Math', tech: 'SymPy' },
-    { emoji: '🧠', name: 'Logic', tech: 'Z3' },
-    { emoji: '💻', name: 'Code', tech: 'AST' },
-    { emoji: '🗃️', name: 'SQL', tech: 'SQLGlot' },
-    { emoji: '📊', name: 'Stats', tech: 'SciPy' },
-    { emoji: '📚', name: 'Fact', tech: 'NLI' },
-    { emoji: '🖼️', name: 'Image', tech: 'Vision' },
-    { emoji: '💭', name: 'Reasoning', tech: 'CoT' },
+    { emoji: '🔢', name: 'Math', tech: 'SymPy + Calculus' },
+    { emoji: '🧠', name: 'Logic', tech: 'Z3 + Quantifiers' },
+    { emoji: '💻', name: 'Code', tech: 'Multi-Lang AST' },
+    { emoji: '🗃️', name: 'SQL', tech: 'SQLGlot + Limits' },
+    { emoji: '📊', name: 'Stats', tech: 'Wasm Sandbox' },
+    { emoji: '📚', name: 'Fact', tech: 'TF-IDF' },
+    { emoji: '🖼️', name: 'Image', tech: 'Deterministic' },
+    { emoji: '💭', name: 'Reasoning', tech: 'Multi-LLM' },
   ];
 
   return (

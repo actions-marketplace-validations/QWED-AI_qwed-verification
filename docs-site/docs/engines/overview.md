@@ -4,50 +4,37 @@ sidebar_position: 1
 
 # Verification Engines
 
-QWED provides 8 specialized verification engines.
+QWED provides **8 specialized verification engines**, each using deterministic methods first and LLM only as fallback.
 
 ## Engine Overview
 
-| Engine | Type | Technology | Use Case |
-|--------|------|------------|----------|
-| **Math** | Deterministic | SymPy | Arithmetic, algebra, calculus |
-| **Logic** | Deterministic | Z3 SMT | Logical constraints, SAT |
-| **Code** | Deterministic | AST | Security vulnerabilities |
-| **SQL** | Deterministic | SQLGlot | Query validation |
-| **Stats** | Deterministic | SciPy | Statistical calculations |
-| **Fact** | LLM-assisted | NLP | Factual claims |
-| **Image** | LLM-assisted | Vision | Image content |
-| **Reasoning** | LLM-assisted | CoT | Complex reasoning |
+| Engine | Technology | Key Features |
+|--------|------------|--------------|
+| **Math** | SymPy + Decimal | Calculus, Matrix ops, NPV/IRR, Statistics |
+| **Logic** | Z3 Theorem Prover | ForAll/Exists quantifiers, BitVectors, Arrays |
+| **Code** | Multi-Lang AST | Python, JavaScript, Java, Go security analysis |
+| **SQL** | SQLGlot AST | Complexity limits, Cost estimation, Schema validation |
+| **Stats** | Wasm/Docker Sandbox | Secure code execution with AST validation |
+| **Fact** | TF-IDF + NLP | Semantic similarity, Entity matching, Citations |
+| **Image** | Deterministic + VLM | Metadata extraction, Size verification, Multi-VLM |
+| **Reasoning** | Multi-LLM + Cache | Chain-of-thought validation, Result caching |
 
-## Deterministic vs LLM-Assisted
+## Deterministic-First Philosophy
 
-### Deterministic Engines (No LLM Required)
+All engines now follow a **deterministic-first** approach:
 
-These engines use symbolic computation and are 100% reproducible:
-
-```python
-# Math - uses SymPy
-result = client.verify_math("x^2 - 1 = (x-1)(x+1)")
-# Always returns the same answer
-
-# Logic - uses Z3
-result = client.verify_logic("(AND (GT x 5) (LT y 10))")
-# Provably SAT or UNSAT
-```
-
-### LLM-Assisted Engines
-
-These engines use LLMs for understanding but verify with deterministic checks:
+1. **Try deterministic methods first** (100% reproducible)
+2. **Fall back to LLM only when necessary**
+3. **Discount LLM confidence** when used
 
 ```python
-# Fact - NLI model + entailment
+# Example: Fact verification is now deterministic!
 result = client.verify_fact(
     claim="Paris is in France",
     context="Paris is the capital of France."
 )
-
-# Reasoning - CoT decomposition + symbolic verification
-result = client.verify("If all A are B, and all B are C, are all A C?")
+# Uses TF-IDF similarity + entity matching
+# No LLM needed for most claims!
 ```
 
 ## Engine Selection
@@ -55,24 +42,33 @@ result = client.verify("If all A are B, and all B are C, are all A C?")
 QWED auto-detects the appropriate engine:
 
 | Content Pattern | Detected Engine |
-|----------------|-----------------|
-| `2+2=4`, `sqrt(16)` | Math |
-| `(AND ...)`, `(GT x 5)` | Logic |
-| `SELECT`, `INSERT` | SQL |
-| ` ```python ` , `import` | Code |
-| Free text claims | Fact |
+|-----------------|-----------------|
+| `2+2=4`, `sqrt(16)`, `derivative` | Math |
+| `(AND ...)`, `ForAll`, `Exists` | Logic |
+| `SELECT`, `INSERT`, `DROP` | SQL |
+| ` ```python `, `import`, `function` | Code |
+| Claims with context | Fact |
+| Image bytes + claim | Image |
 
 Or specify explicitly:
 
 ```python
-result = client.verify("some query", type="math")
+result = client.verify(query, type="math")
 ```
 
-## Engine Details
+## Engine Documentation
 
-- [Math Engine](/docs/engines/math)
-- [Logic Engine](/docs/engines/logic)
-- [Code Engine](/docs/engines/code)
-- [SQL Engine](/docs/engines/sql)
-- [Fact Engine](/docs/engines/fact)
-- [Stats Engine](/docs/engines/stats)
+### Deterministic Engines
+- [Math Engine](/docs/engines/math) - Calculus, Matrix, Financial
+- [Logic Engine](/docs/engines/logic) - Quantifiers, Theorem Proving
+- [Code Engine](/docs/engines/code) - Multi-language Security
+- [SQL Engine](/docs/engines/sql) - Complexity Limits
+
+### Data Verification Engines
+- [Stats Engine](/docs/engines/stats) - Wasm Sandbox Execution
+- [Fact Engine](/docs/engines/fact) - TF-IDF + Citations
+- [Image Engine](/docs/engines/image) - Deterministic Verification
+
+### Orchestration Engines
+- [Reasoning Engine](/docs/engines/reasoning) - Multi-LLM Validation
+- [Consensus Engine](/docs/engines/consensus) - Parallel Execution
