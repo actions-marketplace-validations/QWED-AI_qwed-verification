@@ -3,9 +3,37 @@ import type { Config } from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
-  title: 'QWED Protocol',
-  tagline: 'The Deterministic Verification Protocol for AI',
-  favicon: 'img/favicon.ico',
+  title: 'QWED | Deterministic Verification for AI',
+  tagline: 'Mathematically prove LLM outputs before they reach production.',
+  favicon: 'img/favicon.svg',
+
+  // SEO Metadata
+  headTags: [
+    {
+      tagName: 'meta',
+      attributes: { name: 'keywords', content: 'AI verification, LLM security, deterministic AI, formal verification, AI safety, QWED protocol' },
+    },
+    {
+      tagName: 'meta',
+      attributes: { name: 'author', content: 'QWED-AI' },
+    },
+    {
+      tagName: 'meta',
+      attributes: { property: 'og:type', content: 'website' },
+    },
+    {
+      tagName: 'meta',
+      attributes: { property: 'og:title', content: 'QWED | Deterministic Verification for AI' },
+    },
+    {
+      tagName: 'meta',
+      attributes: { property: 'og:description', content: 'The verification infrastructure layer for Enterprise AI. Mathematically prove LLM outputs before production.' },
+    },
+    {
+      tagName: 'meta',
+      attributes: { name: 'twitter:card', content: 'summary_large_image' },
+    },
+  ],
 
   future: {
     v4: true,

@@ -137,41 +137,79 @@ body {
 }
 
 /* ================================
-   Mobile Menu (Fixed)
+   Mobile Menu (Complete Fix)
    ================================ */
 .navbar-sidebar {
-  background-color: #09090b;
+  background-color: #09090b !important;
+  width: 100% !important;
 }
 
 .navbar-sidebar__brand {
-  background-color: #09090b;
+  background-color: #09090b !important;
   border-bottom: 1px solid #27272a;
+  padding: 1rem;
 }
 
 .navbar-sidebar__items {
-  background-color: #09090b;
+  background-color: #09090b !important;
+  padding: 1rem 0;
+}
+
+.navbar-sidebar__item {
+  padding: 0;
+}
+
+.navbar-sidebar .menu {
+  padding: 0;
+}
+
+.navbar-sidebar .menu__list {
+  padding: 0;
 }
 
 .navbar-sidebar .menu__link {
-  color: #fafafa;
-  padding: 1rem 1.25rem;
-  font-size: 1.5rem;
-  font-weight: 300;
-  letter-spacing: -0.02em;
+  color: #fafafa !important;
+  padding: 1rem 1.5rem !important;
+  font-size: 1.125rem;
+  font-weight: 400;
+  display: block;
+  border-radius: 0;
 }
 
 .navbar-sidebar .menu__link:hover {
-  color: #10b981;
-  background-color: transparent;
-  transform: translateX(8px);
+  color: #10b981 !important;
+  background-color: rgba(16, 185, 129, 0.1) !important;
 }
 
+.navbar-sidebar .menu__link--active {
+  color: #10b981 !important;
+  background-color: rgba(16, 185, 129, 0.1) !important;
+}
+
+/* Mobile toggle button */
 .navbar__toggle {
   color: #a1a1aa;
+  padding: 0.5rem;
 }
 
 .navbar__toggle:hover {
   color: #fafafa;
+  background-color: transparent;
+}
+
+/* Close button */
+.navbar-sidebar__close {
+  color: #a1a1aa;
+}
+
+.navbar-sidebar__close:hover {
+  color: #fafafa;
+  background-color: transparent;
+}
+
+/* Mobile backdrop */
+.navbar-sidebar__backdrop {
+  background-color: rgba(0, 0, 0, 0.5);
 }
 
 /* ================================
