@@ -45,7 +45,7 @@ function QuickInstall() {
           <div className="col col--3">
             <div className={styles.installCard}>
               <strong>Python</strong>
-              <code>pip install qwed-new</code>
+              <code>pip install qwed</code>
             </div>
           </div>
           <div className="col col--3">
@@ -303,3 +303,4 @@ export default function Home(): ReactNode {
     </Layout>
   );
 }
+

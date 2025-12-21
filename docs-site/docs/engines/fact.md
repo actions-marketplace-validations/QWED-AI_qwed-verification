@@ -54,3 +54,4 @@ Claim → TF-IDF + Entity Match → SUPPORTED ✅
 ```
 
 No more hallucinated fact checks!
+

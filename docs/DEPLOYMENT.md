@@ -269,3 +269,4 @@ LIMIT 24;
 
 For detailed architecture documentation, see:
 - [`ARCHITECTURE.md`](ARCHITECTURE.md)
+

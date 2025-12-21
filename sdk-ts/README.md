@@ -197,3 +197,4 @@ const client = new QWEDClient({
 ## License
 
 Apache 2.0
+

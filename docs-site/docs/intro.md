@@ -36,7 +36,7 @@ slug: /
 
 ```bash
 # Install the Python SDK
-pip install qwed-new
+pip install qwed
 
 # Verify math
 qwed verify "Is 2+2=5?"
@@ -74,4 +74,5 @@ qwed verify-logic "(AND (GT x 5) (LT y 10))"
 - [Quick Start Tutorial](/docs/getting-started/quickstart)
 - [SDK Documentation](/docs/sdks/overview)
 - [Protocol Specifications](/docs/specs/overview)
+
 

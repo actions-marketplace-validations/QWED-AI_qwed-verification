@@ -80,3 +80,4 @@ API keys can have restricted scopes:
 | `agent:write` | Agent management |
 | `attestation:read` | Attestation queries |
 | `admin:all` | Full access |
+

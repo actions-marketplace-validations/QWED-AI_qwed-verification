@@ -9,7 +9,7 @@ Get QWED up and running in minutes.
 ## Python SDK
 
 ```bash
-pip install qwed-new
+pip install qwed
 ```
 
 ### Requirements
@@ -78,3 +78,4 @@ python -m uvicorn qwed_new.api.main:app --reload
 
 - [Quick Start Guide](/docs/getting-started/quickstart)
 - [Core Concepts](/docs/getting-started/concepts)
+

@@ -151,3 +151,4 @@ result, err := client.Verify(ctx, "What is 2+2?")
 ## License
 
 Apache 2.0
+

@@ -38,3 +38,4 @@ To help us triage issues effectively, please distinguish between security issues
 *   **Bug:** A functional defect or unexpected behavior that does not have security implications (e.g., UI glitch, incorrect calculation, crash without exploitability). Please report these via the [GitHub Issue Tracker](https://github.com/qwed-platform/qwed-open/issues).
 
 Thank you for helping keep QWED secure!
+

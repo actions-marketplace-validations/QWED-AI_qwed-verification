@@ -72,3 +72,4 @@ To implement the QWED protocol:
 | **Basic** | Request/response format |
 | **Standard** | + All 8 engines |
 | **Full** | + Attestations + Agent API |
+

@@ -59,3 +59,4 @@ result = client.verify_image_consensus(
 print(result.agreement_count)  # 3/3
 print(result.vlm_results)      # Individual VLM responses
 ```
+

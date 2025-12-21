@@ -9,7 +9,7 @@ Use QWED with LangChain for verified AI chains and agents.
 ## Installation
 
 ```bash
-pip install qwed-new langchain
+pip install qwed langchain
 ```
 
 ## Quick Start
@@ -117,3 +117,4 @@ chain = prompt | llm | RunnableLambda(verify_output)
 1. **Use callbacks for monitoring** — Track verification rates
 2. **Use tools for agent autonomy** — Let agents verify themselves
 3. **Use wrappers for guarantees** — Ensure all outputs are verified
+

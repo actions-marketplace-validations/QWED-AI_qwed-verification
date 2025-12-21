@@ -7,7 +7,7 @@
 ## Installation
 
 ```bash
-pip install qwed-new
+pip install qwed
 ```
 
 ---
@@ -319,3 +319,4 @@ print(f"Success rate: {result.success_rate:.1f}%")
 ## License
 
 Apache 2.0
+

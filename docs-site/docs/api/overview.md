@@ -94,3 +94,4 @@ curl -H "X-API-Key: qwed_your_key" https://api.qwed.ai/v1/health
 - [Authentication](/docs/api/authentication)
 - [Error Codes](/docs/api/errors)
 - [Rate Limits](/docs/api/rate-limits)
+

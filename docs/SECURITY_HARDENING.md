@@ -133,3 +133,4 @@ While QWED handles internal verification, you must implement the following "Huma
 - **Data Minimization**: Do not send PII (Personally Identifiable Information) to QWED unless absolutely necessary. Mask or redact sensitive data *before* it reaches the API.
 
 For a full list of QWED's internal defenses, see [docs/security.md](security.md).
+

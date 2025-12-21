@@ -9,7 +9,7 @@ The official Python SDK for QWED.
 ## Installation
 
 ```bash
-pip install qwed-new
+pip install qwed
 ```
 
 ## Quick Start
@@ -121,3 +121,4 @@ qwed batch -f queries.json
 |----------|-------------|
 | `QWED_API_KEY` | API key |
 | `QWED_BASE_URL` | API base URL |
+

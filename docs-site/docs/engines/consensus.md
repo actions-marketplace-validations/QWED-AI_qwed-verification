@@ -85,3 +85,4 @@ The engine uses weighted voting:
 | Fact | 0.85 |
 
 Final confidence = weighted average of agreeing engines.
+

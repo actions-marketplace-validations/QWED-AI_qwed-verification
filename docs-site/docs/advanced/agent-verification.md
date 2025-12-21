@@ -139,3 +139,4 @@ analyst = QWEDVerifiedAgent(
     agent_id="agent_abc123"
 )
 ```
+

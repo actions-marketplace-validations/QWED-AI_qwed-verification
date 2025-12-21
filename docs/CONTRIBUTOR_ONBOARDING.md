@@ -77,3 +77,4 @@ Ping me anytime. I value:
 *   **Curiosity**: Ask "Why did you design it this way?"
 *   **Clarity**: Write simple, readable code.
 *   **Speed**: Ship small, verified changes.
+

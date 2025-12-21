@@ -18,3 +18,4 @@ readme = "README.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["qwed"]
+

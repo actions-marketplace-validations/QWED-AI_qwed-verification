@@ -108,3 +108,4 @@ match client.verify("test").await {
     Err(e) => eprintln!("Error: {}", e),
 }
 ```
+

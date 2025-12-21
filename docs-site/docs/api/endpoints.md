@@ -273,3 +273,4 @@ Get a badge for any status.
 Generate a custom badge.
 
 **Query params:** `label`, `message`, `color`, `logo`
+

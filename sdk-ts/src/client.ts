@@ -303,3 +303,4 @@ export function parseAttestation(jwt: string): {
         return null;
     }
 }
+

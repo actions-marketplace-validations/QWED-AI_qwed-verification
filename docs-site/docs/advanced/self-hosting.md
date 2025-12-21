@@ -107,20 +107,7 @@ spec:
               key: api-key
 ```
 
-## qwed-core (Minimal)
-
-For embedded use without infrastructure:
-
-```bash
-pip install qwed-core
-```
-
-```python
-from qwed_core import verify_math, verify_logic
-
-result = verify_math("2+2=4")
-# No external services needed!
-```
+> 🏢 **Enterprise Support Coming Soon:** Managed hosting, dedicated support, and SLA guarantees. Contact rahul@qwedai.com
 
 ## Scaling
 
@@ -163,3 +150,4 @@ qwed_cache_hit_rate
 3. **Enable rate limiting**
 4. **Use network isolation**
 5. **Rotate secrets regularly**
+

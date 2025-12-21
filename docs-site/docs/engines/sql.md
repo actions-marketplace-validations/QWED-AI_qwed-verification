@@ -72,3 +72,4 @@ print(result.vulnerabilities)
 ```python
 result = client.verify_sql(query, schema, dialect="postgresql")
 ```
+

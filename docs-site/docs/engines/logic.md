@@ -73,3 +73,4 @@ result = client.verify_logic(expr)
 (EQ (PLUS (MULT 2 x) 3) 15)  # 2x + 3 = 15
 (GT (DIV x 2) 5)              # x/2 > 5
 ```
+

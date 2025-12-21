@@ -9,7 +9,7 @@ Use QWED with LlamaIndex for verified RAG pipelines.
 ## Installation
 
 ```bash
-pip install qwed-new llama-index
+pip install qwed llama-index
 ```
 
 ## Quick Start
@@ -104,3 +104,4 @@ class VerifiedResponse:
     attestation: Optional[str]
     source_nodes: List[Any]
 ```
+

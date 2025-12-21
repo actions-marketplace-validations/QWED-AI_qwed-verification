@@ -219,7 +219,7 @@ docker-compose up -d
 ### Python SDK
 
 ```bash
-pip install qwed-new
+pip install qwed
 ```
 
 ```python
@@ -243,3 +243,4 @@ qwed batch queries.json -o results.json
 ### "Safe AI is the only AI that can change the world."
 
 *Built with ❤️ for a deterministic future.*
+

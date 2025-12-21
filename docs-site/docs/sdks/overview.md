@@ -10,7 +10,7 @@ QWED provides official SDKs for 4 languages.
 
 | Language | Package | Status |
 |----------|---------|--------|
-| [Python](/docs/sdks/python) | `qwed-new` | ✅ Stable |
+| [Python](/docs/sdks/python) | `qwed` | ✅ Stable |
 | [TypeScript](/docs/sdks/typescript) | `@qwed-ai/sdk` | ✅ Stable |
 | [Go](/docs/sdks/go) | `github.com/qwed-ai/qwed-go` | ✅ Stable |
 | [Rust](/docs/sdks/rust) | `qwed` | ✅ Stable |
@@ -30,7 +30,7 @@ QWED provides official SDKs for 4 languages.
 
 ```bash
 # Python
-pip install qwed-new
+pip install qwed
 
 # TypeScript
 npm install @qwed-ai/sdk
@@ -89,3 +89,4 @@ println!("{}", result.verified);  // true
 
 </TabItem>
 </Tabs>
+

@@ -93,3 +93,4 @@ packages = ["src/qwed_new", "qwed_sdk"]
 
 [project.scripts]
 qwed = "qwed_sdk.cli:main"
+

@@ -98,3 +98,4 @@ result = client.verify_code(good_code)
 print(result.verified)  # True
 print(result.status)    # "VERIFIED"
 ```
+

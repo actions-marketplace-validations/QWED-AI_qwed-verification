@@ -288,3 +288,4 @@ export interface QWEDClientOptions {
     timeout?: number;
     headers?: Record<string, string>;
 }
+

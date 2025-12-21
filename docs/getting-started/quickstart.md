@@ -86,3 +86,4 @@ print(f"Status: {result.status}")
 - Explore the [API Reference](../api.md) for all endpoints
 - Learn about [Security Features](../security.md)
 - Deep dive into the [Architecture](../architecture.md)
+

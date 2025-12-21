@@ -96,3 +96,4 @@ QWED is not a "do-it-all" solution. It is a specialized engine for **objective t
 *   **General Knowledge**: "Who won the 1998 World Cup?" (Use **Search/RAG**).
 
 **Conclusion**: In the modern AI stack, **RAG** provides the knowledge, **Guardrails** provides the structure, **Red Teaming** provides the assurance, and **QWED** provides the **verification**.
+

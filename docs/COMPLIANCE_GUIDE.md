@@ -149,3 +149,4 @@ Use this checklist to prepare for an enterprise audit.
 - [ ] **GDPR Export Tested:** Verify that data export works for a sample organization.
 - [ ] **Security Events Reviewed:** Check the "Security Events" section of the SOC 2 report for any anomalies.
 - [ ] **Rate Limiting Active:** Confirm rate limits are enforced to prevent abuse (DoS protection).
+

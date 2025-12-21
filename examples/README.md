@@ -6,7 +6,7 @@ This directory contains working examples of how to use the QWED SDK for various 
 
 First, install the SDK:
 ```bash
-pip install qwed-new
+pip install qwed
 ```
 
 Ensure the QWED server is running (e.g., via `docker-compose up` or `uvicorn qwed_new.api.main:app`).
@@ -32,3 +32,4 @@ Each script is standalone. You may need to set your API key if you have authenti
 ```bash
 python math_example.py
 ```
+

@@ -121,3 +121,4 @@ Embed attestation badges:
 ```markdown
 ![Verified](https://api.qwed.ai/badge/attestation/att_xyz789)
 ```
+

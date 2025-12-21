@@ -9,7 +9,7 @@ Use QWED with CrewAI for verified multi-agent systems.
 ## Installation
 
 ```bash
-pip install qwed-new crewai
+pip install qwed crewai
 ```
 
 ## Quick Start
@@ -119,3 +119,4 @@ def process_result(output):
     # Output is verified before this runs
     return output.upper()
 ```
+
