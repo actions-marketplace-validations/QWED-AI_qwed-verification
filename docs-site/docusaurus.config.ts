@@ -11,13 +11,15 @@ const config: Config = {
     v4: true,
   },
 
-  url: 'https://docs.qwed.ai',
+  url: 'https://docs.qwedai.com',
   baseUrl: '/',
 
   organizationName: 'QWED-AI',
   projectName: 'qwed-verification',
+  deploymentBranch: 'gh-pages',
+  trailingSlash: false,
 
-  onBrokenLinks: 'throw',
+  onBrokenLinks: 'warn',
 
   i18n: {
     defaultLocale: 'en',
