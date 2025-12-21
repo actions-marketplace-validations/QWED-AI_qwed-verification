@@ -80,21 +80,27 @@ graph LR
 
 ## ✅ Features
 
+### Open Source (This Repo)
+
 | Feature | Status | Description |
 |---------|--------|-------------|
 | **8 Verification Engines** | ✅ | Math, Logic, Stats, Fact, Code, SQL, Image, Reasoning |
 | **SQL Injection Firewall** | ✅ | AST-based parsing blocks `DROP`, `DELETE`, `; --` |
-| **Distributed Caching** | ✅ | Redis-backed with automatic fallback |
-| **Real-time Observability** | ✅ | Prometheus + Grafana dashboards |
-| **Distributed Tracing** | ✅ | OpenTelemetry + Jaeger |
-| **Multi-Tenancy** | ✅ | Per-organization isolation |
-| **Rate Limiting** | ✅ | Redis sliding window |
+| **Rate Limiting** | ✅ | Configurable per-key and global limits |
 | **Batch Processing** | ✅ | Up to 100 concurrent verifications |
 | **Multi-Language SDKs** | ✅ | Python, TypeScript, Go, Rust |
-| **Protocol Specification** | ✅ | Formal QWED Protocol v1.0 |
-| **Cryptographic Attestations** | ✅ | JWT/ES256 verification proofs |
-| **Agent Verification** | ✅ | Pre-execution checks for AI agents |
-| **Reference Implementation** | ✅ | `qwed-core` embeddable library |
+
+### Enterprise (Separate Repo)
+
+| Feature | Description |
+|---------|-------------|
+| **Real-time Observability** | Prometheus + Grafana dashboards |
+| **Distributed Tracing** | OpenTelemetry + Jaeger |
+| **Multi-Tenancy** | Per-organization isolation |
+| **Cryptographic Attestations** | JWT/ES256 verification proofs |
+| **Compliance Exports** | SOC 2 / GDPR reports |
+
+> 📧 Contact dev@qwed.ai for enterprise features
 
 
 ---
