@@ -60,6 +60,14 @@ const config: Config = {
       defaultMode: 'dark',
       respectPrefersColorScheme: true,
     },
+    // Algolia DocSearch - Apply at https://docsearch.algolia.com/apply/
+    algolia: {
+      appId: 'YOUR_APP_ID',
+      apiKey: 'YOUR_SEARCH_API_KEY',
+      indexName: 'qwedai',
+      contextualSearch: true,
+      searchPagePath: 'search',
+    },
     navbar: {
       title: 'QWED',
       logo: {
@@ -177,12 +185,6 @@ const config: Config = {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
       additionalLanguages: ['python', 'typescript', 'go', 'rust', 'bash'],
-    },
-    algolia: {
-      appId: 'YOUR_APP_ID',
-      apiKey: 'YOUR_SEARCH_API_KEY',
-      indexName: 'qwed',
-      contextualSearch: true,
     },
   } satisfies Preset.ThemeConfig,
 };
