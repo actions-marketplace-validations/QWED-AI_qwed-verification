@@ -143,6 +143,56 @@ agent = QWEDVerifiedAgent(role="Analyst", allow_dangerous_code=False)
 
 ---
 
+## 🤔 How is QWED Different?
+
+| Approach | What it Does | Why it's Not Enough |
+|----------|--------------|---------------------|
+| **RLHF / Fine-tuning** | Teaches model with feedback | Still probabilistic, can't guarantee |
+| **Guardrails** | Filters bad outputs | Reactive, not verification |
+| **RAG** | Grounds answers in docs | Fixes knowledge, not reasoning |
+| **Prompt Engineering** | Better instructions | Can't force determinism |
+| **QWED** | Mathematical verification | **Proves correctness formally** |
+
+> QWED doesn't replace these - it **complements** them.
+
+---
+
+## 🎯 Real Example: The $1M Bug
+
+**User asks AI:** "Calculate compound interest: $100K at 5% for 10 years"
+
+**GPT-4 responds:** "$150,000"  
+*(Used simple interest by mistake)*
+
+**With QWED:**
+```python
+response = client.verify_math(
+    query="Compound interest: $100K, 5%, 10 years",
+    llm_output="$150,000"
+)
+# -> ❌ INCORRECT: Expected $162,889.46
+#    Error: Used simple interest formula instead of compound
+```
+
+**Cost of not verifying:** $12,889 error per transaction 💸
+
+---
+
+## 🏆 Who Uses QWED?
+
+QWED is built for teams who can't afford AI errors:
+
+| Industry | Use Case |
+|----------|----------|
+| 🏦 **Fintech** | Transaction validation, fraud detection |
+| 🏥 **Healthcare** | Drug interaction checking, diagnosis verification |
+| ⚖️ **Legal** | Contract analysis, compliance checking |
+| 🏭 **Manufacturing** | Process control, quality assurance |
+
+*Want to be listed? [Submit a case study →](mailto:rahul@qwedai.com)*
+
+---
+
 ## 🏢 Enterprise
 
 Need **observability**, **multi-tenancy**, **audit logs**, or **compliance exports**?
@@ -158,6 +208,15 @@ Apache 2.0 - See [LICENSE](LICENSE)
 ---
 
 <div align="center">
+  
+  ### ⭐ Star us if you believe AI needs verification
+  
+  <a href="https://github.com/QWED-AI/qwed-verification">
+    <img src="https://img.shields.io/github/stars/QWED-AI/qwed-verification?style=social" alt="GitHub Stars">
+  </a>
+  
+  <br><br>
+  
   <h3>Ready to trust your AI?</h3>
   <p><i>"Safe AI is the only AI that scales."</i></p>
   <br>
