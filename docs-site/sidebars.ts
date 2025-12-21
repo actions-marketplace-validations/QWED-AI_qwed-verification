@@ -49,6 +49,9 @@ const sidebars: SidebarsConfig = {
       label: 'Protocol Specifications',
       items: [
         'specs/overview',
+        'specs/qwed-spec',
+        'specs/attestation',
+        'specs/agent',
       ],
     },
     {
