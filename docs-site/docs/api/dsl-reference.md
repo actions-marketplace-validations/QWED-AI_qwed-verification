@@ -60,8 +60,8 @@ All expressions are enclosed in parentheses. The operator comes first, followed 
 |----------|---------|---------|
 | `EQ` | Equal (=) | `(EQ x 5)` |
 | `NE` | Not equal (≠) | `(NE x 0)` |
-| `GT` | Greater than (>) | `(GT x 5)` |
-| `LT` | Less than (<) | `(LT x 10)` |
+| `GT` | Greater than | `(GT x 5)` |
+| `LT` | Less than | `(LT x 10)` |
 | `GE` | Greater or equal (≥) | `(GE x 0)` |
 | `LE` | Less or equal (≤) | `(LE x 100)` |
 
@@ -140,7 +140,7 @@ FALSE
 ```lisp
 (INT x)          # x is an integer
 (NAT x)          # x is a natural number (≥ 0)
-(POS x)          # x is positive (> 0)
+(POS x)          ; x is positive
 ```
 
 ### Array/List Operations

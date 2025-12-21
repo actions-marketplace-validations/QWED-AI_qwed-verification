@@ -10,8 +10,13 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional
 
-# Configuration (move to .env later)
-SECRET_KEY = "your-secret-key-change-this-in-production"  # TODO: Move to env
+# Configuration - MUST be set via environment variables
+SECRET_KEY = os.getenv("QWED_JWT_SECRET_KEY")
+if not SECRET_KEY:
+    import logging
+    logging.warning("⚠️ QWED_JWT_SECRET_KEY not set! Using insecure random key. Set this in production!")
+    SECRET_KEY = secrets.token_urlsafe(32)  # Generate random key for dev
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
