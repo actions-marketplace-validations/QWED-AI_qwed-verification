@@ -8,6 +8,7 @@ import httpx
 import time
 from typing import List, Dict, Any, Optional, Union
 from contextlib import contextmanager
+import os
 
 from qwed_sdk.models import VerificationResult, BatchResult, VerificationType
 
@@ -161,6 +162,73 @@ class QWEDClient:
         )
         data["latency_ms"] = (time.time() - start) * 1000
         return VerificationResult.from_dict(data)
+
+    def verify_stats(
+        self,
+        query: str,
+        file_path: str
+    ) -> VerificationResult:
+        """
+        Verify statistical claims about uploaded data.
+
+        Args:
+            query: The question or claim to verify
+            file_path: Path to the CSV file
+        """
+        start = time.time()
+        url = f"{self.base_url}/verify/stats"
+
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f)}
+            # Do not use _request here because it sets Content-Type to JSON
+            response = self._client.post(
+                url,
+                headers={"X-API-Key": self.api_key},
+                data={"query": query},
+                files=files
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        data["latency_ms"] = (time.time() - start) * 1000
+        return VerificationResult.from_dict(data)
+
+    def verify_consensus(
+        self,
+        query: str,
+        mode: str = "single",
+        min_confidence: float = 0.95
+    ) -> VerificationResult:
+        """
+        Verify with multi-engine consensus.
+
+        Args:
+            query: The query to verify
+            mode: Verification mode ("single", "high", "maximum")
+            min_confidence: Minimum confidence threshold (0.0 to 1.0)
+        """
+        start = time.time()
+        data = self._request(
+            "POST",
+            "/verify/consensus",
+            json={
+                "query": query,
+                "verification_mode": mode,
+                "min_confidence": min_confidence
+            }
+        )
+        data["latency_ms"] = (time.time() - start) * 1000
+        # The API returns a structure that VerificationResult.from_dict can handle
+        # provided we treat the response as the "result" dictionary or map fields.
+        # The API returns: { "final_answer": ..., "confidence": ..., "verification_chain": ... }
+        # We wrap this in a VerificationResult.
+
+        return VerificationResult(
+            status="VERIFIED" if data.get("meets_requirement", False) else "UNVERIFIED",
+            is_verified=data.get("meets_requirement", False),
+            result=data,
+            latency_ms=data.get("latency_ms", 0.0) or (time.time() - start) * 1000
+        )
     
     def verify_image(
         self,
@@ -348,6 +416,58 @@ class QWEDAsyncClient:
         data["latency_ms"] = (time.time() - start) * 1000
         return VerificationResult.from_dict(data)
     
+    async def verify_stats(
+        self,
+        query: str,
+        file_path: str
+    ) -> VerificationResult:
+        """Verify statistical claims about uploaded data."""
+        if not self._client:
+            raise RuntimeError("Client not initialized. Use 'async with' context.")
+
+        start = time.time()
+        url = f"{self.base_url}/verify/stats"
+
+        # Async file upload logic
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f)}
+            response = await self._client.post(
+                url,
+                headers={"X-API-Key": self.api_key},
+                data={"query": query},
+                files=files
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        data["latency_ms"] = (time.time() - start) * 1000
+        return VerificationResult.from_dict(data)
+
+    async def verify_consensus(
+        self,
+        query: str,
+        mode: str = "single",
+        min_confidence: float = 0.95
+    ) -> VerificationResult:
+        """Verify with multi-engine consensus."""
+        start = time.time()
+        data = await self._request(
+            "POST",
+            "/verify/consensus",
+            json={
+                "query": query,
+                "verification_mode": mode,
+                "min_confidence": min_confidence
+            }
+        )
+
+        return VerificationResult(
+            status="VERIFIED" if data.get("meets_requirement", False) else "UNVERIFIED",
+            is_verified=data.get("meets_requirement", False),
+            result=data,
+            latency_ms=data.get("latency_ms", 0.0) or (time.time() - start) * 1000
+        )
+
     async def verify_image(
         self,
         image_path: str,
