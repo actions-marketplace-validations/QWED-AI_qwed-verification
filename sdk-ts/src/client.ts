@@ -91,7 +91,14 @@ export class QWEDClient {
             clearTimeout(timeoutId);
 
             if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
+                const errorData = await response.json().catch(() => ({})) as {
+                    message?: string;
+                    error?: {
+                        message?: string;
+                        code?: string;
+                        details?: Record<string, unknown>;
+                    };
+                };
 
                 if (response.status === 401) {
                     throw new QWEDAuthError(errorData.message || 'Invalid API key');
@@ -113,7 +120,7 @@ export class QWEDClient {
                 );
             }
 
-            return response.json();
+            return response.json() as Promise<T>;
         } catch (error) {
             clearTimeout(timeoutId);
 
