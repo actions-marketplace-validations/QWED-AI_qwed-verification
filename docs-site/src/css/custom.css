@@ -1,24 +1,26 @@
 /**
  * QWED Documentation Theme
- * Brand: Dark theme with green accents (matching qwedai.com)
- * Font: Inter for modern, clean look
+ * Matches qwedai.com branding exactly
+ * Colors: Zinc dark theme + Emerald hover accents
+ * Font: Inter + JetBrains Mono
  */
 
 /* Import Inter font */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 
 /* ================================
-   QWED Brand Colors
+   QWED Brand Colors (from qwedai.com)
+   Zinc dark + Emerald-500 accents
    ================================ */
 :root {
-  /* Primary: QWED Green */
-  --ifm-color-primary: #22c55e;
-  --ifm-color-primary-dark: #16a34a;
-  --ifm-color-primary-darker: #15803d;
-  --ifm-color-primary-darkest: #166534;
-  --ifm-color-primary-light: #4ade80;
-  --ifm-color-primary-lighter: #86efac;
-  --ifm-color-primary-lightest: #bbf7d0;
+  /* Primary: Emerald (hover accent) */
+  --ifm-color-primary: #10b981;
+  --ifm-color-primary-dark: #059669;
+  --ifm-color-primary-darker: #047857;
+  --ifm-color-primary-darkest: #065f46;
+  --ifm-color-primary-light: #34d399;
+  --ifm-color-primary-lighter: #6ee7b7;
+  --ifm-color-primary-lightest: #a7f3d0;
 
   /* Typography */
   --ifm-font-family-base: 'Inter', system-ui, -apple-system, sans-serif;
@@ -28,52 +30,55 @@
 
   /* Code */
   --ifm-code-font-size: 90%;
-  --docusaurus-highlighted-code-line-bg: rgba(34, 197, 94, 0.1);
-
-  /* Navbar - Light mode (will use dark mode by default) */
-  --ifm-navbar-background-color: #ffffff;
-  --ifm-navbar-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-
-  /* Footer */
-  --ifm-footer-background-color: #0a0a0a;
+  --docusaurus-highlighted-code-line-bg: rgba(16, 185, 129, 0.1);
 }
 
 /* ================================
-   Dark Mode (Primary Theme)
+   Dark Mode (Default - matches qwedai.com)
    ================================ */
 [data-theme='dark'] {
-  /* Green accents on dark */
-  --ifm-color-primary: #22c55e;
-  --ifm-color-primary-dark: #16a34a;
-  --ifm-color-primary-darker: #15803d;
-  --ifm-color-primary-darkest: #166534;
-  --ifm-color-primary-light: #4ade80;
-  --ifm-color-primary-lighter: #86efac;
-  --ifm-color-primary-lightest: #bbf7d0;
+  /* Emerald accents */
+  --ifm-color-primary: #10b981;
+  --ifm-color-primary-dark: #059669;
+  --ifm-color-primary-darker: #047857;
+  --ifm-color-primary-darkest: #065f46;
+  --ifm-color-primary-light: #34d399;
+  --ifm-color-primary-lighter: #6ee7b7;
+  --ifm-color-primary-lightest: #a7f3d0;
 
-  /* Background - pure black like qwedai.com */
-  --ifm-background-color: #0a0a0a;
-  --ifm-background-surface-color: #111111;
+  /* Zinc backgrounds (matches qwedai.com) */
+  --ifm-background-color: #09090b;
+  /* Zinc 950 */
+  --ifm-background-surface-color: #18181b;
+  /* Zinc 900 */
 
   /* Navbar */
-  --ifm-navbar-background-color: #0a0a0a;
-  --ifm-navbar-link-color: #e5e5e5;
-  --ifm-navbar-link-hover-color: #22c55e;
+  --ifm-navbar-background-color: rgba(9, 9, 11, 0.8);
+  --ifm-navbar-link-color: #fafafa;
+  --ifm-navbar-link-hover-color: #10b981;
 
   /* Footer */
-  --ifm-footer-background-color: #0a0a0a;
-  --ifm-footer-link-color: #a3a3a3;
-  --ifm-footer-link-hover-color: #22c55e;
+  --ifm-footer-background-color: #09090b;
+  --ifm-footer-link-color: #a1a1aa;
+  /* Zinc 400 */
+  --ifm-footer-link-hover-color: #10b981;
 
   /* Text */
-  --ifm-font-color-base: #e5e5e5;
-  --ifm-heading-color: #ffffff;
+  --ifm-font-color-base: #fafafa;
+  /* Zinc 50 */
+  --ifm-heading-color: #fafafa;
+
+  /* Borders */
+  --ifm-color-emphasis-200: #27272a;
+  /* Zinc 800 */
+  --ifm-color-emphasis-300: #3f3f46;
+  /* Zinc 700 */
 
   /* Code blocks */
-  --docusaurus-highlighted-code-line-bg: rgba(34, 197, 94, 0.15);
+  --docusaurus-highlighted-code-line-bg: rgba(16, 185, 129, 0.15);
 
-  /* Cards and surfaces */
-  --ifm-card-background-color: #111111;
+  /* Cards */
+  --ifm-card-background-color: #18181b;
 }
 
 /* ================================
@@ -82,72 +87,91 @@
 body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.01em;
 }
 
 /* ================================
-   Navbar
+   Navbar (matches qwedai.com)
    ================================ */
 .navbar {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 1px solid #27272a;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .navbar__brand {
-  font-weight: 600;
+  font-weight: 500;
+  letter-spacing: 0.05em;
 }
 
-/* Logo hover effect - green */
-.navbar__brand:hover {
-  opacity: 1;
-}
-
+/* Logo hover - emerald green */
 .navbar__brand:hover .navbar__logo {
-  filter: brightness(0) saturate(100%) invert(61%) sepia(52%) saturate(501%) hue-rotate(93deg) brightness(95%) contrast(91%);
+  filter: brightness(0) saturate(100%) invert(64%) sepia(74%) saturate(422%) hue-rotate(111deg) brightness(93%) contrast(88%);
+  transform: rotate(90deg);
 }
 
 .navbar__brand:hover .navbar__title {
-  color: #22c55e;
+  color: #10b981 !important;
 }
 
-/* Nav links hover - green */
+.navbar__logo {
+  transition: all 0.3s ease;
+}
+
+.navbar__title {
+  transition: color 0.2s ease;
+}
+
+/* Nav links */
 .navbar__link {
   font-weight: 500;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
   transition: color 0.2s ease;
 }
 
 .navbar__link:hover,
 .navbar__link--active {
-  color: #22c55e !important;
+  color: #10b981 !important;
 }
 
 /* ================================
-   Mobile Menu Fix
+   Mobile Menu (Fixed)
    ================================ */
 .navbar-sidebar {
-  background-color: #0a0a0a;
+  background-color: #09090b;
 }
 
 .navbar-sidebar__brand {
-  background-color: #0a0a0a;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background-color: #09090b;
+  border-bottom: 1px solid #27272a;
 }
 
 .navbar-sidebar__items {
-  background-color: #0a0a0a;
+  background-color: #09090b;
 }
 
 .navbar-sidebar .menu__link {
-  color: #e5e5e5;
-  padding: 0.75rem 1rem;
+  color: #fafafa;
+  padding: 1rem 1.25rem;
+  font-size: 1.5rem;
+  font-weight: 300;
+  letter-spacing: -0.02em;
 }
 
 .navbar-sidebar .menu__link:hover {
-  color: #22c55e;
-  background-color: rgba(34, 197, 94, 0.1);
+  color: #10b981;
+  background-color: transparent;
+  transform: translateX(8px);
 }
 
-/* Toggle button */
 .navbar__toggle {
-  color: #e5e5e5;
+  color: #a1a1aa;
+}
+
+.navbar__toggle:hover {
+  color: #fafafa;
 }
 
 /* ================================
@@ -156,44 +180,43 @@ body {
 .menu__link {
   font-weight: 500;
   transition: all 0.2s ease;
-  border-radius: 6px;
+  border-radius: 4px;
+  color: #a1a1aa;
 }
 
 .menu__link:hover {
-  color: #22c55e;
-  background-color: rgba(34, 197, 94, 0.1);
+  color: #10b981;
+  background-color: rgba(16, 185, 129, 0.1);
 }
 
 .menu__link--active {
-  font-weight: 600;
-  color: #22c55e !important;
-  background-color: rgba(34, 197, 94, 0.15) !important;
+  font-weight: 500;
+  color: #10b981 !important;
+  background-color: rgba(16, 185, 129, 0.1) !important;
 }
 
-/* Sidebar category labels */
 .menu__list-item-collapsible:hover {
-  background-color: rgba(34, 197, 94, 0.1);
+  background-color: rgba(16, 185, 129, 0.05);
 }
 
 /* ================================
-   Links
+   Links - Emerald hover
    ================================ */
 a {
   transition: color 0.2s ease;
 }
 
 a:hover {
-  color: #22c55e;
+  color: #10b981;
   text-decoration: none;
 }
 
-/* Content links */
 .markdown a {
-  color: #22c55e;
+  color: #10b981;
 }
 
 .markdown a:hover {
-  color: #4ade80;
+  color: #34d399;
   text-decoration: underline;
 }
 
@@ -202,7 +225,8 @@ a:hover {
    ================================ */
 pre {
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid #27272a;
+  background-color: #18181b !important;
 }
 
 code {
@@ -210,94 +234,101 @@ code {
   font-weight: 500;
 }
 
-/* Inline code */
+/* Inline code - subtle emerald */
 :not(pre)>code {
-  background-color: rgba(34, 197, 94, 0.1);
-  border: 1px solid rgba(34, 197, 94, 0.2);
-  color: #4ade80;
+  background-color: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  color: #34d399;
 }
 
 /* ================================
    Buttons
    ================================ */
 .button--primary {
-  background-color: #22c55e;
-  border-color: #22c55e;
-  color: #000000;
+  background-color: #10b981;
+  border-color: #10b981;
+  color: #09090b;
+  font-weight: 500;
 }
 
 .button--primary:hover {
-  background-color: #16a34a;
-  border-color: #16a34a;
-  color: #000000;
+  background-color: #059669;
+  border-color: #059669;
+  color: #09090b;
 }
 
 .button--secondary {
-  border-color: #22c55e;
-  color: #22c55e;
+  border-color: #10b981;
+  color: #10b981;
 }
 
 .button--secondary:hover {
-  background-color: rgba(34, 197, 94, 0.1);
-  border-color: #4ade80;
-  color: #4ade80;
+  background-color: rgba(16, 185, 129, 0.1);
+  border-color: #34d399;
+  color: #34d399;
 }
 
 /* ================================
    Hero Section
    ================================ */
 .hero--primary {
-  background: #0a0a0a;
+  background: #09090b;
+  padding: 4rem 0;
 }
 
 .hero__title {
-  color: #ffffff;
+  color: #fafafa;
+  font-weight: 300;
+  letter-spacing: -0.03em;
 }
 
 .hero__subtitle {
-  color: #a3a3a3;
+  color: #a1a1aa;
+  font-weight: 400;
 }
 
 /* ================================
    Footer
    ================================ */
 .footer {
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid #27272a;
+  background-color: #09090b;
 }
 
 .footer__title {
-  color: #ffffff;
+  color: #fafafa;
+  font-weight: 500;
 }
 
 .footer__link-item {
+  color: #a1a1aa;
   transition: color 0.2s ease;
 }
 
 .footer__link-item:hover {
-  color: #22c55e;
+  color: #10b981;
   text-decoration: none;
 }
 
 .footer__copyright {
-  color: #a3a3a3;
+  color: #52525b;
 }
 
 /* ================================
    Search
    ================================ */
 .DocSearch-Button {
-  border-radius: 8px !important;
-  background-color: #111111 !important;
-  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 6px !important;
+  background-color: #18181b !important;
+  border: 1px solid #27272a !important;
 }
 
 .DocSearch-Button:hover {
-  border-color: #22c55e !important;
-  box-shadow: 0 0 0 1px #22c55e !important;
+  border-color: #10b981 !important;
 }
 
-.DocSearch-Button-Keys {
-  display: none;
+.DocSearch-Button-Placeholder {
+  color: #a1a1aa !important;
 }
 
 /* ================================
@@ -308,105 +339,84 @@ table {
 }
 
 table th {
-  background-color: #111111;
-  border-color: rgba(255, 255, 255, 0.1);
+  background-color: #18181b;
+  border-color: #27272a;
+  font-weight: 500;
 }
 
 table td {
-  border-color: rgba(255, 255, 255, 0.1);
+  border-color: #27272a;
 }
 
 table tr:hover {
-  background-color: rgba(34, 197, 94, 0.05);
+  background-color: rgba(16, 185, 129, 0.05);
 }
 
 /* ================================
    Blockquotes
    ================================ */
 blockquote {
-  border-left-color: #22c55e;
-  background-color: rgba(34, 197, 94, 0.05);
+  border-left-color: #10b981;
+  background-color: rgba(16, 185, 129, 0.05);
+  color: #a1a1aa;
 }
 
 /* ================================
    Tabs
    ================================ */
 .tabs__item {
-  border-radius: 6px 6px 0 0;
+  font-weight: 500;
 }
 
 .tabs__item:hover {
-  background-color: rgba(34, 197, 94, 0.1);
+  background-color: rgba(16, 185, 129, 0.1);
 }
 
 .tabs__item--active {
-  border-bottom-color: #22c55e !important;
-  color: #22c55e !important;
+  border-bottom-color: #10b981 !important;
+  color: #10b981 !important;
 }
 
 /* ================================
    Pagination
    ================================ */
 .pagination-nav__link {
-  border-color: rgba(255, 255, 255, 0.1);
+  border-color: #27272a;
   transition: all 0.2s ease;
 }
 
 .pagination-nav__link:hover {
-  border-color: #22c55e;
-  background-color: rgba(34, 197, 94, 0.05);
+  border-color: #10b981;
+  background-color: rgba(16, 185, 129, 0.05);
 }
 
 .pagination-nav__sublabel {
-  color: #a3a3a3;
+  color: #a1a1aa;
 }
 
 /* ================================
-   TOC (Table of Contents)
+   TOC
    ================================ */
 .table-of-contents__link {
-  color: #a3a3a3;
+  color: #a1a1aa;
 }
 
 .table-of-contents__link:hover,
 .table-of-contents__link--active {
-  color: #22c55e;
-}
-
-/* ================================
-   Alerts/Admonitions
-   ================================ */
-.alert {
-  border-radius: 8px;
-}
-
-.alert--success {
-  --ifm-alert-background-color: rgba(34, 197, 94, 0.1);
-  --ifm-alert-border-color: #22c55e;
-}
-
-/* ================================
-   Blog
-   ================================ */
-.blog-post-date {
-  color: #a3a3a3;
+  color: #10b981;
 }
 
 /* ================================
    Version Badge
    ================================ */
-.badge {
-  border-radius: 4px;
-}
-
 .badge--secondary {
-  background-color: rgba(34, 197, 94, 0.1);
-  color: #22c55e;
-  border-color: rgba(34, 197, 94, 0.2);
+  background-color: rgba(16, 185, 129, 0.1);
+  color: #10b981;
+  border-color: rgba(16, 185, 129, 0.2);
 }
 
 /* ================================
-   Scrollbar (Webkit)
+   Scrollbar (matches qwedai.com)
    ================================ */
 ::-webkit-scrollbar {
   width: 8px;
@@ -414,14 +424,31 @@ blockquote {
 }
 
 ::-webkit-scrollbar-track {
-  background: #0a0a0a;
+  background: #09090b;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #333333;
+  background: #27272a;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #22c55e;
+  background: #a1a1aa;
+}
+
+/* ================================
+   Selection
+   ================================ */
+::selection {
+  background: #27272a;
+  color: #fafafa;
+}
+
+/* ================================
+   Animations
+   ================================ */
+@keyframes rotate-90 {
+  to {
+    transform: rotate(90deg);
+  }
 }
