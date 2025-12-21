@@ -1,3 +1,0 @@
-"""
-QWED Deep Benchmark Suite
-"""
