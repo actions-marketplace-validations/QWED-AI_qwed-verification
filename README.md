@@ -1,5 +1,6 @@
 <div align="center">
-  <h1>🛡️ QWED Protocol</h1>
+  <img src="assets/logo.svg" alt="QWED Logo" width="80" height="80">
+  <h1>QWED Protocol</h1>
   <h3>The Deterministic Verification Layer for AI</h3>
   
   <p>
