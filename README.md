@@ -31,6 +31,24 @@ This is like forcing a student to memorize 1,000,000 math problems.
 
 ---
 
+## 📊 The Proof: Why You Need QWED
+
+We benchmarked **Claude Opus 4.5** (one of the world's best LLMs) on 215 critical tasks.
+
+![QWED Benchmark Results](docs-site/static/img/benchmark_chart.png)
+
+| Finding | Implication |
+|---------|-------------|
+| **Finance:** 73% accuracy | Banks can't use raw LLM for calculations |
+| **Adversarial:** 85% accuracy | LLMs fall for authority bias tricks |
+| **QWED:** 100% error detection | All 22 errors caught before production |
+
+> **QWED doesn't compete with LLMs. We ENABLE them for production use.**
+
+📄 [Full Benchmark Report →](BENCHMARKS.md)
+
+---
+
 ## ✅ The Solution: Give the AI a Calculator
 
 **QWED** doesn't try to make the LLM "smarter". 
