@@ -188,12 +188,21 @@ agent = QWEDVerifiedAgent(role="Analyst", allow_dangerous_code=False)
 
 ## 🌍 SDK Support
 
+> ⚠️ **Note:** SDKs are not yet published to package registries. For now, clone the repo and use directly. Once approved, you can install via pip/npm.
+
 | Language | Package | Install |
 |----------|---------|---------|
 | 🐍 Python | `qwed` | `pip install qwed` |
 | 🟦 TypeScript | `@qwed-ai/sdk` | `npm install @qwed-ai/sdk` |
 | 🐹 Go | `qwed-go` | `go get github.com/qwed-ai/qwed-go` |
 | 🦀 Rust | `qwed` | `cargo add qwed` |
+
+**Until SDKs are live:**
+```bash
+git clone https://github.com/QWED-AI/qwed-verification.git
+cd qwed-verification
+pip install -r requirements.txt
+```
 
 ---
 
