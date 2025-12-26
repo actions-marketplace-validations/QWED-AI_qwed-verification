@@ -199,5 +199,164 @@ def divide(x: int, y: int) -> float:
         assert "assert y != 0" in decorated
 
 
+# =============================================================================
+# Phase 2: Bounded Model Checking Tests
+# =============================================================================
+
+class TestComplexityAnalysis:
+    """Test complexity analysis for bounded model checking."""
+    
+    def setup_method(self):
+        self.verifier = SymbolicVerifier()
+    
+    def test_find_simple_for_loop(self):
+        """Test detection of simple for loop."""
+        code = """
+def iterate(items):
+    for item in items:
+        print(item)
+"""
+        result = self.verifier.analyze_complexity(code)
+        assert result["status"] == "analyzed"
+        assert result["total_loops"] == 1
+        assert result["loops"][0]["type"] == "for"
+    
+    def test_find_while_loop(self):
+        """Test detection of while loop."""
+        code = """
+def countdown(n):
+    while n > 0:
+        n -= 1
+"""
+        result = self.verifier.analyze_complexity(code)
+        assert result["total_loops"] == 1
+        assert result["loops"][0]["type"] == "while"
+    
+    def test_nested_loops_depth(self):
+        """Test detection of nested loop depth."""
+        code = """
+def matrix_ops(matrix):
+    for row in matrix:
+        for col in row:
+            for item in col:
+                print(item)
+"""
+        result = self.verifier.analyze_complexity(code)
+        assert result["max_loop_depth"] == 3
+        assert result["total_loops"] == 3
+    
+    def test_detect_direct_recursion(self):
+        """Test detection of direct recursion."""
+        code = """
+def factorial(n: int) -> int:
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+"""
+        result = self.verifier.analyze_complexity(code)
+        assert result["total_recursive_functions"] >= 1
+        assert any(r["type"] == "direct" for r in result["recursions"])
+    
+    def test_complexity_score(self):
+        """Test complexity score calculation."""
+        simple_code = """
+def add(x, y):
+    return x + y
+"""
+        complex_code = """
+def complex_func(items):
+    for i in items:
+        for j in items:
+            while True:
+                if i == j:
+                    break
+"""
+        simple_result = self.verifier.analyze_complexity(simple_code)
+        complex_result = self.verifier.analyze_complexity(complex_code)
+        
+        assert simple_result["complexity_score"] < complex_result["complexity_score"]
+    
+    def test_recommendation_for_complex_code(self):
+        """Test that complex code gets appropriate recommendations."""
+        code = """
+def deeply_nested(items):
+    for a in items:
+        for b in items:
+            for c in items:
+                for d in items:
+                    print(a, b, c, d)
+"""
+        result = self.verifier.analyze_complexity(code)
+        assert result["recommendation"]["risk_level"] in ["medium", "high"]
+
+
+class TestBoundedVerification:
+    """Test bounded model checking verification."""
+    
+    def setup_method(self):
+        self.verifier = SymbolicVerifier()
+    
+    def test_verify_bounded_returns_bounds_info(self):
+        """Test that verify_bounded includes bounds information."""
+        code = """
+def simple(x: int) -> int:
+    return x + 1
+"""
+        result = self.verifier.verify_bounded(code, loop_bound=5, recursion_depth=3)
+        assert "bounded" in result
+        assert result["bounded"] == True
+        assert "bounds_applied" in result
+        assert result["bounds_applied"]["loop_bound"] == 5
+        assert result["bounds_applied"]["recursion_depth"] == 3
+    
+    def test_verify_bounded_syntax_error(self):
+        """Test bounded verification handles syntax errors."""
+        code = """
+def broken(
+"""
+        result = self.verifier.verify_bounded(code)
+        assert result["status"] == "syntax_error"
+    
+    def test_add_bounds_transforms_code(self):
+        """Test that _add_bounds_to_code transforms functions."""
+        code = """
+def recursive_func(n: int) -> int:
+    return recursive_func(n - 1)
+"""
+        bounded = self.verifier._add_bounds_to_code(code, loop_bound=10, recursion_depth=5)
+        assert "_qwed_depth" in bounded
+
+
+class TestVerificationBudget:
+    """Test verification budget calculation."""
+    
+    def setup_method(self):
+        self.verifier = SymbolicVerifier()
+    
+    def test_simple_code_feasible(self):
+        """Test that simple code is marked as feasible."""
+        code = """
+def add(x, y):
+    return x + y
+"""
+        result = self.verifier.get_verification_budget(code)
+        assert result["feasible"] == True
+    
+    def test_complex_code_path_explosion(self):
+        """Test that complex code triggers path explosion warning."""
+        code = """
+def explosion(items):
+    for a in items:
+        for b in items:
+            for c in items:
+                for d in items:
+                    for e in items:
+                        print(a, b, c, d, e)
+"""
+        result = self.verifier.get_verification_budget(code, max_paths=100)
+        assert result["feasible"] == False
+        assert "path explosion" in result["message"].lower() or result["estimated_paths"] > 100
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

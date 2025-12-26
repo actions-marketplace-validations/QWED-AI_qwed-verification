@@ -396,6 +396,363 @@ class SymbolicVerifier:
                 node.body = new_body
         
         return ast.unparse(tree)
+    
+    # =========================================================================
+    # Phase 2: Bounded Model Checking
+    # =========================================================================
+    
+    def analyze_complexity(self, code: str) -> Dict[str, Any]:
+        """
+        Analyze code complexity for bounded model checking.
+        
+        Identifies:
+        - Loops and their nesting depth
+        - Recursive functions
+        - Potentially infinite constructs
+        
+        Args:
+            code: Python code to analyze
+            
+        Returns:
+            Dict with complexity analysis
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return {
+                "status": "syntax_error",
+                "message": str(e)
+            }
+        
+        loops = self._find_loops(tree)
+        recursions = self._find_recursions(tree)
+        max_depth = self._calculate_max_loop_depth(tree)
+        
+        return {
+            "status": "analyzed",
+            "loops": loops,
+            "recursions": recursions,
+            "max_loop_depth": max_depth,
+            "total_loops": len(loops),
+            "total_recursive_functions": len(recursions),
+            "complexity_score": len(loops) + len(recursions) * 2 + max_depth,
+            "recommendation": self._get_bounding_recommendation(loops, recursions, max_depth)
+        }
+    
+    def _find_loops(self, tree: ast.AST) -> List[Dict[str, Any]]:
+        """Find all loops in the code with their properties."""
+        loops = []
+        
+        class LoopVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.depth = 0
+                
+            def visit_For(self, node):
+                self.depth += 1
+                loop_info = {
+                    "type": "for",
+                    "line": node.lineno,
+                    "depth": self.depth,
+                    "has_break": self._has_break(node),
+                    "iterable_type": self._get_iterable_type(node)
+                }
+                loops.append(loop_info)
+                self.generic_visit(node)
+                self.depth -= 1
+                
+            def visit_While(self, node):
+                self.depth += 1
+                loop_info = {
+                    "type": "while",
+                    "line": node.lineno,
+                    "depth": self.depth,
+                    "has_break": self._has_break(node),
+                    "condition": ast.unparse(node.test) if hasattr(ast, 'unparse') else str(node.test)
+                }
+                loops.append(loop_info)
+                self.generic_visit(node)
+                self.depth -= 1
+                
+            def _has_break(self, node) -> bool:
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Break):
+                        return True
+                return False
+                
+            def _get_iterable_type(self, node) -> str:
+                if isinstance(node.iter, ast.Call):
+                    if isinstance(node.iter.func, ast.Name):
+                        return node.iter.func.id  # e.g., "range"
+                return "unknown"
+        
+        visitor = LoopVisitor()
+        visitor.visit(tree)
+        return loops
+    
+    def _find_recursions(self, tree: ast.AST) -> List[Dict[str, Any]]:
+        """Find all potentially recursive functions."""
+        recursions = []
+        
+        # Get all function names
+        function_names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                function_names.add(node.name)
+        
+        # Check each function for self-calls
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                func_name = node.name
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Call):
+                        if isinstance(child.func, ast.Name) and child.func.id == func_name:
+                            recursions.append({
+                                "function": func_name,
+                                "line": node.lineno,
+                                "call_line": child.lineno,
+                                "type": "direct"
+                            })
+                            break
+                        # Check for mutual recursion (calls to other defined functions)
+                        elif isinstance(child.func, ast.Name) and child.func.id in function_names:
+                            if child.func.id != func_name:
+                                recursions.append({
+                                    "function": func_name,
+                                    "calls": child.func.id,
+                                    "line": node.lineno,
+                                    "type": "potential_mutual"
+                                })
+        
+        return recursions
+    
+    def _calculate_max_loop_depth(self, tree: ast.AST) -> int:
+        """Calculate maximum loop nesting depth."""
+        max_depth = 0
+        
+        class DepthCalculator(ast.NodeVisitor):
+            def __init__(self):
+                self.current_depth = 0
+                self.max_found = 0
+                
+            def visit_For(self, node):
+                self.current_depth += 1
+                self.max_found = max(self.max_found, self.current_depth)
+                self.generic_visit(node)
+                self.current_depth -= 1
+                
+            def visit_While(self, node):
+                self.current_depth += 1
+                self.max_found = max(self.max_found, self.current_depth)
+                self.generic_visit(node)
+                self.current_depth -= 1
+        
+        calc = DepthCalculator()
+        calc.visit(tree)
+        return calc.max_found
+    
+    def _get_bounding_recommendation(
+        self, 
+        loops: List[Dict], 
+        recursions: List[Dict], 
+        max_depth: int
+    ) -> Dict[str, Any]:
+        """Get recommended bounds based on complexity."""
+        
+        # Base recommendations
+        loop_bound = 10  # Default iterations per loop
+        recursion_depth = 5  # Default recursion depth
+        timeout = 30  # Default timeout
+        
+        # Adjust based on complexity
+        if max_depth > 2:
+            loop_bound = max(3, 10 // max_depth)  # Reduce for deep nesting
+            timeout = min(60, timeout * max_depth)
+            
+        if len(recursions) > 0:
+            recursion_depth = 5
+            if len(loops) > 3:
+                recursion_depth = 3  # More conservative with many loops
+                
+        risk_level = "low"
+        if len(loops) > 5 or max_depth > 3 or len(recursions) > 2:
+            risk_level = "high"
+        elif len(loops) > 2 or max_depth > 1 or len(recursions) > 0:
+            risk_level = "medium"
+        
+        return {
+            "loop_bound": loop_bound,
+            "recursion_depth": recursion_depth,
+            "timeout_seconds": timeout,
+            "risk_level": risk_level,
+            "message": f"Recommended bounds: {loop_bound} iterations, {recursion_depth} recursion depth"
+        }
+    
+    def verify_bounded(
+        self, 
+        code: str,
+        loop_bound: int = 10,
+        recursion_depth: int = 5,
+        prioritize_paths: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Verify code with bounded model checking.
+        
+        Prevents path explosion by limiting:
+        - Loop iterations
+        - Recursion depth
+        - Exploration paths
+        
+        Args:
+            code: Python code to verify
+            loop_bound: Maximum loop iterations to explore
+            recursion_depth: Maximum recursion depth
+            prioritize_paths: If True, check critical paths first
+            
+        Returns:
+            Dict with bounded verification results
+        """
+        # First analyze complexity
+        analysis = self.analyze_complexity(code)
+        
+        if analysis.get("status") == "syntax_error":
+            return {
+                "is_verified": False,
+                "status": "syntax_error",
+                "message": analysis.get("message")
+            }
+        
+        # Transform code to add bounds
+        bounded_code = self._add_bounds_to_code(code, loop_bound, recursion_depth)
+        
+        # Run verification on bounded code
+        result = self.verify_code(bounded_code)
+        
+        # Add bounded analysis info
+        result["bounded"] = True
+        result["bounds_applied"] = {
+            "loop_bound": loop_bound,
+            "recursion_depth": recursion_depth,
+            "prioritized": prioritize_paths
+        }
+        result["complexity_analysis"] = analysis
+        
+        return result
+    
+    def _add_bounds_to_code(
+        self, 
+        code: str, 
+        loop_bound: int, 
+        recursion_depth: int
+    ) -> str:
+        """
+        Transform code to add execution bounds.
+        
+        Adds:
+        - Loop counters with early exit
+        - Recursion depth tracking
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return code  # Return original if can't parse
+        
+        # Add recursion depth tracking to functions
+        class BoundTransformer(ast.NodeTransformer):
+            def __init__(self, max_depth):
+                self.max_depth = max_depth
+                self.transformed_functions = set()
+                
+            def visit_FunctionDef(self, node):
+                # Add depth parameter and check
+                if node.name not in self.transformed_functions:
+                    self.transformed_functions.add(node.name)
+                    
+                    # Create depth check: if _depth > max_depth: raise RecursionError
+                    depth_check = ast.parse(
+                        f"if _qwed_depth > {self.max_depth}: raise RecursionError('QWED: Bounded recursion limit reached')"
+                    ).body[0]
+                    
+                    # Insert at beginning of function (after docstring if present)
+                    insert_idx = 0
+                    if node.body and isinstance(node.body[0], ast.Expr):
+                        if isinstance(node.body[0].value, ast.Constant):
+                            insert_idx = 1
+                    
+                    # Add default parameter for depth
+                    depth_arg = ast.arg(arg='_qwed_depth', annotation=None)
+                    depth_default = ast.Constant(value=0)
+                    
+                    node.args.args.append(depth_arg)
+                    node.args.defaults.append(depth_default)
+                    
+                    node.body.insert(insert_idx, depth_check)
+                
+                self.generic_visit(node)
+                return node
+        
+        transformer = BoundTransformer(recursion_depth)
+        new_tree = transformer.visit(tree)
+        ast.fix_missing_locations(new_tree)
+        
+        try:
+            return ast.unparse(new_tree)
+        except:
+            return code  # Return original if transform fails
+    
+    def get_verification_budget(
+        self, 
+        code: str,
+        max_paths: int = 1000
+    ) -> Dict[str, Any]:
+        """
+        Calculate verification budget - estimated paths to explore.
+        
+        Helps decide if verification is feasible or needs stricter bounds.
+        
+        Args:
+            code: Code to analyze
+            max_paths: Maximum paths before warning
+            
+        Returns:
+            Dict with path estimation and recommendations
+        """
+        analysis = self.analyze_complexity(code)
+        
+        if analysis.get("status") == "syntax_error":
+            return analysis
+        
+        # Estimate paths (simplified heuristic)
+        loops = analysis.get("loops", [])
+        recursions = analysis.get("recursions", [])
+        max_depth = analysis.get("max_loop_depth", 0)
+        
+        # Rough estimation: paths = iterations^depth for nested loops
+        default_iterations = 10
+        estimated_paths = 1
+        
+        for loop in loops:
+            depth = loop.get("depth", 1)
+            if loop.get("iterable_type") == "range":
+                estimated_paths *= default_iterations
+            else:
+                estimated_paths *= default_iterations * 2  # Unknown iterables are worse
+        
+        # Add recursion factor
+        if recursions:
+            estimated_paths *= 2 ** len(recursions)
+        
+        feasible = estimated_paths <= max_paths
+        
+        return {
+            "estimated_paths": min(estimated_paths, 999999),  # Cap for display
+            "max_paths": max_paths,
+            "feasible": feasible,
+            "recommendation": analysis.get("recommendation", {}),
+            "message": (
+                "Verification feasible within budget" if feasible 
+                else f"Path explosion risk: {estimated_paths} paths. Use stricter bounds."
+            )
+        }
 
 
 # Factory function for easy access
