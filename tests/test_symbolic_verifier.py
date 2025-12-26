@@ -136,12 +136,17 @@ def divide(x, y):
         assert len(functions) == 3
 
 
+# Check if CrossHair is available at module level
+_crosshair_available = SymbolicVerifier()._crosshair_available
+
+
 class TestCodeVerification:
     """Test code verification with CrossHair."""
     
     def setup_method(self):
         self.verifier = SymbolicVerifier(timeout_seconds=5)
     
+    @pytest.mark.skipif(not _crosshair_available, reason="CrossHair not installed")
     def test_verify_no_functions(self):
         """Test verification of code with no functions."""
         code = """
@@ -151,6 +156,7 @@ print(x)
         result = self.verifier.verify_code(code)
         assert result["status"] == "no_functions_to_check"
     
+    @pytest.mark.skipif(not _crosshair_available, reason="CrossHair not installed")
     def test_verify_syntax_error(self):
         """Test verification handles syntax errors."""
         code = """
@@ -159,10 +165,7 @@ def broken(
         result = self.verifier.verify_code(code)
         assert result["status"] == "syntax_error"
     
-    @pytest.mark.skipif(
-        not SymbolicVerifier()._crosshair_available,
-        reason="CrossHair not installed"
-    )
+    @pytest.mark.skipif(not _crosshair_available, reason="CrossHair not installed")
     def test_verify_simple_function(self):
         """Test verification of simple typed function."""
         code = """
