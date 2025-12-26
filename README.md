@@ -50,7 +50,7 @@ This is like forcing a student to memorize 1,000,000 math problems.
 
 We benchmarked **Claude Opus 4.5** (one of the world's best LLMs) on 215 critical tasks.
 
-![QWED Benchmark Results](docs-site/static/img/benchmark_chart.png)
+![QWED Benchmark Results](assets/benchmark_chart.png)
 
 | Finding | Implication |
 |---------|-------------|
