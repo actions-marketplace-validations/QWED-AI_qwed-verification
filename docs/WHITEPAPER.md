@@ -15,8 +15,7 @@ slug: /whitepaper
 **Organization:** QWED-AI  
 **Version:** 1.0.0  
 **Date:** December 2024  
-**License:** Apache 2.0  
-**DOI:** *Pending Zenodo Publication*
+**License:** Apache 2.0
 
 ---
 
