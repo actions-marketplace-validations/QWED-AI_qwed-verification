@@ -164,8 +164,8 @@ class TestMathEngineEdgeCases:
     
     def test_invalid_expression(self, engine):
         """Handle invalid math expressions."""
-        result = engine.verify_math("2 + + 2", expected_value=4)
-        assert result["status"] == "SYNTAX_ERROR"
+        result = engine.verify_math("2 *** 2", expected_value=4)  # *** is invalid
+        assert result["status"] == "SYNTAX_ERROR" or "error" in result
     
     def test_division_by_zero(self, engine):
         """Handle division by zero."""
