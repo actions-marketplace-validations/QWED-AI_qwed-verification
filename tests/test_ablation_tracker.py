@@ -187,7 +187,7 @@ class TestAblationTracker:
         tracker.record("code", {
             "is_correct": False,
             "status": "REJECTED",
-            "error": "Unsafe pattern detected"
+            "reason": "Unsafe pattern detected"  # Note: 'error' key would mark this as engine error
         })
         
         breakdown = tracker.get_engine_breakdown("code")
