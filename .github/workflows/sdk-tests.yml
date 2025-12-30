@@ -4,14 +4,14 @@ on:
   push:
     branches: [main]
     paths:
-      - 'sdk/**'
+      - 'sdk_legacy/**'
       - 'sdk-ts/**'
       - 'sdk-go/**'
       - 'sdk-rust/**'
   pull_request:
     branches: [main]
     paths:
-      - 'sdk/**'
+      - 'sdk_legacy/**'
       - 'sdk-ts/**'
       - 'sdk-go/**'
       - 'sdk-rust/**'
@@ -34,7 +34,7 @@ jobs:
       
       - name: Install SDK
         run: |
-          cd sdk/python
+          cd sdk_legacy/python
           pip install -e .
       
       - name: Test Import
@@ -44,7 +44,7 @@ jobs:
       - name: Check Types (optional)
         run: |
           pip install mypy
-          cd sdk/python
+          cd sdk_legacy/python
           mypy qwed --ignore-missing-imports || true
 
   # ============================================
