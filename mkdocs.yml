@@ -7,6 +7,8 @@ docs_dir: docs
 
 theme:
   name: material
+  logo: ../assets/logo.svg
+  favicon: ../assets/logo.svg
   palette:
     - scheme: slate
       primary: deep purple
@@ -76,4 +78,4 @@ extra:
       link: https://linkedin.com/company/qwed-ai
   generator: false
 
-copyright: Copyright &copy; 2024 QWED AI - Built with ❤️ for a deterministic future
+copyright: Copyright &copy; 2025 QWED AI - Built with ❤️ for a deterministic future
