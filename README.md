@@ -149,7 +149,7 @@ graph LR
 
 ---
 
-## vs QWED vs Traditional AI Safety Approaches
+## QWED 🆚 Traditional AI Safety Approaches
 
 | Approach | Accuracy | Deterministic | Explainable | Best For |
 |----------|----------|---------------|-------------|----------|
