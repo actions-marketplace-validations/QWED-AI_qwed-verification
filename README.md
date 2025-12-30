@@ -225,7 +225,7 @@ agent = QWEDVerifiedAgent(role="Analyst", allow_dangerous_code=False)
 | Language | Package | Status |
 |----------|---------|--------|
 | 🐍 Python | `qwed` | ✅ Available on PyPI |
-| 🟦 TypeScript | `@qwed-ai/sdk` | 🟡 Coming Soon |
+| 🟦 TypeScript | `@qwed-ai/sdk` | ✅ Available on npm |
 | 🐹 Go | `qwed-go` | 🟡 Coming Soon |
 | 🦀 Rust | `qwed` | 🟡 Coming Soon |
 
