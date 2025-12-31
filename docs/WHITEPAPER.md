@@ -166,28 +166,42 @@ QWED's deterministic verification provides the formal guarantees these regulatio
 
 **Figure 2: QWED Protocol Architecture**
 
-```mermaid
-flowchart TD
-    A[User Application] --> B[LLM - Untrusted Translator]
-    B --> C{QWED Protocol}
-    C --> D[Math Engine - SymPy]
-    C --> E[Logic Engine - Z3]
-    C --> F[Code Engine - AST]
-    C --> G[SQL Engine - SQLGlot]
-    C --> H[Stats Engine]
-    C --> I[Fact Engine]
-    C --> J[Image Engine]
-    C --> K[Consensus Engine]
-    D --> L{Verification Result}
-    E --> L
-    F --> L
-    G --> L
-    H --> L
-    I --> L
-    J --> L
-    K --> L
-    L -->|Valid| M[✅ VERIFIED - Proceed]
-    L -->|Invalid| N[❌ REJECTED - Halt + Log]
+```
+                    ┌─────────────────────┐
+                    │  User Application   │
+                    └──────────┬──────────┘
+                               │ Query
+                               ▼
+                    ┌──────────────────────────┐
+                    │   LLM (Untrusted)        │
+                    │   GPT-4 / Claude / Gemini│
+                    └──────────┬───────────────┘
+                               │ Unverified Output
+                               ▼
+          ┌────────────────────────────────────────────────┐
+          │            QWED Protocol (Verifier)            │
+          │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐│
+          │  │ Math │ │Logic │ │ Code │ │ SQL  │ │Stats │││
+          │  │SymPy│ │  Z3  │ │ AST  │ │SQLGlot│Pandas│││
+          │  └───┬──┘ └───┬──┘ └───┬──┘ └───┬──┘ └───┬──┘│
+          │      │        │        │        │        │    │
+          │  ┌───┴────────┴────────┴────────┴────────┴──┐ │
+          │  │           ┌──────┐ ┌──────┐ ┌──────┐    │ │
+          │  │           │ Fact │ │Image │ │Consen│    │ │
+          │  │           │ NLI  │ │OpenCV│ │Multi │    │ │
+          │  │           └───┬──┘ └───┬──┘ └───┬──┘    │ │
+          │  └───────────────┴────────┴────────┴───────┘ │
+          │                       │                       │
+          │              Verification Result              │
+          └───────────────────────┬───────────────────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+                    ▼                           ▼
+          ┌──────────────────┐        ┌──────────────────┐
+          │  ✅ VERIFIED      │        │  ❌ REJECTED      │
+          │  (Proceed)        │        │  (Halt + Log)    │
+          └──────────────────┘        └──────────────────┘
 ```
 
 ### 3.2 Core Principles
@@ -1022,13 +1036,24 @@ We evaluated QWED against **Claude Opus 4.5** across 215 test cases in four cate
 
 **Figure 1: Error Detection Comparison (LLM vs QWED)**
 
-```mermaid
-xychart-beta
-    title "LLM Accuracy vs QWED Detection Rate"
-    x-axis [Financial, Mathematical, Adversarial, Code]
-    y-axis "Accuracy %" 0 --> 100
-    bar [73, 81, 85, 78]
-    bar [100, 100, 100, 100]
+```
+       LLM Accuracy vs QWED Detection Rate
+
+  100% ┤                 ████  ████  ████  ████   ← QWED Detection
+       │                 ████  ████  ████  ████
+       │                 ████  ████  ████  ████
+   85% ┤           ████  ████  ████  ████  ████
+       │           ████  ████  ████  ████  ████
+   81% ┤     ████  ████  ████  ████  ████  ████
+       │     ████  ████  ████  ████  ████  ████
+   78% ┤     ████  ████  ████  ████  ████  ████   ← LLM Accuracy
+   73% ┤████  ████  ████  ████  ████  ████  ████
+       │████  ████  ████  ████  ████  ████  ████
+       │████  ████  ████  ████  ████  ████  ████
+     0%└────┴─────┴─────┴─────┴─────┴─────┴─────
+        Fin  Math  Adv   Code  (Categories)
+
+        Legend: ███ Claude Opus 4.5 (73-85%)    ███ QWED (100%)
 ```
 
 ### 6.2.1 Per-Engine Ablation Study
