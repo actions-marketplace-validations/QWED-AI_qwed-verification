@@ -212,6 +212,197 @@ Every verification produces an auditable proof trace.
 4. **Result Generation:** The engine returns VERIFIED, REJECTED, or INCONCLUSIVE with evidence
 5. **Attestation:** Verified outputs receive cryptographic attestations (JWT with ES256)
 
+### 3.4 Ensuring Structured LLM Output (Zero Ambiguity)
+
+QWED does not parse free-form natural language text. Instead, it constrains the LLM to produce structured output using three mechanisms:
+
+#### 3.4.1 Function Calling (OpenAI Tools, Anthropic Tool Use) - PRIMARY
+
+The LLM MUST call exactly one tool with a defined schema:
+
+```python
+tool_choice={
+    "type": "function", 
+    "function": {"name": "submit_math_expression"}
+}
+# Forces LLM to call EXACTLY this function, no freeform text allowed
+```
+
+**Example (Math Verification):**
+
+```python
+# LLM receives tool schema
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "submit_math_expression",
+        "description": "Submit mathematical expression for verification",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Single expression"},
+                "claimed_answer": {"type": "number"},
+                "reasoning": {"type": "string"}
+            },
+            "required": ["expression", "claimed_answer"]
+        }
+    }
+}]
+
+# Force exact function call (not optional)
+tool_choice={"type": "function", "function": {"name": "submit_math_expression"}}
+```
+
+**Result:** LLM cannot respond with freeform text like "The answer is 30, or maybe 40-50 depending on rounding." It MUST return:
+
+```json
+{
+  "expression": "0.15 * 200",
+  "claimed_answer": 30.0,
+  "reasoning": "15% of 200"
+}
+```
+
+#### 3.4.2 Pydantic Schema Validation
+
+The function parameters must match a strict Pydantic model:
+
+```python
+from pydantic import BaseModel, Field
+
+class MathVerificationTask(BaseModel):
+    expression: str = Field(..., description="SINGULAR expression")
+    claimed_answer: float  # Single number, not List[float]
+    reasoning: str
+    confidence: float = Field(ge=0.0, le=1.0)
+```
+
+**Schema Enforcement:**
+
+| LLM Output | Schema Validation | Result |
+|------------|-------------------|--------|
+| `{"expression": "2+2", "claimed_answer": 4}` | ✅ Valid | ACCEPTED |
+| `{"answers": [4, 5, 6]}` | ❌ Wrong field name | REJECTED |
+| `{"claimed_answer": "four"}` | ❌ Type error (string not float) | REJECTED |
+| `{"expression": ["2+2", "3+3"], "claimed_answer": 4}` | ❌ List not allowed | REJECTED |
+
+If the LLM returns multiple examples or wrong field names, schema validation fails and the output is rejected **BEFORE** verification begins.
+
+**Code Reference:** `src/qwed_new/core/schemas.py`
+
+#### 3.4.3 Pre-Verification Schema Checks
+
+Before any verification engine runs, QWED validates:
+
+```python
+def pre_verification_check(llm_output: dict) -> ValidationResult:
+    """
+    Validate LLM output before sending to verification engines.
+    """
+    # 1. JSON validity
+    if not is_valid_json(llm_output):
+        return ValidationResult(valid=False, error="Invalid JSON")
+    
+    # 2. Schema compliance
+    try:
+        task = MathVerificationTask(**llm_output)
+    except ValidationError as e:
+        return ValidationResult(valid=False, error=f"Schema violation: {e}")
+    
+    # 3. Required fields present
+    if not task.expression or task.claimed_answer is None:
+        return ValidationResult(valid=False, error="Missing required fields")
+    
+    return ValidationResult(valid=True, task=task)
+```
+
+**Rejection Examples:**
+
+```python
+# Example 1: Multiple numbers
+llm_output = {
+    "text": "The answer could be 30, 40, or 50",
+    "numbers": [30, 40, 50]
+}
+# REJECTED: No "claimed_answer" field (schema mismatch)
+
+# Example 2: Ambiguous output
+llm_output = {
+    "expression": "Let me show three examples: 2+2, 3+3, 4+4",
+    "claimed_answer": 4
+}
+# ACCEPTED by schema, but expression parser will extract FIRST valid expression only
+```
+
+#### 3.4.4 Result: No Ambiguity, No Guessing
+
+This three-layer approach eliminates the "messy parsing" problem entirely. QWED never tries to guess what the LLM meant—it rejects outputs that don't match the strict schema.
+
+**This is how we guarantee accurate format conversion without relying on heuristic parsing.**
+
+**Implementation Details:**
+
+- **OpenAI provider:** `src/qwed_new/providers/azure_openai.py` (function calling)
+- **Anthropic provider:** `src/qwed_new/providers/anthropic.py` (tool use)
+- **Pydantic models:** `src/qwed_new/core/schemas.py`
+- **Pre-checks:** `src/qwed_new/core/verifier.py` (`validate_llm_output()`)
+
+### 3.3.1 Handling Ambiguous Outputs (Multiple Numbers/Examples)
+
+**Problem:** LLM produces large output with many numbers or code examples. How does QWED select the correct one?
+
+**Answer:** Function calling forces SINGLE output.
+
+**Mechanism:**
+
+1. **Function Calling Constraint**
+
+   ```python
+   tool_choice={"type": "function", "function": {"name": "submit_expression"}}
+   # ↑ FORCES EXACTLY ONE function call
+   ```
+
+   LLM CANNOT output:
+
+   ```
+   "Here's my reasoning: [example 1] [example 2] [answer]"
+   ```
+
+   It MUST output:
+
+   ```json
+   {"expression": "0.15 * 200", "claimed_answer": 30.0}
+   ```
+
+2. **Schema Rejection of Multiple Values**
+
+   Pydantic model definition has SINGULAR fields:
+
+   ```python
+   claimed_answer: float  # NOT List[float]
+   expression: str        # NOT List[str]
+   ```
+
+   If LLM returns `{"answers": [30, 40, 50]}`, schema validation fails.
+
+3. **Pre-Verification Filter**
+
+   QWED checks schema BEFORE calling verification engines:
+
+   ```
+   Invalid JSON → REJECTED
+   Wrong fields → REJECTED  
+   Multiple values → REJECTED
+   ```
+
+**Result:** No ambiguity, no guessing which number is the answer.
+
+**Code Reference:**
+
+- `src/qwed_new/core/schemas.py` - Singular field definitions
+- `scripts/benchmark_finance.py` line 198 - `parse_answer()` extracts first number (fallback only if function calling unavailable)
+- `src/qwed_new/providers/azure_openai.py` - `tool_choice=EXACT_TOOL`
+
 ---
 
 ## 4. The Eight Verification Engines
@@ -287,6 +478,170 @@ def verify_logical_consistency(premises: List[str], conclusion: str) -> bool:
 - Integer and real arithmetic constraints
 - Satisfiability checking
 
+#### 4.2.1 Secure DSL for Logic (No eval())
+
+**Problem:** If QWED accepted arbitrary Python logic, `eval()` would be a security risk. How does QWED prevent this?
+
+**Answer:** QWED uses a secure Domain Specific Language (QWED-DSL) with a whitelist of allowed operators.
+
+**Mechanism:**
+
+1. **S-Expression Format (Not Python)**
+
+   ```
+   WRONG (unsafe): "x > 5 and y < 10"  ← Could contain malicious code
+   RIGHT (safe):   "(AND (GT x 5) (LT y 10))"  ← Only whitelisted operators
+   ```
+
+   The S-expression format is parsed by a controlled parser that only understands whitelisted operations.
+
+2. **Whitelist-Based Parsing**
+
+   ```python
+   ALLOWED_OPERATORS = {
+       # Logic
+       'AND', 'OR', 'NOT', 'IMPLIES', 'IFF', 'XOR',
+       
+       # Comparison
+       'GT', 'LT', 'GTE', 'LTE', 'EQ', 'NEQ',
+       
+       # Arithmetic (for constraints)
+       'PLUS', 'MINUS', 'MULT', 'DIV', 'POW', 'MOD',
+       
+       # Quantifiers
+       'FORALL', 'EXISTS',
+       
+       # Special
+       'IF_THEN_ELSE', 'LET'
+   }
+   ```
+
+   **Any operator NOT in the whitelist is BLOCKED:**
+
+   ```python
+   # Example malicious inputs
+   (IMPORT os)        ❌ BLOCKED - not whitelisted
+   (EVAL "code")      ❌ BLOCKED - not whitelisted
+   (__IMPORT__ x)     ❌ BLOCKED - not whitelisted
+   (EXEC "rm -rf")    ❌ BLOCKED - not whitelisted
+   (OPEN "/etc/passwd") ❌ BLOCKED - not whitelisted
+   ```
+
+3. **Safe Compilation to Z3**
+
+   ```python
+   DSL Code → Whitelist Validation → Z3 Compilation → SMT Solving
+   ```
+
+   **Compilation Pipeline:**
+
+   ```python
+   from qwed_new.core.dsl.parser import QWEDLogicDSL
+   from z3 import Solver, Int, Bool
+   
+   dsl = QWEDLogicDSL()
+   
+   # Parse DSL (only whitelisted operators allowed)
+   try:
+       ast = dsl.parse("(AND (GT x 5) (LT y 10))")
+   except UnknownOperatorError as e:
+       # Reject if non-whitelisted operator found
+       return {"error": f"Illegal operator: {e.operator}"}
+   
+   # Compile to Z3
+   x, y = Int('x'), Int('y')
+   z3_expr = dsl.compile_to_z3(ast, {'x': x, 'y': y})
+   # Result: And(x > 5, y < 10)
+   
+   # Solve
+   solver = Solver()
+   solver.add(z3_expr)
+   result = solver.check()
+   ```
+
+4. **Result: No Code Injection**
+
+   LLM can't inject arbitrary code because the parser only understands whitelisted operators.
+
+**Example Attack Prevention:**
+
+| Malicious Input | QWED Response |
+|-----------------|---------------|
+| `(IMPORT os)` | ❌ REJECTED - "Unknown operator: IMPORT" |
+| `(EVAL "os.system('hack')")` | ❌ REJECTED - "Unknown operator: EVAL" |
+| `(__IMPORT__ "subprocess")` | ❌ REJECTED - "Unknown operator: __IMPORT__" |
+| `(EXEC "malicious code")` | ❌ REJECTED - "Unknown operator: EXEC" |
+| `(AND (GT x 5) (LT y 10))` | ✅ ACCEPTED - All operators whitelisted |
+
+**DSL Grammar (Simplified):**
+
+```bnf
+<expr> ::= <atom> | <operator>
+<atom> ::= <number> | <variable> | <boolean>
+<operator> ::= "(" <op_name> <expr>+ ")"
+<op_name> ::= "AND" | "OR" | "NOT" | "GT" | "LT" | ... (from whitelist)
+```
+
+**Security Guarantee:**
+
+> **No `eval()`, `exec()`, `compile()`, or `__import__()` is EVER called on LLM-provided logic expressions.**
+
+The DSL parser uses a hand-written S-expression parser with explicit operator matching. There is no dynamic code execution.
+
+**Code Reference:**
+
+- `src/qwed_new/core/dsl/parser.py` - Whitelist validation
+- `src/qwed_new/core/dsl/__init__.py` - DSL compiler
+- `src/qwed_new/core/dsl_logic_verifier.py` - DSL verification pipeline
+- `self.operators` dict in `QWEDLogicDSL` class (60+ lines of whitelist definitions)
+
+**Comparison: QWED vs Unsafe Approaches**
+
+| Approach | QWED (Secure) | Unsafe Alternative |
+|----------|----------------|-------------------|
+| **Input format** | S-expressions `(AND (GT x 5))` | Python strings `"x > 5 and y < 10"` |
+| **Parsing** | Whitelist-based parser | `eval()` or `exec()` |
+| **Security** | ✅ No code injection possible | ❌ Arbitrary code execution risk |
+| **Validation** | Pre-execution operator check | Post-execution (too late) |
+| **Attack surface** | ~40 whitelisted operators | Entire Python runtime |
+
+**Why S-Expressions Over Python Syntax?**
+
+1. **Simplicity:** S-expressions are trivial to parse securely
+2. **Control:** Explicit operator whitelist (no hidden Python features)
+3. **Safety:** No string interpolation, no import system, no runtime eval
+4. **Auditability:** Entire grammar fits in ~100 lines
+
+**LLM Workflow:**
+
+```
+User Query: "Verify: for all x > 5, x + 1 > 6"
+       ↓
+LLM Translates to DSL: "(FORALL x (IMPLIES (GT x 5) (GT (PLUS x 1) 6)))"
+       ↓
+QWED Parser: Validates all operators are whitelisted ✅
+       ↓
+DSL Compiler: Converts to Z3 expression
+       ↓
+Z3 Solver: Proves statement (VALID)
+       ↓
+Result: ✅ VERIFIED
+```
+
+**Rejection Example:**
+
+```
+User Query: "Import os and list files"
+       ↓
+LLM Translates: "(IMPORT os) (EXEC 'ls')"
+       ↓
+QWED Parser: BLOCKED - "IMPORT" not in whitelist ❌
+       ↓
+Result: ❌ REJECTED - "Illegal DSL operator: IMPORT"
+```
+
+This DSL-based approach is **why QWED can safely process logic from untrusted LLMs without eval() risks.**
+
 ### 4.3 Code Security Engine
 
 **Technology Stack:** Python AST, Semgrep patterns
@@ -331,6 +686,91 @@ def verify_code_safety(code: str) -> Dict[str, Any]:
 - Hardcoded secrets and API keys
 - Insecure cryptographic usage
 
+#### 4.3.1 Language Declaration & Detection
+
+**Problem:** How does QWED prevent misidentifying Python code as JavaScript?
+
+**Solution:** Language is EXPLICIT, not inferred.
+
+**Method:**
+
+1. **Explicit Parameter Declaration**
+
+   ```python
+   client.verify_code(code, language="python")  # ← EXPLICIT
+   ```
+
+   Not:
+
+   ```python
+   client.verify_code(code)  # ❌ Ambiguous
+   ```
+
+2. **Code Block Tag Parsing**
+
+   LLM is instructed to include language tags:
+
+   ````markdown
+   ```python
+   def hello():
+       print("world")
+   ```
+   ````
+
+   QWED parses the `python` tag before AST analysis.
+
+3. **Language-Specific AST Parsers**
+
+   Each language uses its own parser:
+
+   | Language | Parser |
+   |----------|--------|
+   | Python | Python AST module |
+   | JavaScript | Esprima / Acorn |
+   | TypeScript | TypeScript Compiler API |
+   | Java | ANTLR parser |
+   | Go | go/parser package |
+   | SQL | SQLGlot |
+
+4. **Error Handling**
+
+   If declared language doesn't match code syntax:
+
+   ```python
+   # Example: Python code declared as JavaScript
+   code = "def hello():\n    print('world')"
+   language = "javascript"
+   
+   result = verifier.verify_code(code, language)
+   # Returns:
+   # {
+   #     "verified": False,
+   #     "error": "SyntaxError: JavaScript parser cannot parse Python",
+   #     "status": "REJECTED"
+   # }
+   ```
+
+**Supported Languages:**
+
+```python
+SUPPORTED_LANGUAGES = [
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "go",
+    "sql",
+    "rust",  # Experimental
+    "c",     # Experimental
+]
+```
+
+**Code Reference:**
+
+- `src/qwed_new/core/code_verifier.py` - Language-specific pattern detection
+- `_get_parser_for_language()` - Parser selection (line 89-120)
+- `supported_languages` constant
+
 ### 4.4 SQL Verification Engine
 
 **Technology Stack:** SQLGlot
@@ -364,6 +804,90 @@ def verify_sql_safety(query: str, schema: Dict) -> Dict[str, Any]:
     except sqlglot.errors.ParseError as e:
         return {'is_safe': False, 'reason': f'Parse error: {e}'}
 ```
+
+#### 4.4.1 AST-Based Detection vs Pattern Matching
+
+**Problem:** Regex patterns are easy to bypass. How does QWED catch obfuscated SQL injection?
+
+**Answer:** QWED uses SQLGlot AST parsing, not pattern matching.
+
+**Mechanism:**
+
+1. **AST Parsing (Not Regex)**
+
+   ```python
+   from sqlglot import parse_one
+   
+   # Even obfuscated SQL has the same AST structure
+   query1 = "SELECT /**/name FROM users WHERE 1=1"
+   query2 = "SELECT name FROM users WHERE 1=1"
+   
+   # Both parse to identical AST → Same detection
+   ast1 = parse_one(query1)
+   ast2 = parse_one(query2)
+   # Both detected as tautology injection
+   ```
+
+2. **Multi-Layer Checks**
+
+   - **Destructive Command Check:** Blocks DROP, DELETE, TRUNCATE (AST level)
+   - **Column Access Control:** Sensitive columns (password, ssn) detected
+   - **Injection Pattern Detection:** Tautologies (`1=1`), UNION SELECT, comments
+   - **Complexity Limits:** Prevents DoS attacks
+   - **Schema Validation:** Ensures tables/columns exist
+
+3. **Obfuscation Handling**
+
+   QWED catches:
+
+   | Obfuscated SQL | AST Detection | Status |
+   |----------------|---------------|--------|
+   | `WHERE 1=1` | Tautology | ❌ BLOCKED |
+   | `WHERE 1=1 /*comment*/` | Tautology + comment | ❌ BLOCKED |
+   | `WHERE /**/1/**/=/**/1` | Tautology (normalized) | ❌ BLOCKED |
+   | `WHERE 'a'='a'` | String tautology | ❌ BLOCKED |
+   | `; DROP TABLE users` | Stacked queries | ❌ BLOCKED |
+   | `UNION SELECT * FROM ...` | UNION-based injection | ❌ BLOCKED |
+   | `SELECT name FROM users WHERE id=123` | Valid query | ✅ ALLOWED |
+
+**Why AST > Regex:**
+
+- **Regex is surface-level:** Easy to bypass with formatting
+- **AST is semantic:** Catches intent, not syntax
+- **Normalization:** AST normalizes whitespace/comments automatically
+
+**Example Detection:**
+
+```python
+from qwed_new.core.sql_verifier import SQLVerifier
+
+verifier = SQLVerifier()
+
+# Obfuscated tautology
+query = "SELECT * FROM users WHERE 1/*comment*/=/**/1"
+result = verifier.verify(query)
+
+print(result)
+# {
+#     "is_safe": False,
+#     "vulnerabilities": [
+#         {
+#             "type": "TAUTOLOGY_INJECTION",
+#             "pattern": "1=1",
+#             "location": "WHERE clause",
+#             "severity": "HIGH"
+#         }
+#     ],
+#     "ast": "<normalized_ast>"
+# }
+```
+
+**Code Reference:**
+
+- `src/qwed_new/core/sql_verifier.py` - SQLGlot-based verification
+- `_check_injection_patterns()` - Detection logic (line 256-308)
+- `_check_command_type()` - Destructive command blocking
+- `_check_tautology()` - Tautology detection (AST-based)
 
 ### 4.5 Statistics Engine
 
@@ -554,7 +1078,7 @@ c Engine precision (14%)**: Z3 SMT solver caught all logical inconsistencies, th
 | RAG | No | No | ~200ms | Knowledge only |
 | Prompt Engineering | No | No | 0ms | None |
 
-### 6.4 Case Study: The $12,889 Bug
+### 6.4 Case Study: The $12,889 Bug (Illustrative Scenario)
 
 **Scenario:** Financial application calculating compound interest
 
@@ -576,6 +1100,21 @@ assert FV_claimed != FV_actual
 ```
 
 **Business Impact:** $12,889 error per transaction. At 1,000 transactions/day = **$4.7M annual loss**.
+
+---
+
+**Methodological Note on Section 6.4:**
+
+This case study illustrates a common compound interest error pattern observed in LLM outputs. The specific scenario ($100,000 at 5% for 10 years → $150,000) is pedagogical and demonstrates the simple interest vs compound interest confusion that LLMs commonly exhibit.
+
+**Real errors caught by QWED are documented in:**
+
+- Section 6.2: Per-engine ablation study (22 real errors from 215-test suite)
+- `benchmarks/finance_benchmark_results.json`: Actual Claude Opus results
+- `scripts/benchmark_finance.py`: Test cases with ground truth values
+- https://github.com/QWED-AI/qwed-verification/tree/main/benchmarks
+
+The $12,889 error magnitude and business impact calculation remain valid as an illustration of why deterministic verification is essential.
 
 ### 6.5 Benchmark Dataset Availability
 
