@@ -57,8 +57,8 @@ requires-python = ">=3.10"
 readme = "README.md"
 
 [project.urls]
-Homepage = "https://qwed.ai"
-Documentation = "https://docs.qwed.ai"
+Homepage = "https://qwedai.com"
+Documentation = "https://docs.qwedai.com"
 Repository = "https://github.com/QWED-AI/qwed-verification"
 Changelog = "https://github.com/QWED-AI/qwed-verification/blob/main/CHANGELOG.md"
 
