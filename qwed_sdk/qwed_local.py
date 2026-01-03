@@ -460,7 +460,8 @@ SymPy code:"""
         """
         Verify logical query.
         
-        Uses Z3 for SAT solving.
+        Uses Z3 for SAT solving and boolean logic verification.
+        Checks cache first to save API costs!
         """
         if not self.has_z3:
             return VerificationResult(
@@ -468,23 +469,245 @@ SymPy code:"""
                 error="Z3 not installed. Run: pip install z3-solver"
             )
         
-        # TODO: Implement Z3 verification
-        return VerificationResult(
-            verified=False,
-            error="Logic verification not yet implemented"
-        )
+        # Check cache first
+        if self._cache:
+            cached_result = self._cache.get(query)
+            if cached_result:
+                if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                    print(f"{QWED.SUCCESS}⚡ Cache HIT{QWED.RESET} {QWED.INFO}(saved API call!){QWED.RESET}")
+                return VerificationResult(**cached_result)
+        
+        # Show QWED branding
+        if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+            print(f"\n{QWED.BRAND}🔬 QWED Verification{QWED.RESET} {QWED.INFO}| Logic Engine{QWED.RESET}")
+        
+        # Step 1: Ask LLM for answer
+        prompt = f"""Solve this logic problem and respond with TRUE or FALSE:
+
+{query}
+
+Answer (TRUE or FALSE only):"""
+        
+        try:
+            llm_response = self._call_llm(prompt)
+            llm_answer = llm_response.strip().upper()
+            
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                print(f"{QWED.INFO}📝 LLM Response: {llm_answer}{QWED.RESET}")
+            
+            # Step 2: Ask LLM for Z3 boolean expression
+            expr_prompt = f"""Convert this logic statement to Python Z3 code:
+
+{query}
+
+Respond with ONLY the Z3 boolean expression code, nothing else.
+Use Bool variables for propositions.
+Example: "And(Bool('p'), Or(Bool('q'), Not(Bool('r'))))"
+
+Z3 code:"""
+            
+            llm_expr = self._call_llm(expr_prompt)
+            
+            # Step 3: Verify with Z3
+            try:
+                from z3 import Bool, And, Or, Not, Implies, Solver, sat
+                
+                # Safe eval with Z3 namespace
+                z3_namespace = {
+                    "Bool": Bool,
+                    "And": And,
+                    "Or": Or, 
+                    "Not": Not,
+                    "Implies": Implies,
+                    "__builtins__": {}
+                }
+                
+                expr = eval(llm_expr.strip(), z3_namespace)
+                
+                # Use Z3 solver
+                solver = Solver()
+                solver.add(expr)
+                
+                # Check satisfiability
+                result = solver.check()
+                is_satisfiable = (result == sat)
+                
+                # Compare with LLM answer
+                llm_says_true = llm_answer == "TRUE"
+                is_correct = is_satisfiable == llm_says_true
+                
+                verification_result = VerificationResult(
+                    verified=is_correct,
+                    value=str(is_satisfiable).upper(),
+                    confidence=1.0 if is_correct else 0.0,
+                    evidence={
+                        "llm_answer": llm_answer,
+                        "z3_satisfiable": is_satisfiable,
+                        "z3_expr": llm_expr.strip(),
+                        "method": "z3_sat"
+                    }
+                )
+                
+                # Save to cache
+                if self._cache and is_correct:
+                    cache_data = {
+                        "verified": verification_result.verified,
+                        "value": verification_result.value,
+                        "confidence": verification_result.confidence,
+                        "evidence": verification_result.evidence
+                    }
+                    self._cache.set(query, cache_data)
+                
+                # Show result
+                if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                    if is_correct:
+                        print(f"{QWED.SUCCESS}✅ VERIFIED{QWED.RESET} {QWED.VALUE}→ {is_satisfiable}{QWED.RESET}")
+                        _show_github_nudge()
+                    else:
+                        print(f"{QWED.ERROR}❌ MISMATCH{QWED.RESET}")
+                        print(f"  LLM said: {llm_answer}")
+                        print(f"  Z3 result: {is_satisfiable}")
+                
+                return verification_result
+            
+            except Exception as e:
+                if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                    print(f"{QWED.ERROR}❌ Z3 verification failed: {str(e)}{QWED.RESET}")
+                
+                return VerificationResult(
+                    verified=False,
+                    error=f"Z3 verification failed: {str(e)}",
+                    evidence={
+                        "llm_answer": llm_answer,
+                        "z3_expr": llm_expr
+                    }
+                )
+        
+        except Exception as e:
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                print(f"{QWED.ERROR}❌ LLM call failed: {str(e)}{QWED.RESET}")
+            
+            return VerificationResult(
+                verified=False,
+                error=f"LLM call failed: {str(e)}"
+            )
     
     def verify_code(self, code: str, language: str = "python") -> VerificationResult:
         """
-        Verify code for security issues.
+        Verify code for security issues and code smells.
         
-        Uses AST analysis.
+        Uses Python AST analysis for security checks.
+        Checks cache first to save API costs!
         """
-        # TODO: Implement AST-based code verification
-        return VerificationResult(
-            verified=False,
-            error="Code verification not yet implemented"
-        )
+        if language != "python":
+            return VerificationResult(
+                verified=False,
+                error=f"Only Python supported currently (got: {language})"
+            )
+        
+        # Check cache first
+        cache_key = f"code:{code}"
+        if self._cache:
+            cached_result = self._cache.get(cache_key)
+            if cached_result:
+                if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                    print(f"{QWED.SUCCESS}⚡ Cache HIT{QWED.RESET} {QWED.INFO}(saved API call!){QWED.RESET}")
+                return VerificationResult(**cached_result)
+        
+        # Show QWED branding
+        if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+            print(f"\n{QWED.BRAND}🔬 QWED Verification{QWED.RESET} {QWED.INFO}| Code Security Engine{QWED.RESET}")
+        
+        # Step 1: AST Analysis (no LLM needed!)
+        import ast
+        
+        dangerous_patterns = []
+        warnings = []
+        
+        try:
+            tree = ast.parse(code)
+            
+            # Check for dangerous patterns
+            for node in ast.walk(tree):
+                # Dangerous functions
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        func_name = node.func.id
+                        if func_name in ['eval', 'exec', 'compile', '__import__']:
+                            dangerous_patterns.append(f"Dangerous function: {func_name}")
+                
+                # File operations
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        if node.func.id == 'open':
+                            warnings.append("File operation detected: open()")
+                
+                # System calls
+                if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            if alias.name in ['os', 'subprocess', 'sys']:
+                                warnings.append(f"System module imported: {alias.name}")
+            
+            # Determine if code is safe
+            is_safe = len(dangerous_patterns) == 0
+            
+            result = VerificationResult(
+                verified=is_safe,
+                value="SAFE" if is_safe else "UNSAFE",
+                confidence=1.0 if is_safe else 0.0,
+                evidence={
+                    "dangerous_patterns": dangerous_patterns,
+                    "warnings": warnings,
+                    "method": "ast_analysis",
+                    "language": language
+                }
+            )
+            
+            # Save to cache
+            if self._cache:
+                cache_data = {
+                    "verified": result.verified,
+                    "value": result.value,
+                    "confidence": result.confidence,
+                    "evidence": result.evidence
+                }
+                self._cache.set(cache_key, cache_data)
+            
+            # Show result
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                if is_safe:
+                    print(f"{QWED.SUCCESS}✅ SAFE CODE{QWED.RESET} {QWED.INFO}(no dangerous patterns){QWED.RESET}")
+                    if warnings:
+                        print(f"{QWED.WARNING}⚠️  Warnings: {len(warnings)}{QWED.RESET}")
+                        for w in warnings[:3]:  # Show first 3
+                            print(f"  - {w}")
+                    _show_github_nudge()
+                else:
+                    print(f"{QWED.ERROR}❌ UNSAFE CODE{QWED.RESET}")
+                    for p in dangerous_patterns:
+                        print(f"  {QWED.ERROR}⚠️  {p}{QWED.RESET}")
+            
+            return result
+        
+        except SyntaxError as e:
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                print(f"{QWED.ERROR}❌ Syntax Error: {str(e)}{QWED.RESET}")
+            
+            return VerificationResult(
+                verified=False,
+                error=f"Python syntax error: {str(e)}",
+                evidence={"syntax_error": str(e)}
+            )
+        
+        except Exception as e:
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                print(f"{QWED.ERROR}❌ Analysis failed: {str(e)}{QWED.RESET}")
+            
+            return VerificationResult(
+                verified=False,
+                error=f"Code analysis failed: {str(e)}"
+            )
 
 
 # Convenience function
