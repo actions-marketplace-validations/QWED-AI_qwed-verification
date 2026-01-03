@@ -31,7 +31,32 @@ Example:
 
 from typing import Optional, Dict, Any, List
 import json
+import os
 from dataclasses import dataclass
+
+# QWED Branding Colors
+try:
+    from colorama import Fore, Style, Back, init
+    init(autoreset=True)
+    
+    # QWED Brand Colors
+    class QWED:
+        """QWED brand colors for terminal output."""
+        BRAND = Fore.MAGENTA + Style.BRIGHT  # QWED signature color
+        SUCCESS = Fore.GREEN + Style.BRIGHT
+        ERROR = Fore.RED + Style.BRIGHT
+        INFO = Fore.CYAN
+        WARNING = Fore.YELLOW
+        VALUE = Fore.BLUE + Style.BRIGHT
+        EVIDENCE = Fore.WHITE + Style.DIM
+        RESET = Style.RESET_ALL
+        
+    HAS_COLOR = True
+except ImportError:
+    # Fallback if colorama not installed
+    class QWED:
+        BRAND = SUCCESS = ERROR = INFO = WARNING = VALUE = EVIDENCE = RESET = ""
+    HAS_COLOR = False
 
 # LLM Clients
 try:
@@ -74,6 +99,38 @@ class VerificationResult:
     def __post_init__(self):
         if self.evidence is None:
             self.evidence = {}
+
+
+# GitHub Star Nudge (only show occasionally)
+_verification_count = 0
+_has_shown_nudge = False
+
+def _show_github_nudge():
+    """Show GitHub star nudge after successful verifications."""
+    global _verification_count, _has_shown_nudge
+    
+    _verification_count += 1
+    
+    # Show nudge after 3rd successful verification, then every 10th
+    should_show = (
+        (_verification_count == 3 and not _has_shown_nudge) or 
+        (_verification_count % 10 == 0)
+    )
+    
+    if should_show and HAS_COLOR:
+        print(f"\n{QWED.BRAND}{'─' * 60}{QWED.RESET}")
+        print(f"{QWED.BRAND}✨ Verified by QWED{QWED.RESET} {QWED.INFO}| Model Agnostic AI Verification{QWED.RESET}")
+        print(f"{QWED.SUCCESS}💚 If QWED saved you time, give us a ⭐ on GitHub!{QWED.RESET}")
+        print(f"{QWED.INFO}👉 https://github.com/QWED-AI/qwed-verification{QWED.RESET}")
+        print(f"{QWED.BRAND}{'─' * 60}{QWED.RESET}\n")
+        _has_shown_nudge = True
+    elif should_show:
+        # Non-colored fallback
+        print("\n" + "─" * 60)
+        print("✨ Verified by QWED | Model Agnostic AI Verification")
+        print("💚 If QWED saved you time, give us a ⭐ on GitHub!")
+        print("👉 https://github.com/QWED-AI/qwed-verification")
+        print("─" * 60 + "\n")
 
 
 class QWEDLocal:
@@ -270,6 +327,10 @@ class QWEDLocal:
                 error="SymPy not installed. Run: pip install sympy"
             )
         
+        # Show QWED branding
+        if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+            print(f"\n{QWED.BRAND}🔬 QWED Verification{QWED.RESET} {QWED.INFO}| Math Engine{QWED.RESET}")
+        
         # Step 1: Ask LLM for answer
         prompt = f"""Solve this math problem and respond ONLY with the numerical answer:
 
@@ -280,6 +341,9 @@ Answer (number only):"""
         try:
             llm_response = self._call_llm(prompt)
             llm_answer = llm_response.strip()
+            
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                print(f"{QWED.INFO}📝 LLM Response: {llm_answer}{QWED.RESET}")
             
             # Step 2: Ask LLM for symbolic expression
             expr_prompt = f"""Convert this to a SymPy expression that we can verify:
@@ -305,7 +369,7 @@ SymPy code:"""
                 # Compare LLM answer with verified result
                 is_correct = str(llm_answer) == verified_value
                 
-                return VerificationResult(
+                result = VerificationResult(
                     verified=is_correct,
                     value=verified_value,
                     confidence=1.0 if is_correct else 0.0,
@@ -316,8 +380,24 @@ SymPy code:"""
                         "method": "sympy_eval"
                     }
                 )
+                
+                # Show result with branding
+                if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                    if is_correct:
+                        print(f"{QWED.SUCCESS}✅ VERIFIED{QWED.RESET} {QWED.VALUE}→ {verified_value}{QWED.RESET}")
+                        # Show GitHub star nudge on success!
+                        _show_github_nudge()
+                    else:
+                        print(f"{QWED.ERROR}❌ MISMATCH{QWED.RESET}")
+                        print(f"  LLM said: {llm_answer}")
+                        print(f"  Verified: {verified_value}")
+                
+                return result
             
             except Exception as e:
+                if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                    print(f"{QWED.ERROR}❌ Verification failed: {str(e)}{QWED.RESET}")
+                
                 return VerificationResult(
                     verified=False,
                     error=f"SymPy verification failed: {str(e)}",
@@ -328,6 +408,9 @@ SymPy code:"""
                 )
         
         except Exception as e:
+            if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+                print(f"{QWED.ERROR}❌ LLM call failed: {str(e)}{QWED.RESET}")
+            
             return VerificationResult(
                 verified=False,
                 error=f"LLM call failed: {str(e)}"
