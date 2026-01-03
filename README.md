@@ -45,14 +45,14 @@
 
   <br>
   <a href="#-quick-start-install--verify-in-30-seconds">Quick Start</a> · 
+  <a href="#-new-in-v210-client-side-verification">🆕 QWEDLocal</a> ·
   <a href="#-the-llm-hallucination-problem-why-ai-cant-be-trusted">The Problem</a> · 
   <a href="#-the-8-verification-engines-how-qwed-validates-llm-outputs">The 8 Engines</a> ·
-  <a href="docs/INTEGRATION.md">🔌 Integration Guide</a> ·
-  <a href="docs/OLLAMA_INTEGRATION.md">🆓 Ollama Integration (FREE!)</a> ·
-  <a href="docs/LLM_CONFIGURATION.md">⚙️ LLM Configuration</a> ·
-  <a href="https://docs.qwedai.com">📖 Full Docs</a> · 
-  <a href="docs/WHITEPAPER.md">📄 Whitepaper</a> · 
-  <a href="https://docs.qwedai.com">📚 Docs</a>
+  <a href="docs/INTEGRATION.md">🔌 Integration</a> ·
+  <a href="docs/QWED_LOCAL.md">⚡ QWEDLocal</a> ·
+  <a href="docs/CLI.md">🖥️ CLI</a> ·
+  <a href="docs/OLLAMA_INTEGRATION.md">🆓 Ollama (FREE!)</a> ·
+  <a href="https://docs.qwedai.com">📖 Full Documentation</a>
 </div>
 
 ---
@@ -173,9 +173,9 @@ QWED is designed for industries where AI errors have real consequences:
 
 ---
 
-## ✅ The Solution: The Neurosymbolic Approach
+## ✅ The Solution: Verification Layer
 
-**QWED** is the first open-source **Neurosymbolic AI Guardrail**.
+**QWED** is the first open-source **Neurosymbolic AI Verification Layer**.
 
 We combine:
 - **Neural Networks** (LLMs) for natural language understanding
