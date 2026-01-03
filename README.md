@@ -173,14 +173,66 @@ QWED is designed for industries where AI errors have real consequences:
 
 ---
 
-## ✅ The Solution: Give the AI a Calculator
+## ✅ The Solution: The Neurosymbolic Approach
 
-**QWED** doesn't try to make the LLM "smarter". 
+**QWED** is the first open-source **Neurosymbolic AI Guardrail**.
 
-It treats the LLM as an **untrusted translator** and verifies its output using **Deterministic Engines** (SymPy, Z3, SQLGlot, AST).
+We combine:
+- **Neural Networks** (LLMs) for natural language understanding
+- **Symbolic Reasoning** (SymPy, Z3, AST) for deterministic verification
 
-> *"If an AI writes code, QWED runs the security audit.*  
-> *If an AI does math, QWED runs the calculus."*
+### The Core Philosophy: "The Untrusted Translator"
+
+QWED operates on a strict principle: **Don't trust the LLM to compute or judge; trust it only to translate.**
+
+**Example Flow:**
+```
+User Query: "If all A are B, and x is A, is x B?"
+
+↓ (LLM translates)
+
+Z3 DSL: Implies(A(x), B(x))
+
+↓ (Z3 proves)
+
+Result: TRUE (Proven by formal logic)
+```
+
+The LLM is an **Untrusted Translator**. The Symbolic Engine is the **Trusted Verifier**.
+
+---
+
+## 🆚 Competitive Landscape
+
+### The "Judge" Problem
+
+Most AI safety tools use **"LLM-as-a-Judge"** (asking GPT-4 to grade GPT-3.5). This is fundamentally unsafe:
+
+- **Recursive Hallucination:** If the judge has the same bias as the generator, errors go undetected
+- **Probabilistic Evaluation:** LLMs give probability, not proof
+- **Subjectivity:** Different judges = different answers
+
+**QWED introduces "Solver-as-a-Judge"**: Replace neural network opinions with compiler execution and mathematical proof.
+
+### Comparison Table
+
+| Feature | **QWED Protocol** | NeMo Guardrails | LangChain Evaluators |
+|---------|-------------------|-----------------|----------------------|
+| **The "Judge"** | Deterministic Solver (Z3/SymPy) | Semantic Matcher | Another LLM (GPT-4) |
+| **Mechanism** | Translation to DSL | Vector Similarity | Prompt Engineering |
+| **Verification Type** | Mathematical Proof | Policy Adherence | Consensus/Opinion |
+| **Primary Goal** | Correctness (Truth) | Safety (Appropriateness) | Quality Score |
+| **False Positives** | Near Zero (Logic-based) | Medium (Semantic drift) | High (Subjectivity) |
+| **Works Offline** | ✅ Yes (QWEDLocal) | ❌ No | ❌ No |
+| **Privacy** | ✅ 100% Local | ❌ Cloud-based | ❌ Cloud-based |
+
+**QWED's Advantage:** When you need **proof**, not opinion.
+
+---
+
+## 🔬 The Verification Engines
+
+QWED routes queries to specialized engines that act as DSL interpreters:
 
 
 ```
