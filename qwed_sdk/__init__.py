@@ -27,16 +27,18 @@ Framework Integrations:
 """
 
 from qwed_sdk.client import QWEDClient, QWEDAsyncClient
+from qwed_sdk.qwed_local import QWEDLocal  # NEW!
 from qwed_sdk.models import (
     VerificationResult,
     BatchResult,
     VerificationType,
 )
 
-__version__ = "1.0.0"
+__version__ = "2.1.0-dev"
 __all__ = [
     "QWEDClient",
     "QWEDAsyncClient",
+    "QWEDLocal",  # NEW!
     "VerificationResult",
     "BatchResult",
     "VerificationType",
