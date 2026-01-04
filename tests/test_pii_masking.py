@@ -12,6 +12,22 @@ import pytest
 import sys
 import os
 
+# Helper to check if PII dependencies are available
+def has_pii_dependencies():
+    """Check if presidio dependencies are installed."""
+    try:
+        import presidio_analyzer
+        import presidio_anonymizer
+        return True
+    except ImportError:
+        return False
+
+# Mark for skipping tests when presidio not installed
+skip_if_no_pii = pytest.mark.skipif(
+    not has_pii_dependencies(),
+    reason="Presidio not installed (pip install 'qwed[pii]')"
+)
+
 # Test PIIDetector class
 class TestPIIDetector:
     """Test PIIDetector class (requires pip install 'qwed[pii]')."""
@@ -29,10 +45,7 @@ class TestPIIDetector:
                 from qwed_sdk.pii_detector import PIIDetector
                 PIIDetector()
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
-        reason="Presidio not installed (pip install 'qwed[pii]')"
-    )
+    @skip_if_no_pii
     def test_email_detection(self):
         """Test email address detection."""
         from qwed_sdk.pii_detector import PIIDetector
@@ -46,8 +59,7 @@ class TestPIIDetector:
         assert "EMAIL_ADDRESS" in info["types"]
         assert len(info["positions"]) == 1
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_credit_card_detection(self):
@@ -62,8 +74,7 @@ class TestPIIDetector:
         assert info["pii_detected"] == 1
         assert "CREDIT_CARD" in info["types"]
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_phone_number_detection(self):
@@ -77,8 +88,7 @@ class TestPIIDetector:
         # Phone detection can be tricky
         assert info["pii_detected"] >= 0  # May or may not detect
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_multiple_pii_types(self):
@@ -93,8 +103,7 @@ class TestPIIDetector:
         assert info["pii_detected"] >= 1
         assert "EMAIL_ADDRESS" in info["types"]
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_no_pii(self):
@@ -109,8 +118,7 @@ class TestPIIDetector:
         assert info["pii_detected"] == 0
         assert len(info.get("types", [])) == 0
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_custom_entities(self):
@@ -162,8 +170,7 @@ class TestQWEDLocalPII:
             # Expected if mask_pii=True and presidio not installed
             pass
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_mask_pii_enabled(self):
@@ -197,8 +204,7 @@ class TestQWEDLocalPII:
 class TestPIIMetadata:
     """Test PII metadata in verification results."""
     
-    @pytest.mark.skipif(
-        not __import__('qwed_sdk.pii_detector', fromlist=['check_pii_dependencies']).check_pii_dependencies(),
+    @skip_if_no_pii.check_pii_dependencies(),
         reason="Presidio not installed"
     )
     def test_pii_info_in_evidence(self):
