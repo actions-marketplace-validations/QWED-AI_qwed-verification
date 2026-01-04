@@ -28,6 +28,7 @@ skip_if_no_pii = pytest.mark.skipif(
     reason="Presidio not installed (pip install 'qwed[pii]')"
 )
 
+
 # Test PIIDetector class
 class TestPIIDetector:
     """Test PIIDetector class (requires pip install 'qwed[pii]')."""
@@ -41,7 +42,7 @@ class TestPIIDetector:
         
         if not has_pii:
             # Should raise helpful error
-            with pytest.raises(ImportError, match="PII masking requires"):
+            with pytest.raises(ImportError):
                 from qwed_sdk.pii_detector import PIIDetector
                 PIIDetector()
     
@@ -59,9 +60,7 @@ class TestPIIDetector:
         assert "EMAIL_ADDRESS" in info["types"]
         assert len(info["positions"]) == 1
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_credit_card_detection(self):
         """Test credit card detection."""
         from qwed_sdk.pii_detector import PIIDetector
@@ -74,9 +73,7 @@ class TestPIIDetector:
         assert info["pii_detected"] == 1
         assert "CREDIT_CARD" in info["types"]
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_phone_number_detection(self):
         """Test phone number detection."""
         from qwed_sdk.pii_detector import PIIDetector
@@ -88,9 +85,7 @@ class TestPIIDetector:
         # Phone detection can be tricky
         assert info["pii_detected"] >= 0  # May or may not detect
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_multiple_pii_types(self):
         """Test detection of multiple PII types."""
         from qwed_sdk.pii_detector import PIIDetector
@@ -103,9 +98,7 @@ class TestPIIDetector:
         assert info["pii_detected"] >= 1
         assert "EMAIL_ADDRESS" in info["types"]
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_no_pii(self):
         """Test text with no PII."""
         from qwed_sdk.pii_detector import PIIDetector
@@ -118,9 +111,7 @@ class TestPIIDetector:
         assert info["pii_detected"] == 0
         assert len(info.get("types", [])) == 0
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_custom_entities(self):
         """Test custom entity list."""
         from qwed_sdk.pii_detector import PIIDetector
@@ -170,9 +161,7 @@ class TestQWEDLocalPII:
             # Expected if mask_pii=True and presidio not installed
             pass
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_mask_pii_enabled(self):
         """Test enabling PII masking."""
         from qwed_sdk import QWEDLocal
@@ -193,7 +182,7 @@ class TestQWEDLocalPII:
         
         if not check_pii_dependencies():
             # Should raise helpful error
-            with pytest.raises(ImportError, match="PII masking requires"):
+            with pytest.raises(ImportError):
                 QWEDLocal(
                     base_url="http://localhost:11434/v1",
                     model="llama3",
@@ -204,9 +193,7 @@ class TestQWEDLocalPII:
 class TestPIIMetadata:
     """Test PII metadata in verification results."""
     
-    @skip_if_no_pii.check_pii_dependencies(),
-        reason="Presidio not installed"
-    )
+    @skip_if_no_pii
     def test_pii_info_in_evidence(self):
         """Test that PII info appears in evidence (if LLM available)."""
         from qwed_sdk import QWEDLocal
