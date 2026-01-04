@@ -155,6 +155,8 @@ class QWEDLocal:
         model: str = "gpt-3.5-turbo",
         cache: bool = True,  # NEW: Enable caching by default
         cache_ttl: int = 86400,  # 24 hours
+        mask_pii: bool = False,  # NEW: Enable PII masking
+        pii_entities: Optional[List[str]] = None,  # NEW: Custom PII types
         **kwargs
     ):
         """
@@ -197,6 +199,22 @@ class QWEDLocal:
             self._cache = VerificationCache(ttl=cache_ttl)
         else:
             self._cache = None
+        
+        # Initialize PII detector (optional)
+        self.mask_pii = mask_pii
+        self._pii_detector = None
+        self._last_pii_info = None
+        
+        if mask_pii:
+            from qwed_sdk.pii_detector import PIIDetector
+            try:
+                self._pii_detector = PIIDetector(entities=pii_entities)
+            except ImportError as e:
+                # Re-raise with helpful message
+                raise ImportError(
+                    str(e) + "\n" +
+                    "💡 PII masking requires: pip install 'qwed[pii]'"
+                ) from e
         
         # Initialize LLM client
         self._init_llm_client(**kwargs)
