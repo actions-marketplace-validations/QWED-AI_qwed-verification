@@ -81,6 +81,36 @@ cd qwed-verification
 pip install -e .
 ```
 
+---
+
+## 🎓 **NEW: Free Course on AI Verification**
+
+**Learning Path: From Zero to Production-Ready AI Verification**
+
+[![Course](https://img.shields.io/badge/🎓_Free_Course-AI_Verification-4CAF50?style=for-the-badge)](https://github.com/QWED-AI/qwed-learning)
+
+<div align="center">
+  <a href="https://github.com/QWED-AI/qwed-learning">
+    <img src="https://img.shields.io/github/stars/QWED-AI/qwed-learning?style=social" alt="Course Stars">
+  </a>
+</div>
+
+**🚀 [Start the Free Course →](https://github.com/QWED-AI/qwed-learning)**
+
+### What You'll Learn:
+
+- 💡 **Artist vs. Accountant:** Why LLMs are creative but terrible at math
+- 🧮 **Neurosymbolic AI:** How deterministic verification catches 100% of errors*
+- 🏗️ **Production Patterns:** Build guardrails that actually work
+- 🔒 **HIPAA/GDPR Compliance:** PII masking for regulated industries
+- 🦜 **Framework Integration:** LangChain, LlamaIndex, and more
+
+**Total Time:** ~3 hours | **Modules:** 4 | **Examples:** Production-ready code
+
+**Perfect for:**  Developers integrating LLMs, ML engineers, Tech leads evaluating AI safety
+
+---
+
 ```python
 from qwed_sdk import QWEDClient
 
