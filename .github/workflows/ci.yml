@@ -92,9 +92,10 @@ jobs:
         pytest tests/ -v --cov=qwed_sdk --cov=src/qwed_new --cov-report=xml --cov-report=term
 
     - name: Upload Coverage to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
-        file: ./coverage.xml
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./coverage.xml
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
