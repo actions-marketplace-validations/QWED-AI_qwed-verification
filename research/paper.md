@@ -62,6 +62,27 @@ result = engine.verify_derivative("x**2", "x", "3*x")
 # Returns: is_correct=False, calculated_derivative="2*x"
 ```
 
+# AI Usage Disclosure
+
+In compliance with JOSS policy (effective January 2026), we disclose AI tool usage in this project:
+
+**Documentation & Code:**  
+- **Tools Used**: GitHub Copilot, Claude (Anthropic), GPT-4  
+- **Purpose**: Code completion, documentation generation, test scaffolding  
+- **Human Oversight**: All AI-generated code underwent manual review, testing, and validation  
+
+**Core Contributions (Human-Designed):**  
+The following represent significant human intellectual contributions:
+- Verification engine architecture and DSL design (see `docs/DESIGN.md`)
+- Symbolic solver integration strategy (SymPy, Z3, SQLGlot)
+- Production deployment patterns and error handling  
+- Benchmark methodology and adversarial test suite design  
+
+**Rationale:**  
+AI tools accelerated implementation of well-understood patterns (e.g., REST API boilerplate, CLI argument parsing). However, the core intellectual contributions—the verification protocol design, engine integration strategy, and production engineering decisions—were human-designed and refined through iterative testing.
+
+For detailed design decisions and justification, see [`docs/DESIGN.md`](docs/DESIGN.md).
+
 # Acknowledgements
 
 QWED builds on the work of the SymPy, Z3, and SQLGlot communities.
