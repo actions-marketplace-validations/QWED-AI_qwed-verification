@@ -72,11 +72,23 @@
 
 ## 🚀 Quick Start: Install & Verify in 30 Seconds
 
+### Python SDK (PyPI)
 ```bash
-# Install from PyPI (Recommended)
 pip install qwed
+```
 
-# Or install from source
+### Go SDK
+```bash
+go get github.com/QWED-AI/qwed-verification/sdk-go
+```
+
+### TypeScript SDK (npm)
+```bash
+npm install @qwed-ai/sdk
+```
+
+### From Source
+```bash
 git clone https://github.com/QWED-AI/qwed-verification.git
 cd qwed-verification
 pip install -e .
