@@ -151,6 +151,27 @@ func (e *QWEDError) Error() string {
 }
 
 // ============================================================================
+// Verifier Interface (for mocking in tests)
+// ============================================================================
+
+// Verifier defines the interface for QWED verification operations.
+// Users can implement this interface to create mock clients for testing.
+type Verifier interface {
+	Health(ctx context.Context) (map[string]interface{}, error)
+	Verify(ctx context.Context, query string) (*VerificationResponse, error)
+	VerifyWithOptions(ctx context.Context, query string, opts *RequestOptions) (*VerificationResponse, error)
+	VerifyMath(ctx context.Context, expression string) (*VerificationResponse, error)
+	VerifyLogic(ctx context.Context, query string) (*VerificationResponse, error)
+	VerifyCode(ctx context.Context, code, language string) (*VerificationResponse, error)
+	VerifyFact(ctx context.Context, claim, factContext string) (*VerificationResponse, error)
+	VerifySQL(ctx context.Context, query, schemaDDL, dialect string) (*VerificationResponse, error)
+	VerifyBatch(ctx context.Context, items []BatchItem, opts *BatchOptions) (*BatchResponse, error)
+}
+
+// Ensure Client implements Verifier
+var _ Verifier = (*Client)(nil)
+
+// ============================================================================
 // Client
 // ============================================================================
 

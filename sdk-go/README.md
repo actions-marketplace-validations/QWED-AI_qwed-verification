@@ -1,14 +1,15 @@
-# qwed-go
+# QWED Go SDK
 
-> Go SDK for QWED Verification Protocol
+Official Go SDK for the [QWED Verification Protocol](https://github.com/QWED-AI/qwed-verification).
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/qwed-ai/qwed-go.svg)](https://pkg.go.dev/github.com/qwed-ai/qwed-go)
-[![Go 1.21+](https://img.shields.io/badge/go-1.21%2B-blue.svg)](https://golang.org/)
+[![Go Reference](https://pkg.go.dev/badge/github.com/QWED-AI/qwed-verification/sdk-go.svg)](https://pkg.go.dev/github.com/QWED-AI/qwed-verification/sdk-go)
+[![Go Report Card](https://goreportcard.com/badge/github.com/QWED-AI/qwed-verification/sdk-go)](https://goreportcard.com/report/github.com/QWED-AI/qwed-verification/sdk-go)
+[![CI](https://github.com/QWED-AI/qwed-verification/actions/workflows/ci.yml/badge.svg)](https://github.com/QWED-AI/qwed-verification/actions)
 
 ## Installation
 
 ```bash
-go get github.com/qwed-ai/qwed-go
+go get github.com/QWED-AI/qwed-verification/sdk-go
 ```
 
 ## Quick Start
@@ -21,134 +22,116 @@ import (
     "fmt"
     "log"
 
-    "github.com/qwed-ai/qwed-go"
+    qwed "github.com/QWED-AI/qwed-verification/sdk-go"
 )
 
 func main() {
-    client := qwed.NewClient("qwed_your_api_key")
-    
-    result, err := client.Verify(context.Background(), "What is 2+2?")
+    // Create client
+    client := qwed.NewClient("your-api-key")
+
+    // Verify math
+    result, err := client.VerifyMath(context.Background(), "2 + 2 = 4")
     if err != nil {
         log.Fatal(err)
     }
     
-    fmt.Println(result.Verified) // true
-    fmt.Println(result.Status)   // VERIFIED
+    fmt.Printf("Verified: %v\n", result.Verified)
 }
 ```
 
-## Verification Methods
+## Features
 
-### Natural Language
+- **Zero Dependencies** - Uses only Go standard library
+- **Context Support** - All methods accept `context.Context` for cancellation
+- **Mockable** - Implements `Verifier` interface for easy testing
+- **Type Safe** - Full type definitions for all requests/responses
 
-```go
-result, err := client.Verify(ctx, "Is 15% of 200 equal to 30?")
-```
+## Available Methods
 
-### Math Expressions
-
-```go
-result, err := client.VerifyMath(ctx, "x**2 + 2*x + 1 = (x+1)**2")
-```
-
-### Logic (QWED-DSL)
-
-```go
-result, err := client.VerifyLogic(ctx, "(AND (GT x 5) (LT y 10))")
-// result.Result["satisfiability"] = "SAT"
-// result.Result["model"] = map[string]interface{}{"x": 6, "y": 9}
-```
-
-### Code Security
-
-```go
-result, err := client.VerifyCode(ctx, `
-import os
-os.system('rm -rf /')
-`, "python")
-```
-
-### Fact Verification
-
-```go
-result, err := client.VerifyFact(ctx,
-    "Paris is the capital of France",
-    "France is a country in Europe. Its capital city is Paris.",
-)
-```
-
-### SQL Validation
-
-```go
-result, err := client.VerifySQL(ctx,
-    "SELECT * FROM users WHERE id = 1",
-    "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
-    "postgresql",
-)
-```
-
-## Batch Verification
-
-```go
-items := []qwed.BatchItem{
-    {Query: "2+2=4", Type: qwed.TypeMath},
-    {Query: "3*3=9", Type: qwed.TypeMath},
-    {Query: "(AND (GT x 5))", Type: qwed.TypeLogic},
-}
-
-result, err := client.VerifyBatch(ctx, items, nil)
-fmt.Printf("Success rate: %.1f%%\n", result.Summary.SuccessRate)
-```
+| Method | Description |
+|--------|-------------|
+| `Health(ctx)` | Check API health status |
+| `Verify(ctx, query)` | Natural language verification |
+| `VerifyMath(ctx, expr)` | Mathematical expression verification |
+| `VerifyLogic(ctx, query)` | Logic/reasoning verification (Z3) |
+| `VerifyCode(ctx, code, lang)` | Code security scanning |
+| `VerifyFact(ctx, claim, context)` | Fact verification |
+| `VerifySQL(ctx, query, schema, dialect)` | SQL validation |
+| `VerifyBatch(ctx, items, opts)` | Batch verification |
 
 ## Client Options
 
 ```go
-client := qwed.NewClient(
-    "qwed_...",
-    qwed.WithBaseURL("https://api.qwed.ai"),
-    qwed.WithTimeout(60 * time.Second),
+client := qwed.NewClient("api-key",
+    qwed.WithBaseURL("https://api.qwedai.com"),
+    qwed.WithTimeout(30 * time.Second),
+    qwed.WithHTTPClient(customClient),
 )
+```
+
+## Testing with Mocks
+
+The SDK provides a `Verifier` interface for easy mocking:
+
+```go
+type Verifier interface {
+    Health(ctx context.Context) (map[string]interface{}, error)
+    Verify(ctx context.Context, query string) (*VerificationResponse, error)
+    VerifyMath(ctx context.Context, expression string) (*VerificationResponse, error)
+    // ... other methods
+}
+
+// In your tests:
+type MockVerifier struct{}
+
+func (m *MockVerifier) VerifyMath(ctx context.Context, expr string) (*qwed.VerificationResponse, error) {
+    return &qwed.VerificationResponse{Verified: true}, nil
+}
+
+// Use mock in your code that accepts Verifier interface
+func ProcessData(v qwed.Verifier, data string) error {
+    result, err := v.VerifyMath(context.Background(), data)
+    // ...
+}
 ```
 
 ## Error Handling
 
 ```go
-result, err := client.Verify(ctx, "test")
+result, err := client.VerifyMath(ctx, "invalid")
 if err != nil {
     if qwedErr, ok := err.(*qwed.QWEDError); ok {
-        switch qwedErr.StatusCode {
-        case 401:
-            log.Println("Invalid API key")
-        case 429:
-            log.Println("Rate limited")
-        default:
-            log.Printf("Error %s: %s", qwedErr.Code, qwedErr.Message)
-        }
+        fmt.Printf("QWED Error [%s]: %s\n", qwedErr.Code, qwedErr.Message)
+        fmt.Printf("HTTP Status: %d\n", qwedErr.StatusCode)
     }
 }
 ```
 
-## Context Support
-
-All methods accept a context for cancellation and timeouts:
+## Response Types
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-
-result, err := client.Verify(ctx, "What is 2+2?")
+type VerificationResponse struct {
+    Status      VerificationStatus     `json:"status"`
+    Verified    bool                   `json:"verified"`
+    Engine      string                 `json:"engine,omitempty"`
+    Result      map[string]interface{} `json:"result,omitempty"`
+    Attestation string                 `json:"attestation,omitempty"`
+    Error       *ErrorInfo             `json:"error,omitempty"`
+    Metadata    *ResponseMetadata      `json:"metadata,omitempty"`
+}
 ```
 
-## Types
+## Examples
 
-| Type | Description |
-|------|-------------|
-| `VerificationType` | Enum: Math, Logic, Stats, Fact, Code, SQL, etc. |
-| `VerificationStatus` | Enum: VERIFIED, FAILED, CORRECTED, BLOCKED, etc. |
-| `VerificationResponse` | Full verification result |
-| `BatchResponse` | Batch operation result |
+See the [examples](./examples/) directory for complete usage examples.
 
 ## License
 
-Apache 2.0
+Apache 2.0 - See [LICENSE](../LICENSE)
 
+## Related
+
+- [QWED Main Repository](https://github.com/QWED-AI/qwed-verification)
+- [Python SDK](https://pypi.org/project/qwed/)
+- [TypeScript SDK](https://www.npmjs.com/package/@qwed-ai/sdk)
+- [Documentation](https://docs.qwedai.com)
