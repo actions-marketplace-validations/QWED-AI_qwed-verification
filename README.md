@@ -24,7 +24,6 @@
   [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
   [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
   [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18110785.svg)](https://doi.org/10.5281/zenodo.18110785)
-  [![status](https://joss.theoj.org/papers/385abbd3a6733fc907f1780eb5b6c927/status.svg)](https://joss.theoj.org/papers/385abbd3a6733fc907f1780eb5b6c927)
   [![PyPI version](https://img.shields.io/pypi/v/qwed.svg)](https://pypi.org/project/qwed/)
   [![Contributors](https://img.shields.io/github/contributors/QWED-AI/qwed-verification)](https://github.com/QWED-AI/qwed-verification/graphs/contributors)
   

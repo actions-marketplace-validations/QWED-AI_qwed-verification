@@ -313,7 +313,7 @@ This project was developed with assistance from generative AI tools:
 - Error handling philosophy
 - Domain modeling and verification workflows
 
-**Validation:** All AI-generated code was reviewed, tested against benchmarks, and validated through JOSS peer review.
+**Validation:** All AI-generated code was reviewed, tested against benchmarks, and validated through comprehensive testing.
 
 ---
 
