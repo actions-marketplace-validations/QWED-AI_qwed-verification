@@ -224,6 +224,15 @@ class CodeVerifier:
             >>> verifier = CodeVerifier()
         """
         self.supported_languages = ["python", "javascript", "typescript", "java", "go", "sql"]
+        self._taint_analyzer = None  # Lazy-loaded
+    
+    @property
+    def taint_analyzer(self):
+        """Lazy-load taint analyzer for Python deep analysis."""
+        if self._taint_analyzer is None:
+            from .taint_analyzer import TaintAnalyzer
+            self._taint_analyzer = TaintAnalyzer()
+        return self._taint_analyzer
     
     def verify_code(self, code: str, language: str = "python") -> Dict[str, Any]:
         """
@@ -373,6 +382,56 @@ class CodeVerifier:
                     ))
         
         return issues
+    
+    def verify_python_deep(self, code: str) -> Dict[str, Any]:
+        """
+        Deep Python verification combining pattern matching with AST taint analysis.
+        
+        This method performs two types of analysis:
+        1. Pattern-based detection (fast, catches known dangerous patterns)
+        2. Taint analysis (AST-based, tracks data flow from sources to sinks)
+        
+        Args:
+            code: Python source code to analyze.
+            
+        Returns:
+            Dict with combined verification results.
+            
+        Example:
+            >>> result = verifier.verify_python_deep("x = input(); eval(x)")
+            >>> print(result["taint_vulnerabilities"])
+        """
+        # Standard pattern-based check
+        pattern_result = self.verify_code(code, "python")
+        
+        # AST-based taint analysis
+        taint_result = self.taint_analyzer.analyze(code)
+        
+        # Combine results
+        is_safe = pattern_result["is_safe"] and taint_result["is_safe"]
+        
+        return {
+            "is_safe": is_safe,
+            "status": "SAFE" if is_safe else "VULNERABLE",
+            "language": "python",
+            "analysis_methods": ["pattern_matching", "taint_analysis"],
+            # Pattern-based results
+            "pattern_issues": pattern_result["issues"],
+            "pattern_critical": pattern_result["critical_count"],
+            "pattern_warnings": pattern_result["warning_count"],
+            # Taint analysis results  
+            "taint_vulnerabilities": taint_result["vulnerabilities"],
+            "tainted_variables": taint_result["tainted_variables"],
+            "data_flow_sources": taint_result["sources_found"],
+            "data_flow_sinks": taint_result["sinks_found"],
+            # Summary
+            "summary": {
+                "pattern_issues_found": len(pattern_result["issues"]),
+                "taint_vulnerabilities_found": len(taint_result["vulnerabilities"]),
+                "tainted_variable_count": len(taint_result["tainted_variables"]),
+                "is_safe": is_safe
+            }
+        }
     
     # =========================================================================
     # JavaScript/TypeScript Checks
