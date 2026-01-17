@@ -85,6 +85,40 @@ When verifying code, QWED runs it in an isolated Docker container:
 
 ---
 
+## 🔍 Taint Analysis Engine (NEW in v2.1.0)
+
+Beyond pattern matching, QWED now includes **AST-based data flow analysis**:
+
+### How It Works
+
+```mermaid
+graph TD
+    Source[User Input Sources] --> Track[Taint Tracking]
+    Track --> Flow[Data Flow Analysis]
+    Flow --> Check{Reaches Sink?}
+    Check -->|Yes| Sanitized{Sanitized?}
+    Check -->|No| Safe[✅ SAFE]
+    Sanitized -->|Yes| Safe
+    Sanitized -->|No| Vuln[🚨 VULNERABILITY]
+```
+
+### Detected Sources
+- `input()`, `request.args`, `request.form`
+- `os.environ`, `sys.argv`
+- File reads, database queries
+
+### Detected Sinks
+- `eval()`, `exec()`, `compile()`
+- `subprocess.*`, `os.system()`
+- SQL queries, file writes
+
+### Sanitizer Recognition
+- Input validation (`int()`, `float()`)
+- Type casting, length checks
+- HTML escaping, SQL parameterization
+
+---
+
 ## Audit Logging
 
 Every verification is logged with:
