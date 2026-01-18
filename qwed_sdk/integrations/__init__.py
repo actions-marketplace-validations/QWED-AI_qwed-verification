@@ -1,19 +1,31 @@
-"""QWED integrations with popular AI frameworks.
+"""
+QWED Framework Integrations.
 
-This module provides seamless integration with major AI/ML frameworks:
-- LangChain: Agent tools and chains
-- LlamaIndex: Tools and query engines (coming soon)
-- CrewAI: Agent tools (coming soon)
-
-Usage:
-    from qwed_sdk.integrations.langchain import QWEDTool
+Import integrations for your favorite agent frameworks.
 """
 
-__all__ = ["langchain"]
+# LangChain
+try:
+    from .langchain import QWEDTool
+except ImportError:
+    pass
 
-# Lazy imports - only load what's needed
-def __getattr__(name):
-    if name == "langchain":
-        from qwed_sdk.integrations import langchain as lc_module
-        return lc_module
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+# CrewAI
+try:
+    from .crewai import QWEDVerifiedAgent, VerificationConfig
+except ImportError:
+    pass
+
+# LlamaIndex
+try:
+    from .llamaindex import QWEDQueryEngine, VerifiedResponse
+except ImportError:
+    pass
+
+__all__ = [
+    "QWEDTool",
+    "QWEDVerifiedAgent", 
+    "VerificationConfig",
+    "QWEDQueryEngine", 
+    "VerifiedResponse"
+]

@@ -32,9 +32,9 @@ graph LR
 
 ---
 
-## 🏛️ The 8-Engine Specialized Architecture
+## 🏛️ The 11-Engine Specialized Architecture
 
-We don't rely on one engine for everything. QWED uses **8 Specialized Deterministic Engines**, each a master of its domain.
+We don't rely on one engine for everything. QWED uses **11 Specialized Deterministic Engines**, each a master of its domain.
 
 ```mermaid
 mindmap
@@ -81,6 +81,18 @@ mindmap
         Metadata Extraction
         Size Verification
         Multi-VLM Consensus
+      Taint Analyzer
+        Data Flow Tracking
+        Source-Sink Analysis
+        Sanitizer Detection
+      Schema Verifier
+        JSON Schema Validation
+        Type Checking
+        Constraint Enforcement
+      Graph Fact Checker
+        Triple Extraction
+        Entity Matching
+        Claim Verification
 ```
 
 ---
@@ -147,6 +159,27 @@ Multi-language AST analysis:
 - **Multi-Provider**: Anthropic, Azure, OpenAI
 - **Circuit Breaker**: Auto-disable failing engines
 - **Async Parallel**: Execute engines concurrently
+
+### 9. 🔍 Taint Analyzer Engine (NEW in v2.1.0)
+**AST-based data flow analysis for Python security:**
+- **Source Detection**: user input, request.args, environment variables
+- **Sink Detection**: eval, exec, subprocess, SQL queries
+- **Flow Tracking**: Variable assignment, function calls, returns
+- **Sanitizer Recognition**: Input validation, type casting, escaping
+
+### 10. 📋 Schema Verifier Engine (NEW in v2.1.0)
+**Deterministic JSON schema validation:**
+- **Type Checking**: string, number, boolean, array, object
+- **Constraint Validation**: min/max, pattern, enum, required
+- **Math Delegation**: Computed field verification via SymPy
+- **UCP Integration**: E-commerce transaction validation
+
+### 11. 📈 Graph Fact Verifier Engine (NEW in v2.1.0)
+**Triple-based fact checking without LLM:**
+- **Triple Extraction**: Subject-Predicate-Object from text
+- **Entity Matching**: Fuzzy matching for names, dates, numbers
+- **Claim Verification**: Compare extracted triples against knowledge base
+- **Confidence Scoring**: Match quality assessment
 
 ---
 
@@ -275,7 +308,18 @@ qwed batch queries.json -o results.json
 
 ---
 
+## 🔌 QWED Extensions & Integrations
+
+QWED extends beyond core verification with specialized integrations:
+
+| Extension | Description |
+|-----------|-------------|
+| **[QWED-UCP](https://github.com/QWED-AI/qwed-ucp)** | Unified Commerce Protocol - E-commerce verification |
+| **[QWED-MCP](https://github.com/QWED-AI/qwed-mcp)** | Model Context Protocol - Claude Desktop integration |
+| **[Open Responses](https://github.com/QWED-AI/qwed-open-responses)** | OpenAI Responses API guards |
+
+---
+
 ### "Safe AI is the only AI that can change the world."
 
 *Built with ❤️ for a deterministic future.*
-
