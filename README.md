@@ -32,6 +32,7 @@
   [![GitHub watchers](https://img.shields.io/github/watchers/QWED-AI/qwed-verification?style=social)](https://github.com/QWED-AI/qwed-verification)
 
   <a href="https://www.nvidia.com/en-us/startups/"><img src="./assets/badges/nvidia-inception.png" alt="NVIDIA Inception Program" height="40"></a>
+  <a href="https://github.com/developer-program"><img src="https://img.shields.io/badge/GitHub_Developer_Program-Member-4183C4?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Developer Program" height="40"></a>
 
   <br>
 
@@ -98,6 +99,17 @@ git clone https://github.com/QWED-AI/qwed-verification.git
 cd qwed-verification
 pip install -e .
 ```
+
+---
+
+## 🧩 Specialized Editions
+
+QWED is available in specialized flavors for specific industry verticals:
+
+| Edition | Target | Use Case | Link |
+| :--- | :--- | :--- | :--- |
+| **QWED Finance** | 🏦 Banking | Loan Origination, NPV, ISO 20022 Checks | [View on Marketplace](https://github.com/marketplace/actions/qwed-finance-guard) |
+| **QWED UCP** | 🛒 Commerce | Universal Commerce Protocol, Tax Compliance | [View on Marketplace](https://github.com/marketplace/actions/qwed-commerce-auditor) |
 
 ---
 
