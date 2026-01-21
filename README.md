@@ -436,7 +436,7 @@ Use QWED verification directly in Claude Desktop via MCP:
 | [🐍 Python](./qwed_sdk/) | `qwed` | ✅ Available on PyPI |
 | [🟦 TypeScript](./sdk-ts/) | `@qwed-ai/sdk` | ✅ Available on npm |
 | [🐹 Go](./sdk-go/) | `qwed-go` | ✅ Available |
-| 🦀 Rust | `qwed` | 🟡 Coming Soon |
+| [🦀 Rust](./sdk-rust/) | `qwed` | ✅ Available on crates.io |
 
 ```bash
 # Python
@@ -447,6 +447,9 @@ go get github.com/QWED-AI/qwed-verification/sdk-go
 
 # TypeScript
 npm install @qwed-ai/sdk
+
+# Rust
+cargo add qwed
 ```
 
 ---
