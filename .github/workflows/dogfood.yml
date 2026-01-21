@@ -1,11 +1,11 @@
 name: QWED Verification Example
 
 on:
-  workflow_dispatch:  # Manual trigger only
-  # push:
-  #   branches: [ main ]
-  # pull_request:
-  #   branches: [ main ]
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   verify-math:
@@ -14,7 +14,7 @@ jobs:
     
     steps:
       - name: Verify Derivative
-        uses: QWED-AI/qwed-verification@v2.2.0
+        uses: QWED-AI/qwed-verification@v2.4.1
         with:
           query: "What is the derivative of x^2?"
           provider: "openai"
@@ -22,7 +22,7 @@ jobs:
           model: "gpt-4o-mini"
       
       - name: Verify Integration
-        uses: QWED-AI/qwed-verification@v2.2.0
+        uses: QWED-AI/qwed-verification@v2.4.1
         with:
           query: "What is the integral of 2x?"
           provider: "openai"
@@ -34,7 +34,7 @@ jobs:
     
     steps:
       - name: Verify SAT Problem
-        uses: QWED-AI/qwed-verification@v2.2.0
+        uses: QWED-AI/qwed-verification@v2.4.1
         with:
           query: "Is (A AND B) OR (NOT A) always true?"
           provider: "anthropic"
@@ -47,7 +47,7 @@ jobs:
     
     steps:
       - name: Verify Code Safety
-        uses: QWED-AI/qwed-verification@v2.2.0
+        uses: QWED-AI/qwed-verification@v2.4.1
         with:
           query: |
             Is this code safe?
@@ -65,7 +65,7 @@ jobs:
     
     steps:
       - name: Secure Verification
-        uses: QWED-AI/qwed-verification@v2.2.0
+        uses: QWED-AI/qwed-verification@v2.4.1
         with:
           query: "Calculate: my email is john@example.com, what is 2+2?"
           mask-pii: "true"
