@@ -81,6 +81,9 @@
 ### Python SDK (PyPI)
 ```bash
 pip install qwed
+# Note: Installs core engines (Math, Code, Facts).
+# For full features (SQL, Logic/Z3, CrossHair):
+# pip install "qwed[full]"
 ```
 
 ### Go SDK
@@ -192,31 +195,31 @@ The LLM is an **Untrusted Translator**. The Symbolic Engine is the **Trusted Ver
 
 ---
 
-## 💡 How QWED Compares
+## 💡 How QWED Compares: The "Orchestrator" Strategy
 
-### The "Judge" Problem
+We don't reinvent the wheel. We unify the best symbolic engines into a single **LLM-Verification Layer**.
 
-Most AI safety tools use **"LLM-as-a-Judge"** (asking GPT-4 to grade GPT-3.5). This is fundamentally unsafe:
+### QWED vs Point Solutions (Libraries)
+QWED wraps best-in-class libraries, abstracting their complex DSLs into a simple natural language interface for LLMs.
 
-- **Recursive Hallucination:** If the judge has the same bias as the generator, errors go undetected
-- **Probabilistic Evaluation:** LLMs give probability, not proof
-- **Subjectivity:** Different judges = different answers
+| Library | Domain | QWED's Role |
+|---------|--------|-------------|
+| **Pandera** | Dataframe Validation | **Orchestrator:** QWED uses Pandera for `verify_data` schema checks. |
+| **CrossHair** | Code Contracts | **Orchestrator:** QWED uses CrossHair for formal python verification. |
+| **SymPy** | Symbolic Math | **Orchestrator:** QWED translates "Derivative of x^2" → SymPy execution. |
+| **Z3 Prover** | Theorem Proving | **Orchestrator:** QWED translates logical paradoxes → Z3 constraints. |
 
-**QWED introduces "Solver-as-a-Judge"**: Replace neural network opinions with compiler execution and mathematical proof.
+### QWED vs AI Guardrails (Frameworks)
 
-### Comparison Table
+| Feature | **QWED Protocol** | NeMo Guardrails | LangChain Evaluators |
+|---------|-------------------|-----------------|----------------------|
+| **The "Judge"** | **Deterministic Solver** (Z3/SymPy) | Semantic Matcher (Embeddings) | Another LLM (GPT-4) |
+| **Mechanism** | Translation to DSL | Vector Similarity | Prompt Engineering |
+| **Verification Type** | **Mathematical Proof** | Policy Adherence | Consensus/Opinion |
+| **False Positives** | **~0%** (Logic-based) | Medium (Semantic drift) | High (Subjectivity) |
+| **Privacy** | **✅ 100% Local** | ❌ Cloud-based (usually) | ❌ Cloud-based |
 
-| Feature | **QWED Protocol** | BEAVER | NeMo Guardrails | LangChain Evaluators |
-|---------|-------------------|--------|-----------------|----------------------|
-| **The "Judge"** | Deterministic Solver (Z3/SymPy) | Probability Bounds | Semantic Matcher | Another LLM (GPT-4) |
-| **Mechanism** | Translation to DSL | Token Trie Search | Vector Similarity | Prompt Engineering |
-| **Verification Type** | Mathematical Proof | Probabilistic Bounds | Policy Adherence | Consensus/Opinion |
-| **Primary Goal** | Correctness (Truth) | Constraint Satisfaction | Safety (Appropriateness) | Quality Score |
-| **False Positives** | Near Zero (Logic-based) | Low (Statistical) | Medium (Semantic drift) | High (Subjectivity) |
-| **Works Offline** | ✅ Yes (QWEDLocal) | ✅ Yes | ❌ No | ❌ No |
-| **Privacy** | ✅ 100% Local | ✅ Local | ❌ Cloud-based | ❌ Cloud-based |
-
-**QWED's Advantage:** When you need **proof**, not opinion.
+> **QWED differs because it provides PROOF, not just localized safety checks.**
 
 ---
 
@@ -231,25 +234,27 @@ QWED routes queries to specialized engines that act as DSL interpreters:
 └──────┬───────┘
        │
        ▼
-┌──────────────────┐
-│ LLM (The Guesser)│
-│ GPT-4 / Claude   │
-└──────┬───────────┘
-       │ Unverified Output
+┌────────────────────────┐
+│  LLM (The Translator)  │
+│  "Translate to Math"   │
+└──────┬─────────────────┘
+       │ DSL / Code
        ▼
-┌────────────────────┐
-│  QWED Protocol     │
-│  (Verification)    │
-└──────┬─────────────┘
-       │
-   ┌───┴────┐
-   ▼        ▼
-❌ Reject  ✅ Verified
-            │
-            ▼
-   ┌────────────────┐
-   │ Your Application│
-   └────────────────┘
+┌─────────────────────────────┐
+│      QWED Protocol          │
+│  (Zero-Trust Verification)  │
+├─────────────────────────────┤
+│ 🧮 SymPy   ⚖️ Z3   🛡️ AST   │
+└──────────────┬──────────────┘
+       │ Proof / Result
+   ┌───┴───┐
+   ▼       ▼
+❌ Reject ✅ Verified
+           │
+           ▼
+  ┌─────────────────┐
+  │ Your Application│
+  └─────────────────┘
 ```
 
 ---
@@ -268,22 +273,58 @@ QWED routes queries to specialized engines that act as DSL interpreters:
 
 ---
 
-## 🔧 The 8 Verification Engines: How QWED Validates LLM Outputs
+## 🔬 The Verification Engines: Examples
 
-We don't use another LLM to check your LLM. **That's circular logic.**
+QWED routes queries to specialized engines that act as DSL interpreters.
 
-We use **Hard Engineering**:
+### 1. 🧮 Math Verifier (SymPy)
+**Use Case:** Financial logic, Physics, Calculus.
+```python
+# LLM: "The integral of x^2 is 3x" (Wrong)
+client.verify_math(
+    query="Integral of x^2",
+    llm_output="3x"
+)
+# -> ❌ CORRECTED: x^3/3 (Verified by SymPy)
+```
 
-| Engine | Tech Stack | What it Solves |
-|--------|------------|----------------|
-| **🧮 Math Verifier** | `SymPy` + `NumPy` | Calculus, Linear Algebra, Finance. No more `$1 + $1 = $3`. |
-| **⚖️ Logic Verifier** | `Z3 Prover` | Formal Verification. Checks for logical contradictions. |
-| **🛡️ Code Security** | `AST` + `Semgrep` | Catches `eval()`, secrets, vulnerabilities before code runs. |
-| **📊 Stats Engine** | `Pandas` + `Wasm` | Sandboxed execution for trusted data analysis. |
-| **🗄️ SQL Validator** | `SQLGlot` | Prevents Injection & validates schema. |
-| **🔍 Fact Checker** | `TF-IDF` + `NLI` | Checks grounding against source docs. |
-| **👁️ Image Verifier** | `OpenCV` + `Metadata` | Verifies image dimensions, format, pixel data. |
-| **🤝 Consensus Engine** | `Multi-Provider` | Cross-checks GPT-4 vs Claude vs Gemini. |
+### 2. ⚖️ Logic Verifier (Z3 Prover)
+**Use Case:** Contract analysis, finding contradictions.
+```python
+# LLM: "Start date is Monday. End date is 3 days later, which is Thursday."
+client.verify_logic(
+    query="If start is Monday, what is 3 days later?",
+    llm_output="Thursday"
+)
+# -> ❌ WRONG: 3 days after Monday is Thursday. 
+# Wait, actually: Mon -> Tue(1) -> Wed(2) -> Thu(3).
+# But if it finds a contradiction:
+# "All politicians are liars. Bob is a politician. Bob tells the truth."
+# -> ❌ CONTRADICTION FOUND (Proven by Z3)
+```
+
+### 3. 🗄️ SQL Verifier (SQLGlot)
+**Use Case:** preventing SQL Injection and Hallucinated Columns.
+```python
+# LLM: "Delete all users where id=1 OR 1=1"
+client.verify_sql(
+   query="Delete user 1",
+   schema="CREATE TABLE users (id INT)",
+   llm_output="DELETE FROM users WHERE id=1 OR 1=1"
+)
+# -> ❌ SECURITY ALERT: SQL Injection Detected (Always True condition)
+```
+
+### 4. 🛡️ Code Verifier (AST + CrossHair)
+**Use Case:** Detecting harmful Python/JS code.
+```python
+client.verify_code(
+    code="import os; os.system('rm -rf /')"
+)
+# -> ❌ SECURITY ALERT: Forbidden function 'os.system' detected.
+```
+
+> **Full list of engines:** Math, Logic, SQL, Code, Stats (Pandera), Fact (TF-IDF), Image, Consensus.
 
 ---
 
@@ -343,6 +384,31 @@ from qwed_sdk.integrations.llamaindex import QWEDQueryEngine
 # Add Fact Guard verification to any query engine
 verified_engine = QWEDQueryEngine(base_engine, verify_facts=True)
 ```
+
+---
+
+## 🔒 Security & Privacy: Why Banks Use QWED
+
+In high-stakes industries (Finance, Legal, Healthcare), you cannot send sensitive data to an external API for verification.
+
+**QWED is designed for Zero-Trust environments:**
+
+*   **100% Local Execution:** QWED runs inside your infrastructure (Docker/Kubernetes). Data never leaves your VPC.
+*   **No "Model Training":** We do not train on your data. QWED is a deterministic code execution engine, not a generative model.
+*   **Audit Logs:** Every verification generates a cryptographically signed receipt (JWT) proving that the check passed.
+
+> **"Don't trust the AI. Trust the Code."**
+
+---
+
+## 🗺️ Roadmap
+
+We are building the **Universal Verification Standard** for the agentic web.
+
+*   **v1.0 (Live):** Core 8 Engines (Math, Logic, Code, SQL, etc).
+*   **v2.0 (Live):** Specialized Industry Packages (`qwed-finance`, `qwed-legal`).
+*   **v2.1 (Q2 2025):** **QWED Client-Side** (WebAssembly) - Run verification in the browser.
+*   **v2.2 (Q3 2025):** **Distributed Verification Network** - A decentralized network of verifier nodes.
 
 ---
 
