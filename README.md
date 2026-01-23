@@ -367,16 +367,10 @@ Use QWED verification in your CI/CD pipelines:
 
 | Action | Use Case | Marketplace |
 |--------|----------|-------------|
+| `QWED-AI/qwed-verification@v1` | Core 8-engine LLM verification | [View](https://github.com/marketplace/actions/qwed-protocol-verification) |
 | `QWED-AI/qwed-legal@v0.2.0` | Contract deadline, jurisdiction, citations | [View](https://github.com/marketplace/actions/qwed-legal-verification) |
 | `QWED-AI/qwed-finance@v1` | NPV, loan calculations, compliance | [View](https://github.com/marketplace/actions/qwed-finance-guard) |
 | `QWED-AI/qwed-ucp@v1` | E-commerce transactions | [View](https://github.com/marketplace/actions/qwed-commerce-auditor) |
-
-```yaml
-# Example: Verify legal contracts in CI
-- uses: QWED-AI/qwed-legal@v0.2.0
-  with:
-    mode: all
-```
 
 ### 🎓 Free Course on AI Verification
 
