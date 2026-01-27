@@ -124,13 +124,28 @@ class QWEDClient:
     ) -> VerificationResult:
         """Verify code for security vulnerabilities."""
         start = time.time()
-        data = self._request(
-            "POST",
-            "/verify/code",
-            json={"code": code, "language": language}
-        )
-        data["latency_ms"] = (time.time() - start) * 1000
-        return VerificationResult.from_dict(data)
+        # Try local execution first (Technical Safety - Phase 12)
+        try:
+            from qwed_new.guards.code_guard import CodeGuard
+            guard = CodeGuard()
+            result_dict = guard.verify_safety(code)
+            
+            result = VerificationResult(
+                status="VERIFIED" if result_dict["verified"] else "UNVERIFIED",
+                is_verified=result_dict["verified"],
+                result=result_dict,
+                latency_ms=(time.time() - start) * 1000
+            )
+            return result
+        except ImportError:
+            # Fallback to API
+            data = self._request(
+                "POST",
+                "/verify/code",
+                json={"code": code, "language": language}
+            )
+            data["latency_ms"] = (time.time() - start) * 1000
+            return VerificationResult.from_dict(data)
     
     def verify_fact(
         self,
@@ -150,18 +165,34 @@ class QWEDClient:
     def verify_sql(
         self,
         query: str,
-        schema_ddl: str,
+        schema_ddl: str = "",
         dialect: str = "sqlite"
     ) -> VerificationResult:
         """Verify SQL query against schema."""
         start = time.time()
-        data = self._request(
-            "POST",
-            "/verify/sql",
-            json={"query": query, "schema_ddl": schema_ddl, "dialect": dialect}
-        )
-        data["latency_ms"] = (time.time() - start) * 1000
-        return VerificationResult.from_dict(data)
+        # Try local execution first (Technical Safety - Phase 12)
+        try:
+            from qwed_new.guards.sql_guard import SQLGuard
+            # Note: SQLGuard in client ignores schema/dialect for deep checks in this simple integration
+            # but we can pass dialect if needed.
+            guard = SQLGuard() 
+            result_dict = guard.verify_query(query, dialect)
+            
+            result = VerificationResult(
+                status="VERIFIED" if result_dict["verified"] else "UNVERIFIED",
+                is_verified=result_dict["verified"],
+                result=result_dict,
+                latency_ms=(time.time() - start) * 1000
+            )
+            return result
+        except ImportError:
+            data = self._request(
+                "POST",
+                "/verify/sql",
+                json={"query": query, "schema_ddl": schema_ddl, "dialect": dialect}
+            )
+            data["latency_ms"] = (time.time() - start) * 1000
+            return VerificationResult.from_dict(data)
 
     def verify_stats(
         self,
