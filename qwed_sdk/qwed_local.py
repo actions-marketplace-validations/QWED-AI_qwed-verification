@@ -305,7 +305,18 @@ class QWEDLocal:
         This is the ONLY place where user data touches the LLM.
         No data is sent to QWED servers!
         """
-        
+        # PII MASKING (Phase 19 privacy shield)
+        if self.mask_pii and self._pii_detector:
+            original_prompt = prompt
+            prompt, pii_report = self._pii_detector.detect_and_mask(prompt)
+            
+            if pii_report["pii_detected"] > 0:
+                if HAS_COLOR:
+                    print(f"{QWED.WARNING}🛡️  Privacy Shield Active: {pii_report['pii_detected']} PII entities masked{QWED.RESET}")
+                    # print(f"   Types: {', '.join(pii_report['types'])}") # Optional verbose
+                else:
+                    print(f"🛡️  Privacy Shield Active: {pii_report['pii_detected']} PII entities masked")
+
         if self.client_type == "openai":
             messages = []
             if system:

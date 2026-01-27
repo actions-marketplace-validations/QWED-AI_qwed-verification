@@ -405,6 +405,7 @@ In high-stakes industries (Finance, Legal, Healthcare), you cannot send sensitiv
 **QWED is designed for Zero-Trust environments:**
 
 *   **100% Local Execution:** QWED runs inside your infrastructure (Docker/Kubernetes). Data never leaves your VPC.
+*   **Privacy Shield (New):** Built-in **PII Masking** redacts Credit Cards, SSNs, and Emails *before* they touch the LLM.
 *   **No "Model Training":** We do not train on your data. QWED is a deterministic code execution engine, not a generative model.
 *   **Audit Logs:** Every verification generates a cryptographically signed receipt (JWT) proving that the check passed.
 

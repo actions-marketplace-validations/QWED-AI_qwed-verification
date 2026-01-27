@@ -1,72 +1,19 @@
-"""
-PII Detection and Masking for QWED.
-
-Enterprise privacy feature that detects and masks personally identifiable 
-information (PII) before sending data to LLM providers.
-
-Requires optional dependencies:
-    pip install qwed[pii]
-    python -m spacy download en_core_web_lg
-"""
-
-from typing import Dict, List, Optional, Tuple
-
-# Lazy imports to avoid forcing dependency
-PIIDetectorType = None
-
-
-def check_pii_dependencies():
-    """Check if PII dependencies are installed."""
-    try:
-        from presidio_analyzer import AnalyzerEngine
-        from presidio_anonymizer import AnonymizerEngine, OperatorConfig
-        return True
-    except ImportError:
-        return False
-
-
-def raise_missing_dependencies():
-    """Raise helpful error if PII dependencies missing."""
-    raise ImportError(
-        "\n"
-        "⚠️  PII masking features require additional packages.\n"
-        "\n"
-        "📦 Install with:\n"
-        "   pip install 'qwed[pii]'\n"
-        "\n"
-        "📥 Then download the spaCy model:\n"
-        "   python -m spacy download en_core_web_lg\n"
-        "\n"
-        "📖 See docs/PII_MASKING.md for details.\n"
-    )
-
+from typing import List, Dict, Any, Tuple, Optional
+try:
+    from presidio_analyzer import AnalyzerEngine
+    from presidio_anonymizer import AnonymizerEngine
+    from presidio_anonymizer.entities import OperatorConfig
+except ImportError:
+    AnalyzerEngine = None
+    AnonymizerEngine = None
 
 class PIIDetector:
     """
-    Detect and mask PII using Microsoft Presidio.
-    
-    Supports detection of:
-    - EMAIL_ADDRESS
-    - CREDIT_CARD
-    - PHONE_NUMBER
-    - US_SSN
-    - IBAN_CODE
-    - IP_ADDRESS
-    - PERSON (names)
-    - LOCATION
-    - MEDICAL_LICENSE
-    
-    Example:
-        >>> detector = PIIDetector()
-        >>> masked, info = detector.detect_and_mask("Email: john@example.com")
-        >>> print(masked)
-        "Email: <EMAIL_ADDRESS>"
-        >>> print(info["pii_detected"])
-        1
+    Microsoft Presidio-based PII detection and masking.
+    Ensures sensitive data (Credit Cards, SSNs, Emails) is redacted before LLM calls.
     """
     
-    # Supported PII entity types
-    ENTITIES = [
+    DEFAULT_ENTITIES = [
         "EMAIL_ADDRESS",
         "CREDIT_CARD",
         "PHONE_NUMBER",
@@ -74,90 +21,64 @@ class PIIDetector:
         "IBAN_CODE",
         "IP_ADDRESS",
         "PERSON",
-        "LOCATION",
-        "MEDICAL_LICENSE"
+        "LOCATION"
     ]
     
     def __init__(self, entities: Optional[List[str]] = None):
         """
-        Initialize PII detector.
+        Initialize PII Detector.
         
         Args:
-            entities: Optional list of entity types to detect.
-                     If None, uses all supported entities.
-        
-        Raises:
-            ImportError: If presidio dependencies not installed.
+            entities: List of PII entity types to detect (default: broad set)
         """
-        if not check_pii_dependencies():
-            raise_missing_dependencies()
-        
-        # Import here (lazy) to avoid forcing dependency
-        from presidio_analyzer import AnalyzerEngine
-        from presidio_anonymizer import AnonymizerEngine
-        
-        self.entities = entities or self.ENTITIES
+        if AnalyzerEngine is None:
+            raise ImportError(
+                "Presidio not found. Install with: pip install presidio-analyzer presidio-anonymizer spacy && python -m spacy download en_core_web_lg"
+            )
+            
         self.analyzer = AnalyzerEngine()
         self.anonymizer = AnonymizerEngine()
+        self.entities = entities or self.DEFAULT_ENTITIES
     
-    def detect_and_mask(self, text: str) -> Tuple[str, Dict]:
+    def detect_and_mask(self, text: str) -> Tuple[str, Dict[str, Any]]:
         """
-        Detect PII and return masked text + metadata.
+        Detect PII in text and return masked version + report.
         
         Args:
-            text: Input text to scan for PII
-        
+            text: Input text (e.g., prompt)
+            
         Returns:
-            Tuple of (masked_text, metadata_dict)
-            
-        Metadata includes:
-            - pii_detected: Count of PII entities found
-            - types: List of entity types detected
-            - positions: List of (start, end) positions
-            - original_length: Length of original text
-            - masked_length: Length of masked text
-            
-        Example:
-            >>> detector.detect_and_mask("Call me at 555-1234")
-            ("Call me at <PHONE_NUMBER>", {
-                "pii_detected": 1,
-                "types": ["PHONE_NUMBER"],
-                ...
-            })
+            Tuple[str, dict]: (masked_text, pii_report)
         """
-        # Analyze for PII
+        # 1. Analyze
         results = self.analyzer.analyze(
             text=text,
             entities=self.entities,
             language='en'
         )
         
-        # No PII found
-        if not results:
-            return text, {"pii_detected": 0}
+        pii_count = len(results)
+        detected_types = list(set([r.entity_type for r in results]))
         
-        # Import operator config for masking
-        from presidio_anonymizer import OperatorConfig
+        if pii_count == 0:
+            return text, {"pii_detected": 0, "types": []}
         
-        # Anonymize with entity type placeholders
-        anonymized = self.anonymizer.anonymize(
+        # 2. Anonymize (Mask)
+        # We replace with <ENTITY_TYPE> to keep context for the LLM if possible, 
+        # or simplified <REDACTED> if preferred. 
+        # Here we use the entity type to allow the LLM to know *something* was there.
+        anonymized_result = self.anonymizer.anonymize(
             text=text,
             analyzer_results=results,
             operators={
-                "DEFAULT": OperatorConfig(
-                    "replace",
-                    {"new_value": lambda x: f"<{x.entity_type}>"}
-                )
+                "DEFAULT": OperatorConfig("replace", {"new_value": "<REDACTED>"}),
+                # Optional: Use specific masks per type
+                # "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "<PHONE_NUMBER>"}),
             }
         )
         
-        # Build metadata
-        metadata = {
-            "pii_detected": len(results),
-            "types": [r.entity_type for r in results],
-            "positions": [(r.start, r.end) for r in results],
-            "original_length": len(text),
-            "masked_length": len(anonymized.text)
+        return anonymized_result.text, {
+            "pii_detected": pii_count,
+            "types": detected_types,
+            "items": [str(r) for r in results]
         }
-        
-        return anonymized.text, metadata
