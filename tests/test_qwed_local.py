@@ -5,6 +5,7 @@ Tests the basic structure without actually calling LLMs.
 """
 
 import sys
+import pytest
 sys.path.insert(0, ".")
 
 from qwed_sdk.qwed_local import QWEDLocal, VerificationResult
