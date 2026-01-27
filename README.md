@@ -124,6 +124,17 @@ print(response)
 
 ---
 
+**Trustworthiness**: `SACChunker` prevents retrieval mismatch.
+
+## 🏛️ Authority Verification (Phase 9)
+*   **No More Fake Cases:** `CitationGuard` (Legal) verifies legal citations against valid reporter formats (e.g., Bluebook).
+*   **Banking Ready:** `ISOGuard` (Finance) ensures AI payments meet ISO 20022 standards.
+*   **Ethical AI:** `DisclaimerGuard` (Core) enforces safety warnings in regulated outputs.
+
+## 📦 Installation
+
+---
+
 ## 🚨 The LLM Hallucination Problem: Why AI Can't Be Trusted
 
 Everyone is trying to fix AI hallucinations by **Fine-Tuning** (teaching it more data).
