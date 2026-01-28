@@ -13,17 +13,10 @@ import json
 import glob
 from pathlib import Path
 
-# QWED SDK imports
-try:
-    from qwed_sdk import QWEDClient
-    from qwed_sdk.guards.system_guard import SystemGuard
-    from qwed_sdk.guards.config_guard import ConfigGuard
-except ImportError:
-    # Fallback for local development
-    sys.path.insert(0, "/app")
-    from qwed_sdk import QWEDClient
-    from qwed_sdk.guards.system_guard import SystemGuard
-    from qwed_sdk.guards.config_guard import ConfigGuard
+# QWED SDK imports - only guards (no heavy dependencies)
+sys.path.insert(0, "/app")
+from qwed_sdk.guards.system_guard import SystemGuard
+from qwed_sdk.guards.config_guard import ConfigGuard
 
 
 def get_env(name: str, default: str = "") -> str:
@@ -65,6 +58,8 @@ def action_verify():
     print(f"🚀 QWED Verification (Engine: {engine})")
     
     try:
+        # Lazy import to avoid httpx dependency for scan modes
+        from qwed_sdk.client import QWEDClient
         client = QWEDClient(api_key=api_key)
         
         if engine == "math":
