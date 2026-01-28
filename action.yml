@@ -1,6 +1,6 @@
 # Source: Matching the qwed-verification file list structure
 name: 'QWED Protocol Verification'
-description: 'Deterministically verify LLM outputs and scan for security issues using Z3, SymPy, and AST. Supports secret scanning, code analysis, and SARIF output.'
+description: 'Verify LLM outputs with Z3/SymPy. Scan secrets, code, and shell scripts. SARIF output for GitHub Security.'
 author: 'QWED-AI'
 branding:
   icon: 'shield'
