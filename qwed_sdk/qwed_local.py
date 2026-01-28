@@ -737,6 +737,123 @@ Z3 code:"""
                 verified=False,
                 error=f"Code analysis failed: {str(e)}"
             )
+    
+    def verify_shell_command(
+        self, 
+        command: str, 
+        allowed_paths: List[str] = None,
+        blocked_commands: List[str] = None
+    ) -> VerificationResult:
+        """
+        Verify a shell command for security risks.
+        
+        Uses deterministic pattern matching (no LLM).
+        Blocks dangerous commands, path traversal, and pipe-to-shell.
+        
+        Args:
+            command: The shell command to verify.
+            allowed_paths: Optional list of allowed file paths.
+            blocked_commands: Optional list of additional commands to block.
+        
+        Returns:
+            VerificationResult with verified=True if safe.
+        """
+        from .guards.system_guard import SystemGuard
+        
+        guard = SystemGuard(
+            allowed_paths=allowed_paths,
+            blocked_commands=blocked_commands
+        )
+        
+        result = guard.verify_shell_command(command)
+        
+        if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+            print(f"\n{QWED.BRAND}🔬 QWED Verification{QWED.RESET} {QWED.INFO}| System Integrity Engine{QWED.RESET}")
+            if result["verified"]:
+                print(f"{QWED.SUCCESS}✅ SAFE COMMAND{QWED.RESET}")
+            else:
+                print(f"{QWED.ERROR}❌ BLOCKED: {result.get('risk', 'SECURITY_RISK')}{QWED.RESET}")
+                print(f"  {QWED.WARNING}{result.get('message', '')}{QWED.RESET}")
+        
+        return VerificationResult(
+            verified=result["verified"],
+            value="SAFE" if result["verified"] else "BLOCKED",
+            confidence=1.0,
+            evidence=result
+        )
+    
+    def verify_file_access(
+        self, 
+        filepath: str, 
+        operation: str = "read",
+        allowed_paths: List[str] = None
+    ) -> VerificationResult:
+        """
+        Verify if a file path is within allowed sandbox directories.
+        
+        Uses deterministic path comparison (no LLM).
+        
+        Args:
+            filepath: The file path to verify.
+            operation: "read" or "write".
+            allowed_paths: Optional list of allowed directories.
+        
+        Returns:
+            VerificationResult with verified=True if allowed.
+        """
+        from .guards.system_guard import SystemGuard
+        
+        guard = SystemGuard(allowed_paths=allowed_paths)
+        
+        result = guard.verify_file_access(filepath, operation)
+        
+        if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+            print(f"\n{QWED.BRAND}🔬 QWED Verification{QWED.RESET} {QWED.INFO}| File Sandbox Engine{QWED.RESET}")
+            if result["verified"]:
+                print(f"{QWED.SUCCESS}✅ ACCESS ALLOWED{QWED.RESET}")
+            else:
+                print(f"{QWED.ERROR}❌ BLOCKED: {result.get('risk', 'SANDBOX_ESCAPE')}{QWED.RESET}")
+                print(f"  {QWED.WARNING}{result.get('message', '')}{QWED.RESET}")
+        
+        return VerificationResult(
+            verified=result["verified"],
+            value="ALLOWED" if result["verified"] else "BLOCKED",
+            confidence=1.0,
+            evidence=result
+        )
+    
+    def verify_config(self, config_data: Any) -> VerificationResult:
+        """
+        Scan configuration data for plaintext secrets.
+        
+        Uses deterministic regex pattern matching (no LLM).
+        
+        Args:
+            config_data: Dict, list, or string to scan for secrets.
+        
+        Returns:
+            VerificationResult with verified=False if secrets found.
+        """
+        from .guards.config_guard import ConfigGuard
+        
+        guard = ConfigGuard()
+        result = guard.verify_config_safety(config_data)
+        
+        if HAS_COLOR and os.getenv("QWED_QUIET") != "1":
+            print(f"\n{QWED.BRAND}🔬 QWED Verification{QWED.RESET} {QWED.INFO}| Config Security Engine{QWED.RESET}")
+            if result["verified"]:
+                print(f"{QWED.SUCCESS}✅ NO SECRETS DETECTED{QWED.RESET}")
+            else:
+                print(f"{QWED.ERROR}❌ SECRETS FOUND: {len(result.get('violations', []))}{QWED.RESET}")
+                for v in result.get("violations", [])[:3]:
+                    print(f"  {QWED.WARNING}⚠️  {v.get('type', 'SECRET')} at {v.get('path', 'unknown')}{QWED.RESET}")
+        
+        return VerificationResult(
+            verified=result["verified"],
+            value="CLEAN" if result["verified"] else "SECRETS_DETECTED",
+            confidence=1.0,
+            evidence=result
+        )
 
 
 # Convenience function
