@@ -17,10 +17,12 @@ class PIIGuard:
             "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b"),
             # Identifying common password declarations (heuristic)
             "password_assignment": re.compile(r"(?i)(password|passwd|pwd|secret)\s*[:=]\s*['\"]?(\S{6,})['\"]?"),
-            # Generic high-entropy strings usually associated with secrets (checking later if needed)
             
-            # Additional PII
-            "phone_number": re.compile(r"(\+\d{1,3}[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}"),
+            # Obfuscated Keys (e.g. "sk - proj - ...")
+            "obfuscated_api_key": re.compile(r"sk\s*-\s*(?:proj|ant)\s*-\s*[a-zA-Z0-9]+"),
+            
+            # Additional PII (Stricter Phone Number: Word boundaries to avoid matching inside API keys)
+            "phone_number": re.compile(r"\b(?:\+\d{1,3}[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}\b"),
         }
 
     def scan(self, content: str) -> Dict[str, Any]:
