@@ -8,8 +8,8 @@ class CodeGuard:
     """
     def __init__(self):
         # Blocklist of dangerous functions and imports
-        self.dangerous_functions: Set[str] = {'eval', 'exec', 'compile', 'open', 'system', 'popen'}
-        self.dangerous_modules: Set[str] = {'os', 'subprocess', 'sys', 'shutil', 'socket', 'pickle'}
+        self.dangerous_functions: Set[str] = {'eval', 'exec', 'compile', 'open', 'system', 'popen', '__import__', 'spawn'}
+        self.dangerous_modules: Set[str] = {'os', 'subprocess', 'sys', 'shutil', 'socket', 'pickle', 'pty'}
 
     def verify_safety(self, code_snippet: str, language: str = "python") -> Dict[str, Any]:
         """
@@ -36,8 +36,12 @@ class CodeGuard:
         for node in ast.walk(tree):
             # Check for dangerous function calls (e.g., eval())
             if isinstance(node, ast.Call):
+                # Direct calls: eval()
                 if isinstance(node.func, ast.Name) and node.func.id in self.dangerous_functions:
                     violations.append(f"Forbidden function call: {node.func.id}()")
+                # Method calls: os.system()
+                elif isinstance(node.func, ast.Attribute) and node.func.attr in self.dangerous_functions:
+                    violations.append(f"Forbidden method call: .{node.func.attr}()")
             
             # Check for dangerous imports (e.g., import os)
             elif isinstance(node, ast.Import):
@@ -69,8 +73,7 @@ class CodeGuard:
         import re
         
         dangerous_patterns = [
-            (r"curl\s+.*\|\s*bash", "Pipe to Bash detected (RCE Risk)"),
-            (r"wget\s+.*\|\s*bash", "Pipe to Bash detected (RCE Risk)"),
+            (r"(?:curl|wget)\s+.*(?:\||&&|;)\s*(?:bash|sh|python|perl|ruby|php)", "Remote Code Execution (RCE) chain detected"),
             (r"rm\s+-rf", "Destructive command (rm -rf)"),
             (r":\(\)\{\s*:\|:\&\s*\}\;", "Fork Bomb detected"),
             (r"nc\s+", "Netcat usage detected (Data Exfiltration/Reverse Shell Risk)"),
@@ -79,6 +82,8 @@ class CodeGuard:
             (r"/etc/passwd", "Sensitive file access (/etc/passwd)"),
             (r"/etc/shadow", "Sensitive file access (/etc/shadow)"),
             (r"id_rsa", "SSH Private Key access detected"),
+            (r"printenv", "Environment Variable Dumping detected"),
+            (r"grep\s+.*(?:pass|token|key|secret)", "Credential Hunting (grep for secrets) detected"),
             (r"base64\s+-d", "Base64 Decoding (Obfuscation Risk)"),
             (r"chmod\s+777", "Insecure permissions (chmod 777)"),
             (r"sudo\s+", "Privilege Escalation attempt (sudo)"),
