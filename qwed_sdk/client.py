@@ -154,6 +154,26 @@ class QWEDClient:
     ) -> VerificationResult:
         """Verify a factual claim against context."""
         start = time.time()
+        
+        # Try local PII scanning first (Privacy Safety - Mode B)
+        try:
+            from qwed_new.guards.pii_guard import PIIGuard
+            guard = PIIGuard()
+            # Treat the 'claim' (response) as the content to scan for leaks
+            pii_result = guard.scan(claim)
+            
+            if not pii_result["verified"]:
+                # PII Detected locally - Return immediately
+                return VerificationResult(
+                    status="UNVERIFIED",
+                    is_verified=False,
+                    result=pii_result,
+                    latency_ms=(time.time() - start) * 1000
+                )
+        except ImportError:
+            pass # Fallback to remote if local guard missing
+
+        # Remote verification (if no local PII or Guard missing)
         data = self._request(
             "POST",
             "/verify/fact",
