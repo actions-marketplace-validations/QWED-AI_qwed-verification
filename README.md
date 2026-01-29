@@ -455,6 +455,7 @@ QWED verification is available as specialized packages for different industries:
 | **qwed-ucp** 🛒 | E-commerce cart/transaction verification | `pip install qwed-ucp` | [GitHub](https://github.com/QWED-AI/qwed-ucp) |
 | **qwed-mcp** 🔌 | Claude Desktop MCP integration | `pip install qwed-mcp` | [GitHub](https://github.com/QWED-AI/qwed-mcp) |
 | **open-responses** 🤖 | OpenAI Responses API + QWED guards | `pip install qwed-open-responses` | [GitHub](https://github.com/QWED-AI/qwed-open-responses) |
+| **qwed-tax** 💸 | Tax compliance & withholding verification middleware | `pip install qwed-tax` | [GitHub](https://github.com/QWED-AI/qwed-tax) |
 
 ### 🎬 GitHub Actions
 
