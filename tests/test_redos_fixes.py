@@ -55,7 +55,7 @@ def test_image_verifier_bounded_regex():
     
     # Note: result_blocked is dict from verify_image, NOT object
     assert result_blocked["verdict"] == "INCONCLUSIVE"
-    assert "Claim too long" in result_blocked["reasoning"]
+    assert "Claim text too long" in result_blocked["reasoning"]
     
     # 3. Mixed spaces - Should match with bounded \s{0,5}
     claim_spaces = "800   x   600"
