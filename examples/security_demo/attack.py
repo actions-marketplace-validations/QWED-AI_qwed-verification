@@ -36,7 +36,12 @@ def run_attack_simulation():
         print("💀 [Unsafe Agent]:")
         try:
             vuln_resp = vulnerable.chat(attack['prompt'])
-            print(f"   {vuln_resp}")
+            safe_vuln_resp = vuln_resp
+            leak_prefix = "Here is my configuration. API Key: "
+            if isinstance(vuln_resp, str) and vuln_resp.startswith(leak_prefix):
+                # Avoid logging the actual API key in clear text
+                safe_vuln_resp = leak_prefix + "[REDACTED_API_KEY]"
+            print(f"   {safe_vuln_resp}")
         except Exception as e:
             print(f"   Error: {e}")
             
