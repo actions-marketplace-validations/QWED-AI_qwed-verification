@@ -74,14 +74,30 @@ import hmac
 # ... (existing imports)
 
 def hash_api_key(api_key: str) -> str:
-    """Hash an API key using HMAC-SHA256 to prevent weak hashing alerts."""
-    # Use SECRET_KEY as salt
+    """
+    Derive a hash for an API key using PBKDF2-HMAC-SHA256.
+
+    This is intentionally computationally expensive to make brute-force attacks
+    against stored API key hashes more difficult, while remaining deterministic
+    for lookup purposes.
+    """
+    # Derive a salt from SECRET_KEY; fall back to a constant development salt.
     if isinstance(SECRET_KEY, str):
-        key_bytes = SECRET_KEY.encode()
+        secret_bytes = SECRET_KEY.encode()
     else:
-        key_bytes = b"default_dev_salt" # Fallback if secret is somehow bytes or None
-        
-    return hmac.new(key_bytes, api_key.encode(), hashlib.sha256).hexdigest()
+        secret_bytes = b"default_dev_salt" # Fallback if secret is somehow bytes or None
+
+    # Namespace the salt for API key hashing to avoid cross-protocol reuse.
+    salt = secret_bytes + b":qwed_api_key"
+
+    # Use PBKDF2-HMAC-SHA256 with a reasonable iteration count.
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        api_key.encode("utf-8"),
+        salt,
+        100_000,
+    )
+    return dk.hex()
 
 def mask_api_key(api_key: str) -> str:
     """
