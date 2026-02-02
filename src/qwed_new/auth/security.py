@@ -69,9 +69,6 @@ def generate_api_key(prefix: str = "qwed_live") -> tuple[str, str]:
     
     return plaintext_key, key_hash
 
-import hmac
-
-# ... (existing imports)
 
 def hash_api_key(api_key: str) -> str:
     """

@@ -24,10 +24,6 @@ async def get_api_key(
             detail="Missing x-api-key header"
         )
     
-from qwed_new.auth.security import hash_api_key
-
-# ...
-
     # Hash the provided key to compare with stored hash
     # The key format is qwed_live_<random>
     # We store the hash of the full key string

@@ -30,10 +30,6 @@ async def get_current_tenant(
     Dependency function to extract and validate the API key.
     Returns the authenticated tenant context.
     """
-from qwed_new.auth.security import hash_api_key
-
-# ...
-
     # 1. Hash the provided key
     hashed_key = hash_api_key(x_api_key)
     
