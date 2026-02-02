@@ -120,6 +120,17 @@ class ImageVerifier:
                 "methods_used": [],
                 "engine": "ImageVerifier"
             }
+            
+        # Security: Prevent ReDoS attacks on regexes
+        if len(claim) > 500:
+            return {
+                "verdict": "INCONCLUSIVE",
+                "confidence": 0.0,
+                "reasoning": "Claim text too long (max 500 chars) - Security ReDoS protection",
+                "analysis": {},
+                "methods_used": [],
+                "engine": "ImageVerifier"
+            }
         
         methods_used = []
         analysis = {}

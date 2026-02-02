@@ -31,7 +31,7 @@ async def get_current_tenant(
     Returns the authenticated tenant context.
     """
     # 1. Hash the provided key
-    hashed_key = hashlib.sha256(x_api_key.encode()).hexdigest()
+    hashed_key = hash_api_key(x_api_key)
     
     # 2. Look up API key
     statement = select(ApiKey).where(ApiKey.key_hash == hashed_key, ApiKey.is_active == True)

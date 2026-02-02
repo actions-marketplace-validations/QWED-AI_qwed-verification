@@ -65,13 +65,36 @@ def generate_api_key(prefix: str = "qwed_live") -> tuple[str, str]:
     plaintext_key = f"{prefix}_{random_part}"
     
     # Hash the key for storage
-    key_hash = hashlib.sha256(plaintext_key.encode()).hexdigest()
+    key_hash = hash_api_key(plaintext_key)
     
     return plaintext_key, key_hash
 
+
 def hash_api_key(api_key: str) -> str:
-    """Hash an API key for comparison."""
-    return hashlib.sha256(api_key.encode()).hexdigest()
+    """
+    Derive a hash for an API key using PBKDF2-HMAC-SHA256.
+
+    This is intentionally computationally expensive to make brute-force attacks
+    against stored API key hashes more difficult, while remaining deterministic
+    for lookup purposes.
+    """
+    # Derive a salt from SECRET_KEY; fall back to a constant development salt.
+    if isinstance(SECRET_KEY, str):
+        secret_bytes = SECRET_KEY.encode()
+    else:
+        secret_bytes = b"default_dev_salt" # Fallback if secret is somehow bytes or None
+
+    # Namespace the salt for API key hashing to avoid cross-protocol reuse.
+    salt = secret_bytes + b":qwed_api_key"
+
+    # Use PBKDF2-HMAC-SHA256 with a reasonable iteration count.
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        api_key.encode("utf-8"),
+        salt,
+        100_000,
+    )
+    return dk.hex()
 
 def mask_api_key(api_key: str) -> str:
     """
