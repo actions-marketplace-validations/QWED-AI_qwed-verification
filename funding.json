@@ -1,0 +1,78 @@
+{
+    "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+    "version": "v1.1.0",
+    "entity": {
+        "type": "individual",
+        "role": "owner",
+        "name": "Rahul Dass",
+        "email": "rahul@qwedai.com",
+        "description": "Founder & Core Maintainer of QWED Protocol, building the deterministic verification layer for AI.",
+        "webpageUrl": {
+            "url": "https://qwedai.com"
+        }
+    },
+    "projects": [
+        {
+            "guid": "qwed-verification",
+            "name": "QWED Protocol",
+            "description": "The first open-source Neurosymbolic AI Verification Layer. QWED prevents hallucinations in high-stakes LLM applications (Math, Finance, Logic) by using deterministic engines (SymPy, Z3, AST) to verify AI outputs.",
+            "webpageUrl": {
+                "url": "https://qwedai.com"
+            },
+            "repositoryUrl": {
+                "url": "https://github.com/QWED-AI/qwed-verification"
+            },
+            "licenses": [
+                "spdx:Apache-2.0"
+            ],
+            "tags": [
+                "ai-security",
+                "verification",
+                "neurosymbolic",
+                "guardrails",
+                "llm-ops"
+            ]
+        }
+    ],
+    "funding": {
+        "channels": [
+            {
+                "guid": "github-sponsors-org",
+                "type": "payment-provider",
+                "address": "https://github.com/sponsors/QWED-AI",
+                "description": "Corporate Sponsorship via GitHub Sponsors."
+            },
+            {
+                "guid": "github-sponsors-rahul",
+                "type": "payment-provider",
+                "address": "https://github.com/sponsors/rahuldass19",
+                "description": "Individual Developer Sponsorship."
+            }
+        ],
+        "plans": [
+            {
+                "guid": "developer-sponsorship",
+                "status": "active",
+                "name": "Core Maintainer Support",
+                "description": "Support the full-time development of QWED Protocol.",
+                "amount": 0,
+                "currency": "USD",
+                "frequency": "monthly",
+                "channels": [
+                    "github-sponsors-rahul",
+                    "github-sponsors-org"
+                ]
+            }
+        ],
+        "history": [
+            {
+                "year": 2024,
+                "income": 0,
+                "expenses": 0,
+                "taxes": 0,
+                "currency": "USD",
+                "description": "Project launched. Currently bootstrapping."
+            }
+        ]
+    }
+}
