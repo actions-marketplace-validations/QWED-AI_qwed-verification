@@ -6,14 +6,27 @@ def sanitize_vulnerable_response(response: str) -> str:
     Sanitize potentially sensitive content from the vulnerable agent's response
     before logging it. In particular, never log API keys in clear text.
     """
+    # If the response is not a string, avoid logging its raw content to prevent
+    # accidental leakage of sensitive data from complex objects.
     if not isinstance(response, str):
-        return response
+        return "[REDACTED] (Non-string response content masked)"
+
+    # Normalize case for robust pattern matching.
+    lower_resp = response.lower()
 
     # CodeQL Mitigation: Return a constant string if sensitive data is detected.
     # Do not construct a new string from the input to avoid taint propagation.
-    if "API Key" in response or "sk_live" in response:
+    # Look for common secret indicators beyond the exact API key prefix.
+    if (
+        "api key" in lower_resp
+        or "apikey" in lower_resp
+        or "sk_live" in lower_resp
+        or "secret" in lower_resp
+        or "password" in lower_resp
+    ):
         return "[REDACTED_API_KEY] (Sensitive content masked)"
 
+    # If no sensitive patterns are detected, it is safe to return the original string.
     return response
 
 def run_attack_simulation():
