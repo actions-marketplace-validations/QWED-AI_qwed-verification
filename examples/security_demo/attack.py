@@ -9,20 +9,10 @@ def sanitize_vulnerable_response(response: str) -> str:
     if not isinstance(response, str):
         return response
 
-    # Redact any "API Key: <value>" pattern.
-    marker = "API Key:"
-    if marker in response:
-        prefix, _, suffix = response.partition(marker)
-        # Keep everything up to "API Key:" and mask the remainder of that token.
-        # We stop redacting at the next whitespace to avoid over-masking.
-        suffix = suffix.lstrip()
-        redacted_suffix = "[REDACTED_API_KEY]"
-        # Preserve any trailing text after the key value.
-        for i, ch in enumerate(suffix):
-            if ch.isspace():
-                redacted_suffix += suffix[i:]
-                break
-        return prefix + marker + " " + redacted_suffix
+    # CodeQL Mitigation: Return a constant string if sensitive data is detected.
+    # Do not construct a new string from the input to avoid taint propagation.
+    if "API Key" in response or "sk_live" in response:
+        return "[REDACTED_API_KEY] (Sensitive content masked)"
 
     return response
 

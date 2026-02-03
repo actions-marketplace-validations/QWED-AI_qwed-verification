@@ -260,7 +260,16 @@ def action_verify_shell():
 def output_results(findings: list, format: str, scan_type: str):
     """Output findings in requested format."""
     if format == "json":
-        print(json.dumps({"findings": findings, "count": len(findings)}, indent=2))
+        # Sanitize findings for JSON output to prevent secret leakage
+        safe_findings = []
+        for f in findings:
+            safe_findings.append({
+                "type": f.get("type", "UNKNOWN"),
+                "file": os.path.basename(f.get("file", "")), # Only show basename
+                "line": f.get("line", "?")
+                # Intentionally omitting 'message' which may contain secrets
+            })
+        print(json.dumps({"findings": safe_findings, "count": len(findings)}, indent=2))
         
     elif format == "sarif":
         sarif = generate_sarif(findings, scan_type)
@@ -274,8 +283,10 @@ def output_results(findings: list, format: str, scan_type: str):
         if findings:
             print(f"\n❌ Found {len(findings)} issue(s):\n")
             for f in findings[:20]:  # Limit output
-                print(f"   [{f['type']}] {f['file']}:{f.get('line', '?')}")
-                print(f"   └── {f['message']}\n")
+                safe_file = os.path.basename(f.get("file", "?"))
+                print(f"   [{f['type']}] {safe_file}:{f.get('line', '?')}")
+                # Use generic message instead of potentially tainted f['message']
+                print(f"   └── Detected potential {f['type']} issue.\n")
             if len(findings) > 20:
                 print(f"   ... and {len(findings) - 20} more issues.")
         else:
