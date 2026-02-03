@@ -555,6 +555,7 @@ async def verify_image(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Image verification error: {redact_pii(str(e))}", exc_info=False)
         return {
             "status": "ERROR",
             "error": "Internal processing error",
