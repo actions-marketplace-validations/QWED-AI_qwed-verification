@@ -285,8 +285,8 @@ def output_results(findings: list, format: str, scan_type: str):
             for f in findings[:20]:  # Limit output
                 safe_file = os.path.basename(f.get("file", "?"))
                 print(f"   [{f['type']}] {safe_file}:{f.get('line', '?')}")
-                # Use generic message instead of potentially tainted f['message']
-                print(f"   └── Detected potential {f['type']} issue.\n")
+                # Use generic message instead of potentially tainted f['message'] or type
+                print("   └── Detected potential security issue.\n")
             if len(findings) > 20:
                 print(f"   ... and {len(findings) - 20} more issues.")
         else:
