@@ -3,7 +3,7 @@
 All notable changes to the QWED Protocol will be documented in this file.
 
 ## [3.0.1] - 2026-02-04
-### 🦾 v3.0.1: Ironclad Update (Security Patch)
+### 🦾 Ironclad Update (Security Patch)
 
 #### 🛡️ Critical Security Hardening
 - **CodeQL Remediation:** Resolved 50+ alerts including ReDoS, Clear-text Logging, and Exception Exposure.
@@ -11,7 +11,7 @@ All notable changes to the QWED Protocol will be documented in this file.
 - **PII Protection:** Implemented robust `redact_pii` logic in all API endpoints and exception handlers.
 
 #### 📝 Compliance
-- **Snyk Attribution:** Added Snyk branding to README and Documentation footer for Partner Program compliance.
+- **Snyk Attribution:** Added Snyk attribution to README and Documentation footer for Partner Program compliance.
 
 #### 🐛 Bug Fixes
 - **API Stability:** Fixed unhandled exceptions in `verify_logic` and `agent_tool_call` endpoints.
