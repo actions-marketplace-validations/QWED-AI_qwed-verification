@@ -15,7 +15,7 @@ from qwed_new.core.verifier import VerificationEngine
 from qwed_new.core.dsl_logic_verifier import DSLLogicVerifier
 from qwed_new.core.schemas import MathVerificationTask
 from qwed_new.core.observability import metrics_collector
-from qwed_new.core.security import EnhancedSecurityGateway
+from qwed_new.core.security import EnhancedSecurityGateway, redact_pii
 from qwed_new.core.output_sanitizer import OutputSanitizer
 
 logger = logging.getLogger(__name__)
@@ -209,9 +209,14 @@ class ControlPlane:
             return response
                     
         except Exception as e:
+            # Log detailed error server-side, with PII redaction
+            logger.error(
+                f"Logic pipeline failure for org {organization_id}: {redact_pii(str(e))}",
+                exc_info=False
+            )
             return {
                 "status": "ERROR",
-                "error": f"Pipeline failure: {str(e)}",
+                "error": "Internal pipeline error",
                 "latency_ms": (time.time() - start_time) * 1000
             }
 
