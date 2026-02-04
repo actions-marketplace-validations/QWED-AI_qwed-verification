@@ -15,7 +15,7 @@ from qwed_new.core.verifier import VerificationEngine
 from qwed_new.core.dsl_logic_verifier import DSLLogicVerifier
 from qwed_new.core.schemas import MathVerificationTask
 from qwed_new.core.observability import metrics_collector
-from qwed_new.core.security import EnhancedSecurityGateway
+from qwed_new.core.security import EnhancedSecurityGateway, redact_pii
 from qwed_new.core.output_sanitizer import OutputSanitizer
 
 logger = logging.getLogger(__name__)
