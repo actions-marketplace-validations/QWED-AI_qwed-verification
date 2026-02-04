@@ -6,7 +6,7 @@ import json
 SOURCE_DIR = r"C:\Users\rahul\.gemini\antigravity\playground\vector-meteoroid\qwed_new\benchmarks\deep_suite"
 DEST_DIR = r"C:\Users\rahul\.gemini\antigravity\playground\vector-meteoroid\qwed_new\opensource_release"
 SENSITIVE_STRINGS = {
-    os.getenv("SENSITIVE_API_KEY", "qwed_live_REDACTED"): "YOUR_API_KEY_HERE",
+    os.environ["SENSITIVE_API_KEY"]: "YOUR_API_KEY_HERE",
     "http://13.71.22.94:8000": "http://localhost:8000",
     "13.71.22.94": "SERVER_IP",
     r"C:\Users\rahul\.gemini\antigravity\playground\vector-meteoroid\qwed_new": "/path/to/project",
