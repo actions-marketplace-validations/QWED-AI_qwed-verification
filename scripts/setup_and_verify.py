@@ -1,10 +1,11 @@
 import requests
 import time
 import sys
+import os
 
 BASE_URL = "http://localhost:8000"
 EMAIL = "rahul@qwedai.com"
-PASSWORD = "secure_password_123"
+PASSWORD = os.environ["QWED_ADMIN_PASSWORD"]
 ORG_NAME = "QWED Internal"
 
 def wait_for_server():
