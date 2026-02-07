@@ -7,7 +7,6 @@ Demonstrates:
 
 import os
 from qwed_sdk import QWEDClient
-import os
 
 def main():
     client = QWEDClient(api_key=os.environ.get("QWED_API_KEY", "qwed_test_key"))

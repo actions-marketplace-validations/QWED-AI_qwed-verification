@@ -30,10 +30,13 @@ def set_output(name: str, value: str):
     if output_file:
         # Validate path to prevent path traversal (defense-in-depth)
         output_path = os.path.realpath(output_file)
-        if not output_path.startswith(("/home/runner", "/github", os.getcwd())):
+        cwd = os.path.realpath(os.getcwd())
+        # Proper containment check - must be within allowed directories
+        allowed_prefixes = ["/home/runner/", "/github/", cwd + os.sep]
+        if not any(output_path.startswith(prefix) or output_path == prefix.rstrip(os.sep) for prefix in allowed_prefixes):
             print(f"⚠️  Suspicious GITHUB_OUTPUT path: {output_file}")
             return
-        with open(output_path, "a") as f:  # noqa: PTH123 - GitHub Actions standard pattern
+        with open(output_path, "a") as f:
             f.write(f"{name}={value}\n")
     print(f"::set-output name={name}::{value}")  # Legacy fallback
 

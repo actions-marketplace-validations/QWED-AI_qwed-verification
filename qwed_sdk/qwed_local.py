@@ -232,7 +232,7 @@ class QWEDLocal:
             
             self.llm_client = OpenAI(
                 base_url=self.base_url,
-                api_key=self.api_key or os.environ.get("OPENAI_API_KEY", "ollama"),  # Ollama doesn't need real key
+                api_key=self.api_key or "not-needed",  # Local LLMs (Ollama/LM Studio) don't need real keys
                 **kwargs
             )
             self.client_type = "openai"
