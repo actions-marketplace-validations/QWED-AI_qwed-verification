@@ -31,12 +31,17 @@ def set_output(name: str, value: str):
         # Validate path to prevent path traversal (defense-in-depth)
         output_path = os.path.realpath(output_file)
         cwd = os.path.realpath(os.getcwd())
-        # Proper containment check - must be within allowed directories
-        allowed_prefixes = ["/home/runner/", "/github/", cwd + os.sep]
-        if not any(output_path.startswith(prefix) or output_path == prefix.rstrip(os.sep) for prefix in allowed_prefixes):
-            print(f"⚠️  Suspicious GITHUB_OUTPUT path: {output_file}")
+        # Canonical containment check using commonpath
+        allowed_roots = ["/home/runner", "/github", cwd]
+        try:
+            if not any(os.path.commonpath([root, output_path]) == root for root in allowed_roots):
+                print(f"⚠️  Suspicious GITHUB_OUTPUT path: {output_file}")
+                return
+        except ValueError:
+            # commonpath raises ValueError if paths are on different drives (Windows)
+            print(f"⚠️  Invalid GITHUB_OUTPUT path: {output_file}")
             return
-        # deepcode ignore PT: Path validated with containment check above
+        # deepcode ignore PT: Path validated with commonpath containment check
         with open(output_path, "a") as f:
             f.write(f"{name}={value}\n")
     print(f"::set-output name={name}::{value}")  # Legacy fallback
