@@ -565,6 +565,57 @@ response = client.verify_math(
 
 ---
 
+## 🧑‍💻 Development & Testing
+
+### Building from Source
+
+```bash
+# Clone and install in development mode
+git clone https://github.com/QWED-AI/qwed-verification.git
+cd qwed-verification
+pip install -e ".[dev]"
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+pytest tests/ -v
+
+# Run with coverage
+pytest tests/ -v --cov=src/qwed_new --cov-report=html
+
+# Run specific test file
+pytest tests/test_math_verifier.py -v
+```
+
+### Static Analysis & Linting
+
+QWED uses multiple tools for code quality:
+
+```bash
+# Type checking
+mypy src/
+
+# Linting
+ruff check src/
+
+# Security scanning (Snyk integration in CI)
+# See .github/workflows/ci.yml
+```
+
+### Continuous Integration
+
+All PRs run through GitHub Actions:
+- ✅ Unit tests (Python 3.10, 3.11, 3.12)
+- ✅ Type checking (mypy)
+- ✅ Security scanning (Snyk, CodeRabbit)
+- ✅ Coverage reporting (Codecov)
+
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for details.
+
+---
+
 ## ❓ Frequently Asked Questions
 
 ### Q: How does QWED differ from RAG (Retrieval Augmented Generation)?
