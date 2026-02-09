@@ -50,7 +50,7 @@ Each domain has a dedicated engine:
 - **SQL**: Uses `SQLGlot` and `DuckDB` for schema-aware query verification.
 
 ### 3. Safety Guards
-- **PII Masking**: Detects and obfuscates minimal PII using `Presidio` before sending data to LLMs.
+- **PII Masking**: [Planned] Detects and obfuscates minimal PII using `Presidio` before sending data to LLMs.
 - **Injection Protection**: Static analysis prevents prompt injection and code injection attacks.
 
 ## Data Flow

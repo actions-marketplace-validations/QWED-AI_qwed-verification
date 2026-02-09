@@ -24,8 +24,8 @@ This project follows a **Benevolent Dictator for Life (BDFL)** governance model.
 ### Contributors
 - **Responsibilities:**
     - Submit PRs and issues
-    - adhere to `CONTRIBUTING.md`
-    - adhere to `CODE_OF_CONDUCT.md`
+    - Adhere to `CONTRIBUTING.md`
+    - Adhere to `CODE_OF_CONDUCT.md`
 
 ## Decision Making Process
 Decisions are made through consensus when possible. GitHub Issues and Discussions are the primary venues for proposals. If consensus cannot be reached, the BDFL makes the final decision.

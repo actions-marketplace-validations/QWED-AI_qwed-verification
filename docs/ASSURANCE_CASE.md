@@ -26,7 +26,7 @@ This document provides the assurance case for QWED's security, justifying why it
 
 ### Least Privilege
 - Verification engines run with minimal permissions.
-- Code execution is sandboxed or restricts imports (e.g., `ast` analysis allows only safe subsets of Python).
+- Code execution restricts imports through AST analysis that allows only safe subsets of Python (no `os`, `subprocess`, or network operations).
 
 ### Complete Mediation
 - All LLM outputs *must* pass through the Verification Layer before reaching the user.
