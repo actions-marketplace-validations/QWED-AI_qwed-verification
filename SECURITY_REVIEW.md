@@ -14,7 +14,7 @@ The security review was conducted using a combination of:
 1.  **Automated SAST:** Snyk Code scanning (configured in `.github/workflows/snyk.yml`) and manual CodeQL analysis.
 2.  **Dependency Analysis:** Automated vulnerability scanning of `pyproject.toml` dependencies via Snyk.
 3.  **Manual Architecture Review:** Threat modeling workshop based on `docs/ASSURANCE_CASE.md`.
-4.  **Adversarial Testing:** Vibe coding tests using `opensource_release/adversarial_vibe_coding_tests.py`.
+4.  **Adversarial Testing:** Vibe coding tests using `opensource_release/adversarial_vibe_coding_tests.py` to simulate attacks.
 
 ## Scope & Boundaries
 
@@ -32,7 +32,7 @@ The security review was conducted using a combination of:
 
 | Finding ID | Severity | Description | Mitigation | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **SEC-001** | High | Code Injection in Logic Engine | Implemented `LogicVerifier` with AST whitelisting to prevent `eval()` of arbitrary code. See `src/qwed_new/core/logic_verifier.py`. | ✅ Fixed |
+| **SEC-001** | High | Code Injection in Logic Engine | Implemented `LogicVerifier` using whitelisted Z3 functions (`SafeEvaluator`) and sanitized constraint evaluation (`ConstraintSanitizer`) to prevent `eval()` of arbitrary code. See `src/qwed_new/core/logic_verifier.py`. | ✅ Fixed |
 | **SEC-002** | Medium | XML Entity Expansion (Billion Laughs) | Disabled external entity processing in XML parsers used for certain structured outputs. | ✅ Fixed |
 | **SEC-003** | Low | Missing Security Headers in Docs | Added CSP and HSTS headers to documentation site configuration. | ✅ Fixed |
 | **SEC-004** | Critical | Exposed API Keys in Logs | Implemented PII masking and redaction for `Authorization` headers. See `qwed_sdk/pii_detector.py`. | ✅ Fixed |
