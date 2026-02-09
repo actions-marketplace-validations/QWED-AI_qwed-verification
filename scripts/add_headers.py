@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 COPYRIGHT_HEADER = """# Copyright (c) 2024-2026 QWED Team

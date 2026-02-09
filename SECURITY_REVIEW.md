@@ -11,16 +11,16 @@ This document summarizes the security review performed for the OpenSSF Best Prac
 ## Methodology
 
 The security review was conducted using a combination of:
-1.  **Automated SAST:** Snyk Code and CodeQL scanning integration.
-2.  **Dependency Analysis:** Automated vulnerability scanning of `pyproject.toml` dependencies.
+1.  **Automated SAST:** Snyk Code scanning (configured in `.github/workflows/snyk.yml`) and manual CodeQL analysis.
+2.  **Dependency Analysis:** Automated vulnerability scanning of `pyproject.toml` dependencies via Snyk.
 3.  **Manual Architecture Review:** Threat modeling workshop based on `docs/ASSURANCE_CASE.md`.
-4.  **Penetration Testing:** Adversarial testing using `benchmarks/deep_suite/run_all_adversarial_tests.py`.
+4.  **Adversarial Testing:** Vibe coding tests using `opensource_release/adversarial_vibe_coding_tests.py`.
 
 ## Scope & Boundaries
 
 -   **In Scope:**
     -   Core Verification Engines (`src/qwed_new/core/`)
-    -   API Server (`src/qwed_new/server.py`)
+    -   CLI Interface (`qwed_sdk/cli.py`)
     -   Python SDK (`qwed_sdk/`)
     -   Authentication Middleware
 
@@ -32,10 +32,10 @@ The security review was conducted using a combination of:
 
 | Finding ID | Severity | Description | Mitigation | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **SEC-001** | High | Code Injection in Logic Engine | Implemented `LogicVerifier` with AST whitelisting to prevent `eval()` of arbitrary code. | ✅ Fixed |
+| **SEC-001** | High | Code Injection in Logic Engine | Implemented `LogicVerifier` with AST whitelisting to prevent `eval()` of arbitrary code. See `src/qwed_new/core/logic_verifier.py`. | ✅ Fixed |
 | **SEC-002** | Medium | XML Entity Expansion (Billion Laughs) | Disabled external entity processing in XML parsers used for certain structured outputs. | ✅ Fixed |
 | **SEC-003** | Low | Missing Security Headers in Docs | Added CSP and HSTS headers to documentation site configuration. | ✅ Fixed |
-| **SEC-004** | Critical | Exposed API Keys in Logs | Implemented PII masking and redaction for `Authorization` headers in specific debug logs. | ✅ Fixed |
+| **SEC-004** | Critical | Exposed API Keys in Logs | Implemented PII masking and redaction for `Authorization` headers. See `qwed_sdk/pii_detector.py`. | ✅ Fixed |
 
 ## Hardening Measures
 
