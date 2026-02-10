@@ -12,10 +12,9 @@ jobs:
       - image: cimg/python:<< parameters.python-version >>
     steps:
       - checkout
-      - python/install-packages:
-          pkg-manager: pip
-          # Install dependencies with extra groups for dev, server, and symbolic support
-          args: .[dev,server,symbolic]
+      - run:
+          name: Install Dependencies
+          command: pip install .[dev,server,symbolic]
       - run:
           name: Run Tests
           command: |
