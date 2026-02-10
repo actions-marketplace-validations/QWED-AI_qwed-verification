@@ -17,8 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1000 appuser
 
 # Fix permissions for GitHub Actions workspace
-# CodeRabbit Suggested Fix: Ensure appuser can write to workspace
 RUN mkdir -p /github/workspace && chown -R appuser:appuser /github
+
+# Install gosu for easy step-down from root
+RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file first to leverage cache
 COPY requirements.txt /app/requirements.txt
@@ -34,12 +36,15 @@ COPY --chown=appuser:appuser qwed_sdk /app/qwed_sdk/
 COPY --chown=appuser:appuser action_entrypoint.py /action_entrypoint.py
 RUN chmod +x /action_entrypoint.py
 
+# Copy and setup runtime entrypoint
+COPY --chown=appuser:appuser entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Set Python path to use local SDK
 ENV PYTHONPATH=/app
 
 WORKDIR /github/workspace
 
-# Switch to non-root user
-USER appuser
-
-ENTRYPOINT ["python", "/action_entrypoint.py"]
+# NOTE: We do NOT switch USER here. We start as root to fix permissions on mounted volumes
+# in entrypoint.sh, then drop privileges to appuser using gosu.
+ENTRYPOINT ["/entrypoint.sh"]
