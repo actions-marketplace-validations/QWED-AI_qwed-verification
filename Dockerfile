@@ -20,6 +20,9 @@ RUN useradd -m -u 1000 appuser
 # CodeRabbit Suggested Fix: Ensure appuser can write to workspace
 RUN mkdir -p /github/workspace && chown -R appuser:appuser /github
 
+# Copy requirements file first to leverage cache
+COPY requirements.txt /app/requirements.txt
+
 # Install dependencies with hash verification
 # Vulnerability Fix: Pin versions with hashes to prevent supply chain attacks
 RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
