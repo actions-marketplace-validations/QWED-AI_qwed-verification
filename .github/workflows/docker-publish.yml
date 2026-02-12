@@ -60,6 +60,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -75,10 +76,10 @@ jobs:
         if: github.event_name != 'pull_request'
         with:
           command: cves
-          image: ${{ env.IMAGE_NAME }}:latest
+          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           sarif-file: docker-scout-results.sarif
           summary: true
         continue-on-error: true
 
       - name: Image digest
-        run: echo "Image pushed with digest ${{ steps.meta.outputs.digest }}"
+        run: echo "Image pushed with digest ${{ steps.build.outputs.digest }}"
