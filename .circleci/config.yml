@@ -12,23 +12,73 @@ jobs:
       - image: cimg/python:<< parameters.python-version >>
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - pip-{{ checksum "pyproject.toml" }}-<< parameters.python-version >>
+            - pip-
       - run:
           name: Install Dependencies
           command: pip install .[dev,server,symbolic]
+      - save_cache:
+          key: pip-{{ checksum "pyproject.toml" }}-<< parameters.python-version >>
+          paths:
+            - ~/.local/lib
       - run:
           name: Run Tests
           command: |
-            # Run pytest with coverage as configured in pyproject.toml
-            pytest
+            mkdir -p test-results
+            pytest --junitxml=test-results/results.xml
       - store_test_results:
           path: test-results
       - store_artifacts:
           path: htmlcov
 
+  security-scan:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install Dependencies
+          command: pip install .[dev,server,symbolic]
+      - run:
+          name: Run pip-audit
+          command: |
+            pip install pip-audit
+            pip-audit --strict --desc 2>&1 | tee audit-results.txt || true
+      - store_artifacts:
+          path: audit-results.txt
+
+  docker-build:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: docker24
+          docker_layer_caching: true
+      - run:
+          name: Build Docker Image
+          command: |
+            docker build -t qwedai/qwed-verification:ci-${CIRCLE_SHA1:0:7} .
+      - run:
+          name: Verify Image
+          command: |
+            docker run --rm qwedai/qwed-verification:ci-${CIRCLE_SHA1:0:7} python -c "import qwed_sdk; print('QWED SDK loaded successfully')"
+
 workflows:
-  main:
+  ci:
     jobs:
       - build-and-test:
           matrix:
             parameters:
               python-version: ["3.10", "3.11", "3.12"]
+      - security-scan:
+          requires:
+            - build-and-test
+      - docker-build:
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only: main

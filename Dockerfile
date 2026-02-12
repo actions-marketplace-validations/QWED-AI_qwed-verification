@@ -28,7 +28,7 @@ COPY requirements.txt /app/requirements.txt
 # Vulnerability Fix: Upgrade pip and wheel to patch base image CVEs
 # CVE-2026-24049 (Critical): wheel<=0.46.1 -> 0.46.2
 # CVE-2025-8869 (Medium):   pip==24.0 -> latest
-RUN pip install --no-cache-dir --upgrade "pip>=25.0" "wheel>=0.46.2"
+RUN pip install --no-cache-dir --force-reinstall "pip>=25.0" "wheel>=0.46.2"
 
 # Install dependencies with hash verification
 # Vulnerability Fix: Pin versions with hashes to prevent supply chain attacks
