@@ -12,23 +12,83 @@ jobs:
       - image: cimg/python:<< parameters.python-version >>
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - pip-v1-{{ checksum "pyproject.toml" }}-<< parameters.python-version >>
+            - pip-v1-
       - run:
           name: Install Dependencies
           command: pip install .[dev,server,symbolic]
+      - save_cache:
+          key: pip-v1-{{ checksum "pyproject.toml" }}-<< parameters.python-version >>
+          paths:
+            - ~/.local/lib/python<< parameters.python-version >>/site-packages
+            - ~/.cache/pip
       - run:
           name: Run Tests
           command: |
-            # Run pytest with coverage as configured in pyproject.toml
-            pytest
+            mkdir -p test-results
+            pytest --junitxml=test-results/results.xml
       - store_test_results:
           path: test-results
       - store_artifacts:
           path: htmlcov
 
+  security-scan:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Create isolated audit environment
+          command: |
+            python -m venv /tmp/audit-env
+            /tmp/audit-env/bin/pip install --upgrade pip
+            /tmp/audit-env/bin/pip install .[dev,server,symbolic]
+      - run:
+          name: Run pip-audit (project deps only)
+          command: |
+            set -o pipefail
+            /tmp/audit-env/bin/pip install pip-audit
+            /tmp/audit-env/bin/pip-audit --strict --skip-editable --desc \
+              `# CVE-2025-8869: pip tar extraction vuln — build-only tool, not in runtime image` \
+              --ignore-vuln CVE-2025-8869 \
+              `# CVE-2026-1703: pip wheel path traversal (CVSS 2.0 Low) — build-only, pinned hashes used` \
+              --ignore-vuln CVE-2026-1703 \
+              2>&1 | tee audit-results.txt
+      - store_artifacts:
+          path: audit-results.txt
+
+  docker-build:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: docker24
+          docker_layer_caching: true
+      - run:
+          name: Build Docker Image
+          command: |
+            docker build -t qwedai/qwed-verification:ci-${CIRCLE_SHA1:0:7} .
+      - run:
+          name: Verify Image
+          command: |
+            docker run --rm --entrypoint python qwedai/qwed-verification:ci-${CIRCLE_SHA1:0:7} -c "import qwed_sdk; print('QWED SDK loaded successfully')"
+
 workflows:
-  main:
+  ci:
     jobs:
       - build-and-test:
           matrix:
             parameters:
               python-version: ["3.10", "3.11", "3.12"]
+      - security-scan:
+          requires:
+            - build-and-test
+      - docker-build:
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only: main
