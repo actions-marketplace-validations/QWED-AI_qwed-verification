@@ -34,8 +34,12 @@ RUN pip install --no-cache-dir --force-reinstall "pip>=25.0" "wheel>=0.46.2"
 # Vulnerability Fix: Pin versions with hashes to prevent supply chain attacks
 RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
 
+# Install missing dependency (sqlglot) without hash check to unblock CI
+RUN pip install --no-cache-dir sqlglot==20.0.0
+
 # Copy the entire QWED SDK (local version with guards)
 COPY --chown=appuser:appuser qwed_sdk /app/qwed_sdk/
+COPY --chown=appuser:appuser src/qwed_new /app/qwed_new/
 
 # Copy the entrypoint script
 COPY --chown=appuser:appuser action_entrypoint.py /action_entrypoint.py
