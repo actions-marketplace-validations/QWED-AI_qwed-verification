@@ -36,6 +36,7 @@ RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
 
 # Copy the entire QWED SDK (local version with guards)
 COPY --chown=appuser:appuser qwed_sdk /app/qwed_sdk/
+COPY --chown=appuser:appuser src/qwed_new /app/qwed_new/
 
 # Copy the entrypoint script
 COPY --chown=appuser:appuser action_entrypoint.py /action_entrypoint.py
