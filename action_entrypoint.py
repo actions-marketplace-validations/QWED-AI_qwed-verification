@@ -360,8 +360,12 @@ def action_verify_process():
         else:
             print("\n✅ Reasoning Process Verified (IRAC Compliant)")
             
+            
     set_output("verified", str(authorized).lower())
     set_output("badge_url", generate_badge_url(authorized))
+    set_output("irac_score", f"{irac_result['score']:.4f}")
+    set_output("process_rate", f"{milestone_result['process_rate']:.4f}")
+    set_output("findings", json.dumps(findings))
     
     if not authorized and get_env("FAIL_ON_FINDINGS", "true") == "true":
         sys.exit(1)
@@ -484,7 +488,7 @@ def main():
         action_verify_process()
     else:
         print(f"❌ Unknown action: {action}")
-        print("   Supported: verify, scan-secrets, scan-code, verify-shell")
+        print("   Supported: verify, scan-secrets, scan-code, verify-shell, verify-process")
         sys.exit(1)
 
 

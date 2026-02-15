@@ -1,6 +1,6 @@
 
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 class ProcessVerifier:
     """
@@ -11,10 +11,10 @@ class ProcessVerifier:
     def __init__(self):
         # IRAC Patterns based on MSLR [Source 154, 163]
         self.irac_patterns = {
-            "issue": r"(?i)(issue|question|problem presented)",
-            "rule": r"(?i)(rule|law|statute|regulation|article \d+)",
-            "application": r"(?i)(application|analysis|applying|in this case)",
-            "conclusion": r"(?i)(conclusion|holding|verdict|therefore)"
+            "issue": re.compile(r"\b(issue|question|problem presented)\b", re.I),
+            "rule": re.compile(r"\b(rule|law|statute|regulation|article \d+)\b", re.I),
+            "application": re.compile(r"\b(application|analysis|applying|in this case)\b", re.I),
+            "conclusion": re.compile(r"\b(conclusion|holding|verdict|therefore)\b", re.I)
         }
 
     def verify_irac_structure(self, reasoning_trace: str) -> Dict[str, Any]:
@@ -32,7 +32,7 @@ class ProcessVerifier:
         matches = {}
         
         for step, pattern in self.irac_patterns.items():
-            match = re.search(pattern, reasoning_trace)
+            match = pattern.search(reasoning_trace)
             if match:
                 matches[step] = True
             else:
@@ -68,7 +68,11 @@ class ProcessVerifier:
                 "missed_milestones": []
             }
             
-        found_milestones = [kw for kw in key_middle if kw.lower() in text.lower()]
+        text_lc = text.lower()
+        found_milestones = [
+            kw for kw in key_middle 
+            if re.search(rf"\b{re.escape(kw.lower())}\b", text_lc)
+        ]
         process_rate = len(found_milestones) / len(key_middle)
         
         return {

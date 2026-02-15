@@ -1,6 +1,6 @@
 
 # Root of qwed-verification
-language: python
+language: en-US
 reviews:
   auto_review:
     enabled: true
