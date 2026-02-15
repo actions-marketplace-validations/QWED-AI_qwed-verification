@@ -39,13 +39,13 @@ Determinism in AI verification is not binary. We categorize it into layers:
 Located in `src/qwed_new/guards/process_guard.py`.
 
 #### A. IRAC Structure Enforcement (Legal Standard)
-Inspired by evaluation methodologies in the **MSLR Benchmark** [Source 154], we enforce the "Reasoned Elaboration" standard.
+Inspired by evaluation methodologies in the **MSLR Benchmark**, we enforce the "Reasoned Elaboration" standard.
 We use **structural detection, not semantic scoring**.
 
 > **Note:** Our Regex detection ensures *completeness*, not legal validity. It guarantees the model *attempted* an analysis, not that the analysis is legally sound (a higher-order logic problem).
 
 #### B. Milestone Verification (Process Rate)
-Inspired by **LegalAgentBench** [Source 716], we verify **Process Rate**: the percentage of mandatory intermediate steps successfully executed.
+Inspired by **LegalAgentBench**, we verify **Process Rate**: the percentage of mandatory intermediate steps successfully executed.
 
 ### 3.2 System Flow
 
