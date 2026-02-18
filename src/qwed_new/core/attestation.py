@@ -293,7 +293,8 @@ class AttestationService:
             issuer = unverified.get("iss")
             
             if issuer not in trusted_issuers:
-                return False, None, f"Untrusted issuer: {issuer}"
+                safe_issuer = str(issuer)[:128].replace('\n', '').replace('\r', '')
+                return False, None, f"Untrusted issuer: {safe_issuer}"
             
             # For self-issued attestations, use our key
             if issuer == self.issuer_did:

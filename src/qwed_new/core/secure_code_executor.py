@@ -119,7 +119,7 @@ class SecureCodeExecutor:
                         return False, "No result file generated", None
                         
                 except docker.errors.ContainerError as e:
-                    logger.error("Container error: %s", _sanitize_log_msg(e))
+                    logger.exception("Container error: %s", _sanitize_log_msg(e))
                     return False, f"Container execution failed: {str(e)}", None
                     
                 except docker.errors.ImageNotFound:
@@ -127,7 +127,7 @@ class SecureCodeExecutor:
                     return False, f"Docker image '{self.image}' not found. Please pull it first.", None
                     
                 except Exception as e:
-                    logger.error("Unexpected execution error: %s", _sanitize_log_msg(e))
+                    logger.exception("Unexpected execution error: %s", _sanitize_log_msg(e))
                     return False, f"Execution error: {str(e)}", None
                     
         except Exception as e:

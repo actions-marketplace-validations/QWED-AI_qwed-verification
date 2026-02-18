@@ -1,6 +1,5 @@
 
 import unittest
-import ast
 import sys
 import os
 
@@ -57,6 +56,23 @@ class TestSecurityFixes(unittest.TestCase):
         self.assertFalse(_is_safe_sympy_expr("sympy.os.system('id')"))
         
         print("SymPy AST validator verified.")
+
+    def test_safe_z3_validator(self):
+        """Test the AST validator for Z3 expressions."""
+        # Safe expressions
+        self.assertTrue(_is_safe_z3_expr("And(Bool('p'), Bool('q'))"))
+        self.assertTrue(_is_safe_z3_expr("Not(Bool('p'))"))
+        self.assertTrue(_is_safe_z3_expr("Implies(Bool('a'), Bool('b'))"))
+        self.assertTrue(_is_safe_z3_expr("True"))
+        self.assertTrue(_is_safe_z3_expr("False"))
+
+        # Unsafe expressions
+        self.assertFalse(_is_safe_z3_expr("__import__('os')"))
+        self.assertFalse(_is_safe_z3_expr("eval('1+1')"))
+        self.assertFalse(_is_safe_z3_expr("os.system('id')"))
+        self.assertFalse(_is_safe_z3_expr("Int('x') + Int('y')")) # Int not in allowed_names
+        
+        print("Z3 AST validator verified.")
 
     def test_log_sanitization(self):
         """Test that newlines are stripped from log messages."""
