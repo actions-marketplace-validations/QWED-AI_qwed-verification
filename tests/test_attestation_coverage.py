@@ -2,7 +2,7 @@
 import unittest
 import base64
 from unittest.mock import patch, MagicMock
-from src.qwed_new.core.attestation import AttestationService, VerificationResult, create_verification_attestation, HAS_CRYPTO
+from src.qwed_new.core.attestation import AttestationService, create_verification_attestation, HAS_CRYPTO
 
 class TestAttestationCoverage(unittest.TestCase):
     """Targeted tests to improve coverage of attestation.py"""
