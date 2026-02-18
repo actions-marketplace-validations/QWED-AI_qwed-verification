@@ -8,6 +8,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from qwed_sdk.qwed_local import _is_safe_sympy_expr, _is_safe_z3_expr
 
+from qwed_sdk.qwed_local import _is_safe_sympy_expr, _is_safe_z3_expr, QWEDLocal, VerificationResult
+from unittest.mock import MagicMock, patch
+
 def _has_attestation_deps():
     try:
         from src.qwed_new.core.attestation import AttestationService, HAS_CRYPTO
@@ -122,5 +125,82 @@ class TestSecurityFixes(unittest.TestCase):
         self.assertNotIn('\r', sanitized)
         self.assertEqual(sanitized, "Error occurred with malicious newline injection")
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_secure_executor_logging_fix(self):
+        """Test that logging exception in SecureCodeExecutor does not duplicate message."""
+        from src.qwed_new.core.secure_code_executor import SecureCodeExecutor
+        import tempfile
+        
+        # Mock logger
+        with patch('src.qwed_new.core.secure_code_executor.logger') as mock_logger:
+            executor = SecureCodeExecutor()
+            # Force docker_available to True so we don't return early
+            executor.docker_available = True
+            
+            # Mock tempfile.TemporaryDirectory to raise OSError
+            with patch('tempfile.TemporaryDirectory', side_effect=OSError("Permission denied")):
+                # execute() -> tries to create temp dir -> raises OSError
+                success, error, _ = executor.execute("print('hi')", {})
+                
+                self.assertFalse(success)
+                self.assertIn("Setup error", error)
+                # Verify logger.exception was called with static message
+                mock_logger.exception.assert_called_with("Failed to create temporary directory")
+
+
+
+class TestQWEDLocalExecution(unittest.TestCase):
+    """Test the actual execution flow of QWEDLocal, including eval() safety."""
+    
+    def setUp(self):
+        self.client = QWEDLocal(base_url="http://mock-url", model="mock-model")
+        # Mock the LLM call to return safe expressions
+        self.client._call_llm = MagicMock()
+
+    def test_verify_math_safe_eval(self):
+        """Test that verify_math correctly evaluates safe expressions."""
+        # 1. Mock LLM to return "4" then "2 + 2"
+        # Note: We cannot use sympy.simplify("2+2") because string args are now banned!
+        self.client._call_llm.side_effect = ["4", "2 + 2"]
+        
+        # 2. Call verify_math
+        result = self.client.verify_math("What is 2+2?")
+        
+        # 3. Assertions
+        self.assertTrue(result.verified)
+        self.assertEqual(result.value, "4")
+        self.assertIn("2 + 2", result.evidence["sympy_expr"])
+
+    def test_verify_math_unsafe_eval(self):
+        """Test that verify_math blocks unsafe expressions before eval."""
+        # 1. Mock LLM to return "import os"
+        self.client._call_llm.side_effect = ["pwned", "import os"]
+        
+        # 2. Call verify_math
+        # It should catch ValueError from _is_safe_sympy_expr and return verified=False
+        result = self.client.verify_math("Hack me")
+        
+        # 3. Assertions
+        self.assertFalse(result.verified)
+        self.assertIn("Unsafe SymPy expression detected", result.error)
+
+    def test_verify_logic_safe_eval(self):
+        """Test that verify_logic correctly evaluates safe Z3 expressions."""
+        # Check if Z3 is installed
+        if not self.client.has_z3:
+            self.skipTest("Z3 not installed")
+            
+        # 1. Mock LLM to return "TRUE" then "And(True, True)"
+        # Note: We use capitalized True/False because strict Z3 validator might require specific form,
+        # but here we rely on what _is_safe_z3_expr allows.
+        # Actually, _is_safe_z3_expr allows And, Or, Not.
+        # Let's use a valid Z3 expression that works with the validator.
+        self.client._call_llm.side_effect = ["TRUE", "And(True, True)"] # safe Z3 expr
+        
+        # 2. Call verify_logic
+        result = self.client.verify_logic("Is true true?")
+        
+        # 3. Assertions
+        self.assertTrue(result.verified)
+        self.assertEqual(result.value, "TRUE")
+
+
