@@ -105,7 +105,8 @@ class SecureCodeExecutor:
                         
                         if 'error' in result_data:
                             error_msg = str(result_data['error']).replace('\n', ' ').replace('\r', ' ')
-                            logger.warning(f"Code execution error: {error_msg}")
+                            # Use lazy formatting for logging (safer and standard practice)
+                            logger.warning("Code execution error: %s", error_msg)
                             return False, result_data['error'], None
                         
                         logger.info(f"Code execution successful: {execution_id}")

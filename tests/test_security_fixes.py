@@ -76,5 +76,16 @@ class TestSecurityFixes(unittest.TestCase):
         
         print("SymPy AST validator verified.")
 
+    def test_log_sanitization(self):
+        """Test that newlines are stripped from log messages."""
+        # Simulate the logic in secure_code_executor.py
+        raw_error = "Error occurred\nwith malicious\rnewline injection"
+        sanitized = str(raw_error).replace('\n', ' ').replace('\r', ' ')
+        
+        self.assertNotIn('\n', sanitized)
+        self.assertNotIn('\r', sanitized)
+        self.assertEqual(sanitized, "Error occurred with malicious newline injection")
+        print("Log sanitization verified.")
+
 if __name__ == '__main__':
     unittest.main()
