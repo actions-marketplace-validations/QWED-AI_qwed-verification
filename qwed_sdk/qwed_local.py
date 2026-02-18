@@ -423,9 +423,43 @@ SymPy code:"""
             local_vars = {"sympy": sympy, "x": sympy.Symbol('x')}
             
             try:
-                # Use sympify for safer parsing than eval
-                # It handles string-to-expression conversion robustly
-                verified_result = sympy.sympify(llm_expr.strip(), locals=local_vars)
+                # Use safe eval with AST whitelist instead of sympify
+                # This allows sympy function calls like sympy.diff(x**2, x) which sympify blocks
+                import ast
+                
+                def _is_safe_sympy_expr(expr_str):
+                    """Validate that expression only contains allowed operations."""
+                    try:
+                        tree = ast.parse(expr_str, mode='eval')
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.Call):
+                                # Allow calls like sympy.diff(...)
+                                if isinstance(node.func, ast.Attribute):
+                                    # Ensure the base object is 'sympy'
+                                    if getattr(node.func.value, 'id', '') != 'sympy':
+                                        return False
+                                elif isinstance(node.func, ast.Name):
+                                    # BLOCK all direct function calls unless whitelisted
+                                    # This prevents __import__, eval, etc.
+                                    safe_funcs = {'abs', 'float', 'int', 'complex'}
+                                    if node.func.id not in safe_funcs:
+                                        return False
+                                else:
+                                    return False
+                            elif isinstance(node, (ast.Name, ast.Constant, ast.Str, ast.Num, 
+                                                 ast.Expression, ast.Load, ast.BinOp, ast.UnaryOp,
+                                                 ast.operator, ast.unaryop, ast.Attribute)):
+                                pass
+                            else:
+                                return False
+                        return True
+                    except SyntaxError:
+                        return False
+
+                if not _is_safe_sympy_expr(llm_expr.strip()):
+                    raise ValueError("Unsafe SymPy expression detected")
+
+                verified_result = eval(llm_expr.strip(), {"__builtins__": {}}, local_vars)
                 
                 # If it's an expression (like 2+2), evaluate it
                 if hasattr(verified_result, 'evalf'):
@@ -443,7 +477,7 @@ SymPy code:"""
                         "llm_answer": llm_answer,
                         "verified_value": verified_value,
                         "sympy_expr": llm_expr.strip(),
-                        "method": "sympy_eval"
+                        "method": "sympy_eval_safe"
                     }
                 )
                 

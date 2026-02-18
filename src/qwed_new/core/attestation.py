@@ -282,7 +282,8 @@ class AttestationService:
                 _, payload_segment, _ = jwt_token.split('.', 2)
                 
                 # Add padding if needed
-                padding = '=' * (4 - len(payload_segment) % 4)
+                # Correct padding logic: (-n) % 4 gives us the number of '=' needed
+                padding = '=' * (-len(payload_segment) % 4)
                 import base64
                 payload_data = base64.urlsafe_b64decode(payload_segment + padding)
                 unverified = json.loads(payload_data)
