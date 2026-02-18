@@ -423,7 +423,13 @@ SymPy code:"""
             local_vars = {"sympy": sympy, "x": sympy.Symbol('x')}
             
             try:
-                verified_result = eval(llm_expr.strip(), {"__builtins__": {}}, local_vars)
+                # Use sympify for safer parsing than eval
+                # It handles string-to-expression conversion robustly
+                verified_result = sympy.sympify(llm_expr.strip(), locals=local_vars)
+                
+                # If it's an expression (like 2+2), evaluate it
+                if hasattr(verified_result, 'evalf'):
+                    verified_result = verified_result.evalf()
                 verified_value = str(verified_result)
                 
                 # Compare LLM answer with verified result
@@ -552,6 +558,41 @@ Z3 code:"""
                     "__builtins__": {}
                 }
                 
+                # Validate Z3 expression safety using AST
+                import ast
+                
+                def _is_safe_z3_expr(expr_str):
+                    """Validate that expression only contains allowed Z3 operations."""
+                    allowed_names = {
+                        'Bool', 'And', 'Or', 'Not', 'Implies', 
+                        'Solver', 'sat', 'unsat', 'unknown',
+                        'True', 'False'
+                    }
+                    
+                    try:
+                        tree = ast.parse(expr_str, mode='eval')
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.Call):
+                                if isinstance(node.func, ast.Name):
+                                    if node.func.id not in allowed_names:
+                                        return False
+                                else:
+                                    return False # Reject complex calls
+                            elif isinstance(node, ast.Name):
+                                if node.id not in allowed_names:
+                                    return False
+                            elif isinstance(node, (ast.Constant, ast.Str, ast.Num, ast.Expression, ast.Load)):
+                                pass
+                            else:
+                                # Reject operations, attributes, etc.
+                                return False
+                        return True
+                    except SyntaxError:
+                        return False
+
+                if not _is_safe_z3_expr(llm_expr.strip()):
+                     raise ValueError("Unsafe Z3 expression detected")
+
                 expr = eval(llm_expr.strip(), z3_namespace)
                 
                 # Use Z3 solver

@@ -104,7 +104,8 @@ class SecureCodeExecutor:
                             result_data = json.load(f)
                         
                         if 'error' in result_data:
-                            logger.warning(f"Code execution error: {result_data['error']}")
+                            error_msg = str(result_data['error']).replace('\n', ' ').replace('\r', ' ')
+                            logger.warning(f"Code execution error: {error_msg}")
                             return False, result_data['error'], None
                         
                         logger.info(f"Code execution successful: {execution_id}")
