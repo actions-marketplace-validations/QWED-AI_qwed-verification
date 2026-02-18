@@ -124,7 +124,8 @@ def _is_safe_sympy_expr(expr_str: str) -> bool:
                     return False
             elif isinstance(node, (ast.Name, ast.Constant, ast.Expression, 
                                    ast.Load, ast.BinOp, ast.UnaryOp,
-                                   ast.operator, ast.unaryop, ast.Attribute)):
+                                   ast.Attribute, ast.Call, ast.keyword, ast.Pow,
+                                   ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.USub)):
                 pass
             # Deprecated check for older Python versions if needed, but modern ast uses Constant
             elif hasattr(ast, 'Str') and isinstance(node, ast.Str): pass

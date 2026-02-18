@@ -75,7 +75,7 @@ class SecureCodeExecutor:
             return False, f"Code safety validation failed: {safety_reason}", None
         
         self.execution_count += 1
-        execution_id = f"exec_{self.execution_count}_{int(datetime.now(timezone.utc).timestamp())}"
+        execution_id = f"exec_{self.execution_count}"
         
         logger.info(f"Starting secure code execution: {execution_id}")
         
@@ -119,21 +119,21 @@ class SecureCodeExecutor:
                         return False, "No result file generated", None
                         
                 except docker.errors.ContainerError as e:
-                    logger.exception("Container error: %s", _sanitize_log_msg(e))
-                    return False, f"Container execution failed: {str(e)}", None
+                    logger.exception("Container execution failed")
+                    return False, f"Container execution failed: {e!s}", None
                     
                 except docker.errors.ImageNotFound:
                     safe_image = _sanitize_log_msg(str(self.image))
-                    logger.error("Docker image not found: %s", safe_image)
-                    return False, f"Docker image '{safe_image}' not found. Please pull it first.", None
+                    logger.exception("Docker image not found: %s", safe_image)
+                    return False, f"Docker image '{safe_image!s}' not found. Please pull it first.", None
                     
                 except Exception as e:
-                    logger.exception("Unexpected execution error: %s", _sanitize_log_msg(e))
-                    return False, f"Execution error: {str(e)}", None
+                    logger.exception("Unexpected execution error")
+                    return False, f"Execution error: {e!s}", None
                     
-        except Exception as e:
-            logger.error("Failed to create temporary directory: %s", _sanitize_log_msg(e))
-            return False, f"Setup error: {str(e)}", None
+        except OSError as e:
+            logger.exception("Failed to create temporary directory: %s", _sanitize_log_msg(e))
+            return False, f"Setup error: {e!s}", None
     
     def _run_in_container(self, tmpdir: str, execution_id: str) -> Any:
         """Run code in Docker container with resource limits."""

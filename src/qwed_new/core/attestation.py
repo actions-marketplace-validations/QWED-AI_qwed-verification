@@ -287,6 +287,8 @@ class AttestationService:
                 padding = '=' * (-len(payload_segment) % 4)
                 payload_data = base64.urlsafe_b64decode(payload_segment + padding)
                 unverified = json.loads(payload_data)
+                if not isinstance(unverified, dict):
+                    raise ValueError("Payload is not a JSON object")
             except Exception:
                 return False, None, "Invalid token format"
 
