@@ -1,7 +1,7 @@
 
 import unittest
 from unittest.mock import MagicMock, patch
-from qwed_sdk.qwed_local import QWEDLocal, VerificationResult
+from qwed_sdk.qwed_local import QWEDLocal
 
 class TestQWEDLocalCoverage(unittest.TestCase):
     """Targeted tests to improve coverage of qwed_local.py"""

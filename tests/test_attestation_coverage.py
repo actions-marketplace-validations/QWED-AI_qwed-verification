@@ -1,9 +1,7 @@
 
 import unittest
-import time
-import json
 import base64
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch, MagicMock
 from src.qwed_new.core.attestation import AttestationService, VerificationResult, create_verification_attestation, HAS_CRYPTO
 
 class TestAttestationCoverage(unittest.TestCase):
