@@ -140,7 +140,7 @@ def _is_safe_z3_expr(expr_str: str) -> bool:
     """Validate that expression only contains allowed Z3 operations."""
     allowed_names = {
         'Bool', 'And', 'Or', 'Not', 'Implies', 
-        'True', 'False'
+        # Note: True/False are ast.Constant on Python 3.8+, handled separately
     }
     
     try:
@@ -509,7 +509,9 @@ SymPy code:"""
                 if not _is_safe_sympy_expr(llm_expr.strip()):
                     raise ValueError("Unsafe SymPy expression detected")
 
-                verified_result = eval(llm_expr.strip(), {"__builtins__": {}}, local_vars)
+                # S307: eval() is guarded by _is_safe_sympy_expr AST whitelist
+                # and restricted namespace (no __builtins__, only sympy + Symbol('x'))
+                verified_result = eval(llm_expr.strip(), {"__builtins__": {}}, local_vars)  # noqa: S307
                 
                 # If it's an expression (like 2+2), evaluate it
                 if hasattr(verified_result, 'evalf'):
@@ -645,7 +647,7 @@ Z3 code:"""
                 # Validate using module-level validator
 
                 if not _is_safe_z3_expr(llm_expr.strip()):
-                     raise ValueError("Unsafe Z3 expression detected")
+                    raise ValueError("Unsafe Z3 expression detected")
 
                 expr = eval(llm_expr.strip(), z3_namespace)
                 

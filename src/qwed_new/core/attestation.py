@@ -135,16 +135,19 @@ class AttestationService:
     Implements the QWED-Attestation v1.0 specification.
     """
     
+
     def __init__(
-        self,
+        self, 
         issuer_did: str = "did:qwed:node:local",
-        validity_days: int = 365
+        validity_days: int = 365,
+        key_suffix: Optional[str] = None
     ):
         self.issuer_did = issuer_did
         self.validity_days = validity_days
         
-        # Key management
-        self.key_id = f"{issuer_did}#signing-key-{datetime.now().year}"
+        # Key management - deterministic if key_suffix provided
+        suffix = key_suffix or str(datetime.now().year)
+        self.key_id = f"{issuer_did}#signing-key-{suffix}"
         self._key_pair: Optional[IssuerKeyPair] = None
         
         # Revocation tracking

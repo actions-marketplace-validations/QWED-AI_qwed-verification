@@ -15,7 +15,7 @@ import json
 import os
 import logging
 from typing import Any, Dict, Tuple, Optional
-from datetime import datetime, timezone
+
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class SecureCodeExecutor:
                     return False, f"Execution error: {e!s}", None
                     
         except OSError as e:
-            logger.exception("Failed to create temporary directory: %s", _sanitize_log_msg(e))
+            logger.exception("Failed to create temporary directory: %s", _sanitize_log_msg(str(e)))
             return False, f"Setup error: {e!s}", None
     
     def _run_in_container(self, tmpdir: str, execution_id: str) -> Any:
