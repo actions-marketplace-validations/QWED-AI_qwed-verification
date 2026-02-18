@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 
 # Cryptographic imports - using PyJWT with cryptography backend
@@ -146,7 +146,7 @@ class AttestationService:
         self.validity_days = validity_days
         
         # Key management - deterministic if key_suffix provided
-        suffix = key_suffix or str(datetime.now().year)
+        suffix = key_suffix or "v1"
         self.key_id = f"{issuer_did}#signing-key-{suffix}"
         self._key_pair: Optional[IssuerKeyPair] = None
         
@@ -262,7 +262,7 @@ class AttestationService:
         self,
         jwt_token: str,
         trusted_issuers: Optional[List[str]] = None,
-    ) -> tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
         """
         Verify an attestation JWT.
         

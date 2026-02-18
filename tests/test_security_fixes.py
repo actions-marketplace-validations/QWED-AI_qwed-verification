@@ -68,10 +68,10 @@ class TestSecurityFixes(unittest.TestCase):
         # We catch the "Untrusted issuer" or "External issuer key resolution" error, which is expected.
         is_valid, _claims, error = service.verify_attestation(attestation.jwt_token)
         
-        # Expected failure mode for this test setup (no real keys), but strictly NO CRASHES.
-        # If we fixed the logic, it should handle the token parsing and return tuple.
-        self.assertIsInstance(is_valid, bool)
-        self.assertTrue(error is None or isinstance(error, str))
+        # Self-issued attestation should verify successfully
+        self.assertTrue(is_valid, f"Self-issued attestation should be valid, got error: {error}")
+        self.assertIsNone(error)
+        self.assertIsNotNone(_claims)
 
     def test_safe_sympy_validator(self):
         """Test the AST validator for SymPy expressions using REAL implementation."""
@@ -91,6 +91,10 @@ class TestSecurityFixes(unittest.TestCase):
         # Adversarial cases (bypass attempts)
         self.assertFalse(_is_safe_sympy_expr("sympy.sympify('__import__(\"os\")')"))
         self.assertFalse(_is_safe_sympy_expr("sympy.os.system('id')"))
+        
+        # String args to whitelisted functions — sympify is called internally
+        self.assertFalse(_is_safe_sympy_expr("sympy.simplify('__import__(\"os\")')"))
+        self.assertFalse(_is_safe_sympy_expr("sympy.solve('__import__(\"os\")')"))
 
     def test_safe_z3_validator(self):
         """Test the AST validator for Z3 expressions."""

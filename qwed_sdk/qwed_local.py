@@ -117,11 +117,29 @@ def _is_safe_sympy_expr(expr_str: str) -> bool:
                         return False
                 elif isinstance(node.func, ast.Name):
                     # Explicitly block direct calls unless safe builtins
-                    safe_funcs = {'abs', 'float', 'int', 'complex'}
+                    # float and complex removed to reduce attack surface
+                    safe_funcs = {'abs', 'int'}
                     if node.func.id not in safe_funcs:
                         return False
                 else:
                     return False
+                
+                # Critical Security Check: Reject string arguments in function calls
+                # Whitelisted functions like simplify() call sympify() internally on strings,
+                # which uses eval() and creates an injection vector.
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        return False
+                    # Check for legacy ast.Str (Python < 3.8)
+                    if hasattr(ast, 'Str') and isinstance(arg, ast.Str):
+                        return False
+                        
+                for kw in node.keywords:
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        return False
+                    # Check for legacy ast.Str (Python < 3.8)
+                    if hasattr(ast, 'Str') and isinstance(kw.value, ast.Str):
+                        return False
             elif isinstance(node, (ast.Name, ast.Constant, ast.Expression, 
                                    ast.Load, ast.BinOp, ast.UnaryOp,
                                    ast.Attribute, ast.Call, ast.keyword, ast.Pow,
