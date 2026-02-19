@@ -58,6 +58,7 @@ except ImportError:
         BRAND = SUCCESS = ERROR = INFO = WARNING = VALUE = EVIDENCE = RESET = ""
     HAS_COLOR = False
 
+
 # LLM Clients
 try:
     from openai import OpenAI
@@ -230,6 +231,7 @@ def _show_github_nudge():
         print("💚 If QWED saved you time, give us a ⭐ on GitHub!")
         print("👉 https://github.com/QWED-AI/qwed-verification")
         print("─" * 60 + "\n")
+        _has_shown_nudge = True
 
 
 class QWEDLocal:

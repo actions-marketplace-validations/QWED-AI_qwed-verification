@@ -1,8 +1,8 @@
 
 import unittest
 import base64
-from unittest.mock import patch, MagicMock
-from src.qwed_new.core.attestation import AttestationService, create_verification_attestation, HAS_CRYPTO
+from unittest.mock import patch
+from src.qwed_new.core.attestation import AttestationService, VerificationResult, create_verification_attestation, HAS_CRYPTO
 
 class TestAttestationCoverage(unittest.TestCase):
     """Targeted tests to improve coverage of attestation.py"""
@@ -75,6 +75,63 @@ class TestAttestationCoverage(unittest.TestCase):
         with patch("src.qwed_new.core.attestation.get_attestation_service", side_effect=Exception("Boom")):
             token = create_verification_attestation("s", True, "e", "q")
             self.assertIsNone(token)
+
+    def test_create_attestation_full_options(self):
+        """Test creating attestation with all options (proof, chain)."""
+        result = VerificationResult(status="ok", verified=True, engine="test")
+        attestation = self.service.create_attestation(
+            result, 
+            "query", 
+            proof_data="proof123", 
+            chain_id="chain1", 
+            chain_index=5
+        )
+        claims = attestation.claims.qwed
+        self.assertEqual(claims["proof_hash"], self.service._hash_content("proof123"))
+        self.assertEqual(claims["chain_id"], "chain1")
+        self.assertEqual(claims["chain_index"], 5)
+
+    def test_verify_expired_token(self):
+        """Test verification of expired token."""
+        # Create token with short expiry and travel in time
+        self.service.validity_days = -1 # Expired immediately
+        result = VerificationResult(status="ok", verified=True, engine="test")
+        attestation = self.service.create_attestation(result, "query")
+        
+        is_valid, _, error = self.service.verify_attestation(attestation.jwt_token)
+        self.assertFalse(is_valid)
+        self.assertIn("expired", error)
+        self.service.validity_days = 365 # Reset
+
+    def test_verify_invalid_signature(self):
+        """Test verification with tampered signature."""
+        result = VerificationResult(status="ok", verified=True, engine="test")
+        attestation = self.service.create_attestation(result, "query")
+        
+        # Tamper with the token (modify last char of signature)
+        tampered_token = attestation.jwt_token[:-1] + ("A" if attestation.jwt_token[-1] != "A" else "B")
+        
+        is_valid, _, error = self.service.verify_attestation(tampered_token)
+        # Depending on how the padding/decoding fails, it might be invalid token or format
+        self.assertFalse(is_valid)
+        
+    def test_get_issuer_info(self):
+        """Test get_issuer_info returns correct structure."""
+        info = self.service.get_issuer_info()
+        self.assertEqual(info["did"], "did:test:123")
+        self.assertEqual(info["status"], "active")
+        self.assertIn("public_keys", info)
+        self.assertEqual(len(info["public_keys"]), 1)
+        
+    def test_key_pair_generation(self):
+        """Test internal key pair generation and properties."""
+        kp = self.service._ensure_key_pair()
+        self.assertIsNotNone(kp.private_key_pem)
+        self.assertIsNotNone(kp.public_key_pem)
+        jwk = kp.jwk
+        self.assertEqual(jwk["kty"], "EC")
+        self.assertEqual(jwk["crv"], "P-256")
+        self.assertEqual(jwk["kid"], kp.key_id)
 
 if __name__ == '__main__':
     unittest.main()
