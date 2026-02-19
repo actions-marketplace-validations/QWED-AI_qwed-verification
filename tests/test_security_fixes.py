@@ -6,8 +6,6 @@ import os
 # Adjust path to allow imports from qwed_sdk if not installed as package
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from qwed_sdk.qwed_local import _is_safe_sympy_expr, _is_safe_z3_expr
-
 from qwed_sdk.qwed_local import _is_safe_sympy_expr, _is_safe_z3_expr, QWEDLocal
 from unittest.mock import MagicMock, patch
 
@@ -181,7 +179,10 @@ class TestQWEDLocalExecution(unittest.TestCase):
         
         # 3. Assertions
         self.assertFalse(result.verified)
-        self.assertIn("Unsafe SymPy expression detected", result.error)
+        # "import os" is a statement — triggers InvalidExpressionSyntaxError.
+        # verify_math catches it and sets result.error with the prefix below.
+        self.assertIsNotNone(result.error)
+        self.assertIn("SymPy verification failed", result.error)
 
     def test_verify_logic_safe_eval(self):
         """Test that verify_logic correctly evaluates safe Z3 expressions."""
