@@ -1,0 +1,7 @@
+steps:
+  - label: "🧪 Run Tests"
+    command:
+      - pip install --upgrade pip
+      - pip install -e ".[dev,symbolic,server,pii]"
+      - pytest tests/ -x --timeout=30 -q --ignore=tests/advanced_audit --ignore=tests/security -p no:cacheprovider
+    timeout_in_minutes: 10

@@ -72,7 +72,7 @@ class TestQWEDLocalCoverage(unittest.TestCase):
 
     def test_show_github_nudge(self):
         """Test the github nudge logic."""
-        import qwed_sdk.qwed_local as mod
+        from qwed_sdk import qwed_local as mod
         
         # Reset counters
         mod._verification_count = 0
@@ -95,7 +95,7 @@ class TestQWEDLocalCoverage(unittest.TestCase):
 
     def test_show_github_nudge_no_color(self):
         """Test nudge without color (non-colored fallback path)."""
-        import qwed_sdk.qwed_local as mod
+        from qwed_sdk import qwed_local as mod
         
         old_count = mod._verification_count
         old_shown = mod._has_shown_nudge
@@ -122,7 +122,7 @@ class TestQWEDLocalCoverage(unittest.TestCase):
 
     def test_cache_hit_printing_logic(self):
         """Test cache hit printing paths."""
-        import qwed_sdk.qwed_local as mod
+        from qwed_sdk import qwed_local as mod
         
         client = QWEDLocal(base_url="http://mock", cache=True)
         # Mock the cache to return a valid VerificationResult-compatible dict
@@ -163,7 +163,7 @@ class TestQWEDLocalCoverage(unittest.TestCase):
 
     def test_is_safe_sympy_expr_complex(self):
         """Test safe sympy validator with various node types."""
-        import qwed_sdk.qwed_local as mod
+        from qwed_sdk import qwed_local as mod
         
         # Valid cases - bare expressions and safe builtins
         self.assertTrue(mod._is_safe_sympy_expr("1 + 2"))

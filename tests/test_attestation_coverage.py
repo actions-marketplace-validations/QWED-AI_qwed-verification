@@ -2,8 +2,7 @@
 import unittest
 import base64
 import json
-import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from src.qwed_new.core.attestation import (
     AttestationService,
     VerificationResult,
