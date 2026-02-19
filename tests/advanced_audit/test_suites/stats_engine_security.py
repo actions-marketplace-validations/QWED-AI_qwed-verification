@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from base_test import BaseTest, TestResult
 
 
-class Test_DataFrame_Eval_Injection(BaseTest):
+class TestDataFrameEvalInjection(BaseTest):
     """Test: Detect DataFrame.eval() with user input (RCE)"""
     
     def __init__(self):
@@ -65,7 +65,7 @@ result = df.eval(user_formula)  # RCE via eval!
         )
 
 
-class Test_Exec_In_Analysis(BaseTest):
+class TestExecInAnalysis(BaseTest):
     """Test: Detect exec() in statistical analysis code"""
     
     def __init__(self):
@@ -114,7 +114,7 @@ exec(analysis_code)  # Direct RCE
         )
 
 
-class Test_Safe_Pandas_Operations(BaseTest):
+class TestSafePandasOperations(BaseTest):
     """Test: Verify safe pandas operations are not flagged"""
     
     def __init__(self):
@@ -170,7 +170,7 @@ correlation = df["x"].corr(df["y"])
 
 # Export tests
 AVAILABLE_TESTS = [
-    Test_DataFrame_Eval_Injection(),
-    Test_Exec_In_Analysis(),
-    Test_Safe_Pandas_Operations()
+    TestDataFrameEvalInjection(),
+    TestExecInAnalysis(),
+    TestSafePandasOperations()
 ]

@@ -15,9 +15,13 @@ import json
 import os
 import logging
 from typing import Any, Dict, Tuple, Optional
-from datetime import datetime
+
 
 logger = logging.getLogger(__name__)
+
+def _sanitize_log_msg(msg: str) -> str:
+    """Strip newline characters to prevent log injection."""
+    return str(msg).replace('\n', ' ').replace('\r', ' ')
 
 
 class SecureCodeExecutor:
@@ -71,7 +75,7 @@ class SecureCodeExecutor:
             return False, f"Code safety validation failed: {safety_reason}", None
         
         self.execution_count += 1
-        execution_id = f"exec_{self.execution_count}_{int(datetime.utcnow().timestamp())}"
+        execution_id = f"exec_{self.execution_count}"
         
         logger.info(f"Starting secure code execution: {execution_id}")
         
@@ -104,8 +108,9 @@ class SecureCodeExecutor:
                             result_data = json.load(f)
                         
                         if 'error' in result_data:
-                            logger.warning(f"Code execution error: {result_data['error']}")
-                            return False, result_data['error'], None
+                            # Log a static message (S5145: don't log user-controlled data)
+                            logger.warning("Code execution returned an error for %s", execution_id)
+                            return False, _sanitize_log_msg(str(result_data['error'])), None
                         
                         logger.info(f"Code execution successful: {execution_id}")
                         return True, None, result_data.get('result')
@@ -113,20 +118,21 @@ class SecureCodeExecutor:
                         return False, "No result file generated", None
                         
                 except docker.errors.ContainerError as e:
-                    logger.error(f"Container error: {e}")
-                    return False, f"Container execution failed: {str(e)}", None
+                    logger.exception("Container execution failed")
+                    return False, f"Container execution failed: {e!s}", None
                     
                 except docker.errors.ImageNotFound:
-                    logger.error(f"Docker image not found: {self.image}")
-                    return False, f"Docker image '{self.image}' not found. Please pull it first.", None
+                    safe_image = _sanitize_log_msg(str(self.image))
+                    logger.exception("Docker image not found: %s", safe_image)
+                    return False, f"Docker image '{safe_image!s}' not found. Please pull it first.", None
                     
                 except Exception as e:
-                    logger.error(f"Unexpected execution error: {e}")
-                    return False, f"Execution error: {str(e)}", None
+                    logger.exception("Unexpected execution error")
+                    return False, f"Execution error: {e!s}", None
                     
-        except Exception as e:
-            logger.error(f"Failed to create temporary directory: {e}")
-            return False, f"Setup error: {str(e)}", None
+        except OSError as e:
+            logger.exception("Failed to create temporary directory")
+            return False, f"Setup error: {e!s}", None
     
     def _run_in_container(self, tmpdir: str, execution_id: str) -> Any:
         """Run code in Docker container with resource limits."""

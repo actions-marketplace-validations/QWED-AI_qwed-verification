@@ -58,6 +58,7 @@ except ImportError:
         BRAND = SUCCESS = ERROR = INFO = WARNING = VALUE = EVIDENCE = RESET = ""
     HAS_COLOR = False
 
+
 # LLM Clients
 try:
     from openai import OpenAI
@@ -85,6 +86,105 @@ try:
     from z3 import Solver, sat, Bool, Int, Real
 except ImportError:
     Solver = None
+
+
+
+# Validators
+import ast
+
+def _is_safe_sympy_expr(expr_str: str) -> bool:
+    """
+    Validate that expression only contains allowed SymPy operations.
+    Strictly whitelists safe functions to prevent code injection.
+    """
+    ALLOWED_SYMPY_FUNCS = {
+        'simplify', 'expand', 'factor', 'diff', 'integrate',
+        'solve', 'limit', 'series', 'summation',
+        'sin', 'cos', 'tan', 'exp', 'log', 'sqrt',
+        'Symbol', 'symbols', 'Rational', 'Integer',
+        'pi', 'E', 'oo', 'zoo', 'nan',
+    }
+    try:
+        tree = ast.parse(expr_str, mode='eval')
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Check calls like sympy.diff(...)
+                if isinstance(node.func, ast.Attribute):
+                    # Ensure base is 'sympy'
+                    if getattr(node.func.value, 'id', '') != 'sympy':
+                        return False
+                    # Check specific function against whitelist
+                    if node.func.attr not in ALLOWED_SYMPY_FUNCS:
+                        return False
+                elif isinstance(node.func, ast.Name):
+                    # Explicitly block direct calls unless safe builtins
+                    # float and complex removed to reduce attack surface
+                    safe_funcs = {'abs', 'int'}
+                    if node.func.id not in safe_funcs:
+                        return False
+                else:
+                    return False
+                
+                # Critical Security Check: Reject string arguments in function calls
+                # Whitelisted functions like simplify() call sympify() internally on strings,
+                # which uses eval() and creates an injection vector.
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        return False
+                    # Check for legacy ast.Str (Python < 3.8)
+                    if hasattr(ast, 'Str') and isinstance(arg, ast.Str):
+                        return False
+                        
+                for kw in node.keywords:
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        return False
+                    # Check for legacy ast.Str (Python < 3.8)
+                    if hasattr(ast, 'Str') and isinstance(kw.value, ast.Str):
+                        return False
+            elif isinstance(node, (ast.Name, ast.Constant, ast.Expression, 
+                                   ast.Load, ast.BinOp, ast.UnaryOp,
+                                   ast.Attribute, ast.Call, ast.keyword, ast.Pow,
+                                   ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.USub)):
+                pass
+            # Deprecated check for older Python versions if needed, but modern ast uses Constant
+            elif hasattr(ast, 'Str') and isinstance(node, ast.Str): pass
+            elif hasattr(ast, 'Num') and isinstance(node, ast.Num): pass
+            else:
+                return False
+        return True
+    except SyntaxError:
+        return False
+
+def _is_safe_z3_expr(expr_str: str) -> bool:
+    """Validate that expression only contains allowed Z3 operations."""
+    allowed_names = {
+        'Bool', 'And', 'Or', 'Not', 'Implies', 
+        # Note: True/False are ast.Constant on Python 3.8+, handled separately
+    }
+    
+    try:
+        tree = ast.parse(expr_str, mode='eval')
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id not in allowed_names:
+                        return False
+                else:
+                    return False # Reject complex calls
+            elif isinstance(node, ast.Name):
+                if node.id not in allowed_names:
+                    return False
+            elif isinstance(node, (ast.Constant, ast.Expression, ast.Load)):
+                pass
+            # Deprecated check
+            elif hasattr(ast, 'Str') and isinstance(node, ast.Str): pass
+            elif hasattr(ast, 'Num') and isinstance(node, ast.Num): pass
+            else:
+                # Reject operations, attributes, etc.
+                return False
+        return True
+    except SyntaxError:
+        return False
 
 
 @dataclass
@@ -131,6 +231,7 @@ def _show_github_nudge():
         print("💚 If QWED saved you time, give us a ⭐ on GitHub!")
         print("👉 https://github.com/QWED-AI/qwed-verification")
         print("─" * 60 + "\n")
+        _has_shown_nudge = True
 
 
 class QWEDLocal:
@@ -423,7 +524,18 @@ SymPy code:"""
             local_vars = {"sympy": sympy, "x": sympy.Symbol('x')}
             
             try:
-                verified_result = eval(llm_expr.strip(), {"__builtins__": {}}, local_vars)
+                # Use safe eval with AST whitelist (module-level validator)
+
+                if not _is_safe_sympy_expr(llm_expr.strip()):
+                    raise ValueError("Unsafe SymPy expression detected")
+
+                # S307: eval() is guarded by _is_safe_sympy_expr AST whitelist
+                # and restricted namespace (no __builtins__, only sympy + Symbol('x'))
+                verified_result = eval(llm_expr.strip(), {"__builtins__": {}}, local_vars)  # noqa: S307 # NOSONAR
+                
+                # If it's an expression (like 2+2), evaluate it
+                if hasattr(verified_result, 'evalf'):
+                    verified_result = verified_result.evalf()
                 verified_value = str(verified_result)
                 
                 # Compare LLM answer with verified result
@@ -437,7 +549,7 @@ SymPy code:"""
                         "llm_answer": llm_answer,
                         "verified_value": verified_value,
                         "sympy_expr": llm_expr.strip(),
-                        "method": "sympy_eval"
+                        "method": "sympy_eval_safe"
                     }
                 )
                 
@@ -552,6 +664,11 @@ Z3 code:"""
                     "__builtins__": {}
                 }
                 
+                # Validate using module-level validator
+
+                if not _is_safe_z3_expr(llm_expr.strip()):
+                    raise ValueError("Unsafe Z3 expression detected")
+
                 expr = eval(llm_expr.strip(), z3_namespace)
                 
                 # Use Z3 solver
