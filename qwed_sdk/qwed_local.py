@@ -155,34 +155,42 @@ def _is_safe_sympy_expr(expr_str: str) -> bool:
     except SyntaxError:
         return False
 
-def _is_safe_z3_expr(expr_str: str) -> bool:
-    """Validate that expression only contains allowed Z3 operations."""
+def _is_safe_z3_ast(tree: ast.AST) -> bool:
+    """Validate that an AST tree only contains allowed Z3 operations."""
     allowed_names = {
         'Bool', 'And', 'Or', 'Not', 'Implies', 
         # Note: True/False are ast.Constant on Python 3.8+, handled separately
     }
     
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id not in allowed_names:
+                    return False
+            else:
+                return False # Reject complex calls
+        elif isinstance(node, ast.Name):
+            if node.id not in allowed_names:
+                return False
+        elif isinstance(node, (ast.Constant, ast.Expression, ast.Load)):
+            pass
+        # Deprecated check
+        elif hasattr(ast, 'Str') and isinstance(node, ast.Str): pass
+        elif hasattr(ast, 'Num') and isinstance(node, ast.Num): pass
+        else:
+            # Reject operations, attributes, etc.
+            return False
+    return True
+
+
+def _is_safe_z3_expr(expr_str: str) -> bool:
+    """Validate that expression string only contains allowed Z3 operations.
+    
+    Backward-compatible wrapper around _is_safe_z3_ast.
+    """
     try:
         tree = ast.parse(expr_str, mode='eval')
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    if node.func.id not in allowed_names:
-                        return False
-                else:
-                    return False # Reject complex calls
-            elif isinstance(node, ast.Name):
-                if node.id not in allowed_names:
-                    return False
-            elif isinstance(node, (ast.Constant, ast.Expression, ast.Load)):
-                pass
-            # Deprecated check
-            elif hasattr(ast, 'Str') and isinstance(node, ast.Str): pass
-            elif hasattr(ast, 'Num') and isinstance(node, ast.Num): pass
-            else:
-                # Reject operations, attributes, etc.
-                return False
-        return True
+        return _is_safe_z3_ast(tree)
     except SyntaxError:
         return False
 
@@ -191,22 +199,28 @@ def _safe_eval_z3_expr(expr_str: str, z3_namespace: dict):
     """Safely evaluate a Z3 expression using AST compilation.
     
     Instead of eval(), this function:
-    1. Parses the expression into an AST
-    2. Validates all nodes against the allow-list via _is_safe_z3_expr
+    1. Parses the expression into an AST (once)
+    2. Validates all nodes against the allow-list
     3. Compiles the validated AST into a code object
-    4. Executes the compiled code in the restricted namespace
+    4. Executes the compiled code in a restricted namespace (no builtins)
     
     This eliminates the eval() call that triggers S5334.
     """
     stripped = expr_str.strip()
-    if not _is_safe_z3_expr(stripped):
+    
+    # Parse once and validate the AST
+    tree = ast.parse(stripped, mode='eval')
+    if not _is_safe_z3_ast(tree):
         raise ValueError("Unsafe Z3 expression detected")
     
-    # Parse into AST and compile from the validated tree (not from raw string)
-    tree = ast.parse(stripped, mode='eval')
+    # Compile the already-validated AST (no re-parse)
     code = compile(tree, '<z3_expr>', 'eval')
-    # Execute compiled code in restricted namespace (no builtins)
-    return eval(code, z3_namespace)  # noqa: S307  # nosec - AST-validated
+    
+    # Defensively strip builtins regardless of what the caller passes
+    restricted_ns = {k: v for k, v in z3_namespace.items() if k != "__builtins__"}
+    restricted_ns["__builtins__"] = {}
+    
+    return eval(code, restricted_ns)  # noqa: S307  # nosec - AST-validated
 
 
 @dataclass
