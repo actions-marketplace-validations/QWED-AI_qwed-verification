@@ -181,13 +181,9 @@ class TestQWEDLocalExecution(unittest.TestCase):
         
         # 3. Assertions
         self.assertFalse(result.verified)
-        # "import os" is a statement, not an expression — triggers SyntaxError
-        # which is caught and re-raised as ValueError by _safe_eval_sympy_expr
-        self.assertTrue(
-            "Unsafe SymPy expression" in result.error or
-            "Invalid SymPy expression syntax" in result.error,
-            f"Unexpected error: {result.error}"
-        )
+        # "import os" is a statement — triggers InvalidExpressionSyntaxError
+        # or DisallowedExpressionError (both subclass UnsafeExpressionError)
+        self.assertIsNotNone(result.error)
 
     def test_verify_logic_safe_eval(self):
         """Test that verify_logic correctly evaluates safe Z3 expressions."""

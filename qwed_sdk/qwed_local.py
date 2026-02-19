@@ -89,12 +89,22 @@ except ImportError:
 
 
 
+import os
+
 # Validators
 import ast
 
 
 class UnsafeExpressionError(ValueError):
     """Raised when an expression fails AST safety validation."""
+
+
+class InvalidExpressionSyntaxError(UnsafeExpressionError):
+    """Raised when an expression is not valid Python syntax."""
+
+
+class DisallowedExpressionError(UnsafeExpressionError):
+    """Raised when an expression contains disallowed AST nodes."""
 
 def _has_string_arg(node: ast.Call) -> bool:
     """Check if a Call node has any string literal arguments."""
@@ -130,6 +140,13 @@ _SAFE_SYMPY_NODE_TYPES = (
 _SAFE_SYMPY_BUILTINS = {"abs": abs, "int": int}
 
 
+# Functions that execute/parse strings via sympify — must never receive string args.
+# Most sympy functions call sympify() internally, which uses eval().
+# Only Symbol/symbols/Rational/Integer/constants take string args safely.
+_SYMPY_SAFE_STRING_FUNCS = {'Symbol', 'symbols', 'Rational', 'Integer'}
+_SYMPY_FUNCS_REJECTING_STRING_ARGS = _ALLOWED_SYMPY_FUNCS - _SYMPY_SAFE_STRING_FUNCS
+
+
 def _is_safe_sympy_call(node: ast.Call) -> bool:
     """Validate a single Call node against sympy allow-list."""
     if isinstance(node.func, ast.Attribute):
@@ -137,20 +154,22 @@ def _is_safe_sympy_call(node: ast.Call) -> bool:
             return False
         if node.func.attr not in _ALLOWED_SYMPY_FUNCS:
             return False
+        # Only reject string args for functions that evaluate strings
+        if node.func.attr in _SYMPY_FUNCS_REJECTING_STRING_ARGS:
+            return not _has_string_arg(node)
     elif isinstance(node.func, ast.Name):
         if node.func.id not in {'abs', 'int'}:
             return False
     else:
         return False
-    # Reject string arguments (sympify injection vector)
-    return not _has_string_arg(node)
+    return True
 
 
 def _is_safe_sympy_attribute(node: ast.Attribute) -> bool:
-    """Validate attribute access — only allow sympy.X pattern."""
+    """Validate attribute access — only allow sympy.X for allowed functions."""
     if not isinstance(node.value, ast.Name):
         return False
-    return node.value.id == 'sympy'
+    return node.value.id == 'sympy' and node.attr in _ALLOWED_SYMPY_FUNCS
 
 
 def _is_safe_sympy_node(node: ast.AST) -> bool:
@@ -168,6 +187,11 @@ def _is_safe_sympy_node(node: ast.AST) -> bool:
     return False
 
 
+def _is_safe_sympy_ast(tree: ast.AST) -> bool:
+    """Validate that an AST tree only contains allowed SymPy operations."""
+    return all(_is_safe_sympy_node(node) for node in ast.walk(tree))
+
+
 def _is_safe_sympy_expr(expr_str: str) -> bool:
     """
     Validate that expression only contains allowed SymPy operations.
@@ -175,7 +199,7 @@ def _is_safe_sympy_expr(expr_str: str) -> bool:
     """
     try:
         tree = ast.parse(expr_str, mode='eval')
-        return all(_is_safe_sympy_node(node) for node in ast.walk(tree))
+        return _is_safe_sympy_ast(tree)
     except SyntaxError:
         return False
 
@@ -191,9 +215,9 @@ def _safe_eval_sympy_expr(expr_str: str, local_vars: dict):
     try:
         tree = ast.parse(stripped, mode='eval')
     except SyntaxError as exc:
-        raise UnsafeExpressionError(f"Invalid SymPy expression syntax: {exc}") from exc
-    if not all(_is_safe_sympy_node(node) for node in ast.walk(tree)):
-        raise UnsafeExpressionError("Unsafe SymPy expression detected")
+        raise InvalidExpressionSyntaxError(str(exc)) from exc
+    if not _is_safe_sympy_ast(tree):
+        raise DisallowedExpressionError
 
     code = compile(tree, '<sympy_expr>', 'eval')
 
@@ -258,9 +282,9 @@ def _safe_eval_z3_expr(expr_str: str, z3_namespace: dict):
     try:
         tree = ast.parse(stripped, mode='eval')
     except SyntaxError as exc:
-        raise UnsafeExpressionError(f"Invalid Z3 expression syntax: {exc}") from exc
+        raise InvalidExpressionSyntaxError(str(exc)) from exc
     if not _is_safe_z3_ast(tree):
-        raise UnsafeExpressionError("Unsafe Z3 expression detected")
+        raise DisallowedExpressionError
     
     # Compile the already-validated AST (no re-parse)
     code = compile(tree, '<z3_expr>', 'eval')
@@ -418,7 +442,7 @@ class QWEDLocal:
             
             self.llm_client = OpenAI(
                 base_url=self.base_url,
-                api_key=self.api_key or "not-needed",  # deepcode ignore HardcodedSecret: Placeholder for local LLMs (Ollama), not a real secret
+                api_key=self.api_key or os.environ.get("QWED_LOCAL_API_KEY", "not-needed"),
                 **kwargs
             )
             self.client_type = "openai"
