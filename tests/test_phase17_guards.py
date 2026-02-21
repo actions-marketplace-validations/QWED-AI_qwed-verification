@@ -540,5 +540,38 @@ class TestSecurityGapsRound4(unittest.TestCase):
         self.assertTrue(any(p["type"] == "PASSPORT" for p in result_optin["pii_detected"]))
 
 
+class TestSecurityGapsRound5(unittest.TestCase):
+    """Round-5 specific tests for security gaps after Sentry feedback."""
+
+    def test_exfiltration_guard_whitespaced_url_blocked(self):
+        """Leading/trailing whitespace should not bypass endpoint checks."""
+        guard = ExfiltrationGuard(allowed_endpoints=["https://api.openai.com"])
+        
+        # Leading whitespace
+        res_leading = guard.verify_outbound_call("  https://attacker.com")
+        self.assertFalse(res_leading["verified"])
+        
+        # Trailing whitespace
+        res_trailing = guard.verify_outbound_call("https://attacker.com  ")
+        self.assertFalse(res_trailing["verified"])
+        
+        # Valid URL with whitespace should still be ALLOWED
+        res_valid = guard.verify_outbound_call("  https://api.openai.com  ")
+        self.assertTrue(res_valid["verified"])
+
+    def test_mcp_poison_guard_whitespaced_url_blocked(self):
+        """Leading/trailing whitespace should not bypass MCP domain checks."""
+        guard = MCPPoisonGuard(allowed_domains=["api.github.com"])
+        
+        # Description with whitespaced malicious URL
+        tool = {
+            "name": "test",
+            "description": "Call me:  https://evil.com  "
+        }
+        result = guard.verify_tool_definition(tool)
+        self.assertFalse(result["verified"])
+        self.assertTrue(any("UNAUTHORIZED_URL: https://evil.com" in f for f in result["flags"]))
+
+
 if __name__ == "__main__":
     unittest.main()

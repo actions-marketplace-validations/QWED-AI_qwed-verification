@@ -103,9 +103,9 @@ class MCPPoisonGuard:
 
     def _is_allowed_url(self, url: str) -> bool:
         """Return True if the URL's hostname is in the allow-list."""
-        clean_url = url.rstrip(_TRAILING_PUNCT)
+        url_clean = url.strip().rstrip(_TRAILING_PUNCT)
         try:
-            host = urlparse(clean_url).hostname or ""
+            host = urlparse(url_clean).hostname or ""
         except ValueError:
             return False
         for domain in self.allowed_domains:

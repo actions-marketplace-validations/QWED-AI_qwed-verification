@@ -122,9 +122,10 @@ class ExfiltrationGuard:
 
     def _is_allowed_endpoint(self, url: str) -> bool:
         """Check if URL matches any allowed endpoint prefix or hostname."""
-        url_lower = url.lower()
+        url_clean = url.strip()
+        url_lower = url_clean.lower()
         try:
-            _parsed_url = urlparse(url)
+            _parsed_url = urlparse(url_clean)
             parsed_host = _parsed_url.hostname or ""
             url_scheme = _parsed_url.scheme
         except ValueError:
