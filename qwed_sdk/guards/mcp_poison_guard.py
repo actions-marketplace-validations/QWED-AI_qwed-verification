@@ -166,13 +166,12 @@ class MCPPoisonGuard:
 
         # Optionally scan parameter descriptions
         if self.scan_parameters:
-            input_schema = (
-                tool_schema.get("inputSchema")
-                or tool_schema.get("parameters")
-                or {}
-            )
-            for param_name, param_def in (input_schema.get("properties") or {}).items():
-                all_flags.extend(self._scan_parameter(param_name, param_def))
+            for _schema_key in ("inputSchema", "parameters"):
+                _schema = tool_schema.get(_schema_key) or {}
+                # inputSchema in MCP is often an object with a 'properties' key
+                props = _schema.get("properties") or {}
+                for param_name, param_def in props.items():
+                    all_flags.extend(self._scan_parameter(param_name, param_def))
 
         _rule = "Tool descriptions and parameters must not contain prompt injections or unauthorized URLs."
 

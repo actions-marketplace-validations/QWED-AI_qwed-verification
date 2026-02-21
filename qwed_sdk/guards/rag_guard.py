@@ -166,6 +166,13 @@ class RAGGuard:
             f"All {total} chunk(s) verified from correct source document."
         )
 
+        _app_message = (
+            f"{len(mismatched)} mismatch(es) tolerated; "
+            f"{total - len(mismatched)}/{total} chunk(s) from correct source."
+            if mismatched else
+            f"All {total} chunk(s) passed document_id equality check."
+        )
+
         return {
             "verified": True,
             "drm_rate": drm_float,
@@ -175,7 +182,7 @@ class RAGGuard:
             "message": _success_message,
             "irac.issue": "None — all chunks evaluated.",
             "irac.rule": _rule,
-            "irac.application": f"All {total} chunk(s) passed document_id equality check.",
+            "irac.application": _app_message,
             "irac.conclusion": "Verified: DRM rate within acceptable threshold.",
         }
 
