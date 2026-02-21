@@ -22,6 +22,9 @@ AUDIT_RULE = "irac.rule"
 AUDIT_APP = "irac.application"
 AUDIT_CONCL = "irac.conclusion"
 
+KEY_TOOLS = "tools"
+KEY_MCP_SERVERS = "mcpServers"
+
 
 # Prompt injection patterns — manipulative tags and override attempts
 _DEFAULT_INJECTION_PATTERNS: List[str] = [
@@ -260,8 +263,8 @@ class MCPPoisonGuard:
 
     def _get_tools_from_config(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract flat list of tools from multiple config formats."""
-        has_tools = "tools" in config
-        has_mcp = "mcpServers" in config
+        has_tools = KEY_TOOLS in config
+        has_mcp = KEY_MCP_SERVERS in config
 
         if has_tools and has_mcp:
             logger.warning(
@@ -270,13 +273,13 @@ class MCPPoisonGuard:
             )
 
         if has_tools:
-            raw = config["tools"]
+            raw = config[KEY_TOOLS]
             if not isinstance(raw, list):
                 raise ValueError(f"'tools' must be a list, got {type(raw).__name__!r}")
             return raw
 
         if has_mcp:
-            return self._extract_mcp_server_tools(config["mcpServers"])
+            return self._extract_mcp_server_tools(config[KEY_MCP_SERVERS])
 
         return []
 
@@ -289,7 +292,7 @@ class MCPPoisonGuard:
         tools = []
         for server_def in mcp_servers.values():
             if isinstance(server_def, dict):
-                server_tools = server_def.get("tools")
+                server_tools = server_def.get(KEY_TOOLS)
                 if isinstance(server_tools, list):
                     tools.extend(server_tools)
         return tools

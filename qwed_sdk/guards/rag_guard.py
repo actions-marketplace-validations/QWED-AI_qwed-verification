@@ -12,7 +12,7 @@ legal/financial documents look structurally identical to embedding
 models, causing cross-document contamination of retrieved context.
 """
 from fractions import Fraction
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List
 
 
 # --- Audit Constants ---
@@ -20,6 +20,8 @@ AUDIT_ISSUE = "irac.issue"
 AUDIT_RULE = "irac.rule"
 AUDIT_APP = "irac.application"
 AUDIT_CONCL = "irac.conclusion"
+
+KEY_DOC_ID = "document_id"
 
 
 class RAGGuardConfigError(ValueError):
@@ -48,7 +50,7 @@ class RAGGuard:
 
     def __init__(
         self,
-        max_drm_rate: Union[Fraction, str, int] = Fraction(0),
+        max_drm_rate: Fraction | str | int = Fraction(0),
         require_metadata: bool = True,
     ):
         """
@@ -123,7 +125,7 @@ class RAGGuard:
         for chunk in retrieved_chunks:
             chunk_id = chunk.get("id", "unknown")
             metadata = chunk.get("metadata") or {}
-            chunk_doc_id = metadata.get("document_id")
+            chunk_doc_id = metadata.get(KEY_DOC_ID)
 
             if chunk_doc_id is None:
                 if self.require_metadata:
@@ -215,7 +217,7 @@ class RAGGuard:
             raise ValueError("target_document_id must be a non-empty string.")
 
         def _chunk_matches(chunk: Dict[str, Any]) -> bool:
-            doc_id = chunk.get("metadata", {}).get("document_id")
+            doc_id = chunk.get("metadata", {}).get(KEY_DOC_ID)
             if doc_id == target_document_id:
                 return True
             # When require_metadata=False, chunks with no document_id are kept
