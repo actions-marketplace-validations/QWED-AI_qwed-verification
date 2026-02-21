@@ -28,8 +28,9 @@ _DEFAULT_INJECTION_PATTERNS: List[str] = [
     r"(?i)DAN\s+mode",
 ]
 
-# URL pattern — catches http(s):// URLs in tool descriptions
-_URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+# URL pattern — catches http(s):// URLs; excludes trailing punctuation
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"',;)\}\]]+", re.IGNORECASE)
+_TRAILING_PUNCT = frozenset('.,;:!?)>\'"]}\'')
 
 
 
@@ -84,14 +85,19 @@ class MCPPoisonGuard:
 
     def _is_allowed_url(self, url: str) -> bool:
         """Return True if the URL's hostname is in the allow-list."""
+        # Strip trailing punctuation that the regex may have captured
+        clean_url = url.rstrip('.,;:!?)>\'"}_')
         try:
-            host = urlparse(url).hostname or ""
-            return any(
-                host == domain or host.endswith(f".{domain}")
-                for domain in self.allowed_domains
-            )
-        except Exception:
+            host = urlparse(clean_url).hostname or ""
+        except ValueError:
             return False
+        for domain in self.allowed_domains:
+            if host == domain:
+                return True
+            # Subdomain match only for multi-label domains (not 'localhost')
+            if "." in domain and host.endswith(f".{domain}"):
+                return True
+        return False
 
     def _scan_text(self, text: str) -> List[str]:
         """Scan a single string and return a list of flag strings."""
@@ -105,7 +111,7 @@ class MCPPoisonGuard:
 
         # Check for unauthorized URLs (separate from injection patterns)
         for url_match in _URL_PATTERN.finditer(text):
-            url = url_match.group(0)
+            url = url_match.group(0).rstrip('.,;:!?)>\'"}')
             if not self._is_allowed_url(url):
                 flags.append(f"UNAUTHORIZED_URL: {url}")
 

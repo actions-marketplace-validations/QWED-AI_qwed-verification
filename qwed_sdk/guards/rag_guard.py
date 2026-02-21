@@ -11,7 +11,8 @@ for Large Legal Datasets" — DRM is a critical failure mode where
 legal/financial documents look structurally identical to embedding
 models, causing cross-document contamination of retrieved context.
 """
-from typing import List, Dict, Any, Optional
+from fractions import Fraction
+from typing import List, Dict, Any
 
 
 class RAGGuard:
@@ -100,27 +101,30 @@ class RAGGuard:
                 })
 
         total = len(retrieved_chunks)
-        drm_rate = len(mismatched) / total
+        # Use exact rational arithmetic to avoid IEEE-754 imprecision
+        drm_fraction = Fraction(len(mismatched), total)
+        drm_float = round(float(drm_fraction), 4)
+        threshold = Fraction(self.max_drm_rate).limit_denominator(10 ** 6)
 
-        if drm_rate > self.max_drm_rate:
+        if drm_fraction > threshold:
             return {
                 "verified": False,
                 "risk": "DOCUMENT_RETRIEVAL_MISMATCH",
-                "drm_rate": round(drm_rate, 4),
+                "drm_rate": drm_float,
                 "chunks_checked": total,
                 "mismatched_count": len(mismatched),
                 "message": (
                     f"Blocked RAG injection: {len(mismatched)}/{total} chunks "
                     f"originated from the wrong source document. "
-                    f"DRM rate {drm_rate:.1%} exceeds threshold {self.max_drm_rate:.1%}. "
-                    "This will cause hallucinations."
+                    f"DRM rate {float(drm_fraction):.1%} exceeds threshold "
+                    f"{self.max_drm_rate:.1%}. This will cause hallucinations."
                 ),
                 "details": mismatched,
             }
 
         return {
             "verified": True,
-            "drm_rate": round(drm_rate, 4),
+            "drm_rate": drm_float,
             "chunks_checked": total,
             "message": f"All {total} chunk(s) verified from correct source document.",
         }
@@ -143,7 +147,11 @@ class RAGGuard:
         Returns:
             Filtered list containing only matching chunks.
         """
-        return [
-            chunk for chunk in retrieved_chunks
-            if chunk.get("metadata", {}).get("document_id") == target_document_id
-        ]
+        def _chunk_matches(chunk: Dict[str, Any]) -> bool:
+            doc_id = chunk.get("metadata", {}).get("document_id")
+            if doc_id == target_document_id:
+                return True
+            # When require_metadata=False, chunks with no document_id are kept
+            return not self.require_metadata and doc_id is None
+
+        return [chunk for chunk in retrieved_chunks if _chunk_matches(chunk)]

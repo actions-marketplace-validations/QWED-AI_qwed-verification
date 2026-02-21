@@ -29,7 +29,9 @@ _PII_PATTERNS: Dict[str, re.Pattern] = {
     "PHONE_US": re.compile(
         r"\b(?:\+1\s?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}\b"
     ),
-    "PASSPORT": re.compile(r"\b[A-Z]{1,2}[0-9]{6,9}\b"),
+    # PASSPORT: opt-in only — too broad by default (matches version strings etc.)
+    # Enable via pii_checks=[..., 'PASSPORT'] in ExfiltrationGuard.__init__
+    "PASSPORT": re.compile(r"\b(?:passport\s*(?:no|number|#)?[:\s]+)?[A-Z]{1,2}[0-9]{6,9}\b", re.IGNORECASE),
     "IBAN": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}(?:[A-Z0-9]?){0,16}\b"),
     "AWS_ACCESS_KEY": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     "PRIVATE_KEY": re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"),
@@ -87,9 +89,12 @@ class ExfiltrationGuard:
         ]
 
         # Build active PII patterns
-        active_pii = dict(_PII_PATTERNS)
+        # Default checks exclude PASSPORT (too broad, opt-in only)
+        _DEFAULT_CHECKS = {k for k in _PII_PATTERNS if k != "PASSPORT"}
         if pii_checks is not None:
-            active_pii = {k: v for k, v in active_pii.items() if k in pii_checks}
+            active_pii = {k: v for k, v in _PII_PATTERNS.items() if k in pii_checks}
+        else:
+            active_pii = {k: v for k, v in _PII_PATTERNS.items() if k in _DEFAULT_CHECKS}
         if custom_pii_patterns:
             for name, pattern_str in custom_pii_patterns.items():
                 active_pii[name] = re.compile(pattern_str)
@@ -100,16 +105,22 @@ class ExfiltrationGuard:
         url_lower = url.lower()
         try:
             parsed_host = urlparse(url).hostname or ""
-        except Exception:
+        except ValueError:
             return False
 
         for allowed in self.allowed_endpoints:
             allowed_lower = allowed.lower()
-            # Prefix match (e.g. "https://api.openai.com")
+            # Prefix match — require path boundary to prevent
+            # 'https://api.openai.com.evil.com' bypassing the allowlist
             if url_lower.startswith(allowed_lower):
-                return True
+                rest = url_lower[len(allowed_lower):]
+                if not rest or rest[0] in ('/', '?', '#', ':'):
+                    return True
             # Hostname-only match (e.g. "api.openai.com")
-            allowed_host = urlparse(allowed).hostname or allowed_lower
+            try:
+                allowed_host = urlparse(allowed).hostname or allowed_lower
+            except ValueError:
+                allowed_host = allowed_lower
             if parsed_host == allowed_host or parsed_host.endswith(f".{allowed_host}"):
                 return True
         return False
