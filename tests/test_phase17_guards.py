@@ -323,6 +323,114 @@ class TestExfiltrationGuard(unittest.TestCase):
         result = self.guard.scan_payload("The answer is 42.")
         self.assertTrue(result["verified"])
 
+    # ── Round-2 fixes ─────────────────────────────────────────────────────
+
+    def test_formatted_credit_card_blocked(self):
+        """Formatted card numbers (spaces/hyphens) must be caught."""
+        result = self.guard.verify_outbound_call(
+            "https://api.openai.com/v1/chat/completions",
+            payload="Card: 4111 1111 1111 1111"
+        )
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["risk"], "PII_LEAK")
+        self.assertTrue(any(p["type"] == "CREDIT_CARD" for p in result["pii_detected"]))
+
+    def test_formatted_credit_card_hyphen_blocked(self):
+        """Hyphen-separated card number must also be caught."""
+        result = self.guard.verify_outbound_call(
+            "https://api.openai.com/v1/chat/completions",
+            payload="Card: 4111-1111-1111-1111"
+        )
+        self.assertFalse(result["verified"])
+        self.assertTrue(any(p["type"] == "CREDIT_CARD" for p in result["pii_detected"]))
+
+    def test_aws_asia_session_key_blocked(self):
+        """AWS temporary/session credentials (ASIA prefix) must be detected."""
+        result = self.guard.verify_outbound_call(
+            "https://api.openai.com/v1/chat/completions",
+            payload="aws_access_key=ASIAIOSFODNN7EXAMPLE"
+        )
+        self.assertFalse(result["verified"])
+        self.assertTrue(any(p["type"] == "AWS_ACCESS_KEY" for p in result["pii_detected"]))
+
+    def test_allowed_endpoints_empty_list_blocks_all(self):
+        """allowed_endpoints=[] must block ALL calls, not fall back to defaults."""
+        guard = ExfiltrationGuard(allowed_endpoints=[])
+        result = guard.verify_outbound_call("https://api.openai.com/v1/chat/completions")
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["risk"], "DATA_EXFILTRATION")
+
+
+class TestRAGGuardRound2(unittest.TestCase):
+    """Round-2 specific tests for RAGGuard."""
+
+    def _chunk(self, chunk_id, doc_id):
+        return {"id": chunk_id, "metadata": {"document_id": doc_id}}
+
+    def test_empty_target_document_id_raises(self):
+        """verify_retrieval_context must reject empty target_document_id."""
+        guard = RAGGuard()
+        with self.assertRaises(ValueError):
+            guard.verify_retrieval_context("", [self._chunk("c1", "")])
+
+    def test_fraction_threshold_exact(self):
+        """Fraction threshold stored exactly — no limit_denominator workaround."""
+        from fractions import Fraction
+        guard = RAGGuard(max_drm_rate=Fraction(1, 3))
+        # 1/4 DRM < 1/3 threshold → should pass
+        chunks = [
+            self._chunk("c1", "doc"), self._chunk("c2", "doc"),
+            self._chunk("c3", "doc"), self._chunk("c4", "other"),
+        ]
+        result = guard.verify_retrieval_context("doc", chunks)
+        self.assertTrue(result["verified"])
+
+    def test_rag_guard_config_error_type(self):
+        """RAGGuardConfigError must be a subclass of ValueError."""
+        from qwed_sdk.guards.rag_guard import RAGGuardConfigError
+        with self.assertRaises(RAGGuardConfigError):
+            RAGGuard(max_drm_rate=2.0)
+        with self.assertRaises(ValueError):
+            RAGGuard(max_drm_rate=2.0)
+
+    def test_irac_fields_present_on_success(self):
+        guard = RAGGuard()
+        chunks = [self._chunk("c1", "doc")]
+        result = guard.verify_retrieval_context("doc", chunks)
+        self.assertIn("irac.issue", result)
+        self.assertIn("irac.rule", result)
+        self.assertIn("irac.application", result)
+        self.assertIn("irac.conclusion", result)
+
+    def test_irac_fields_present_on_failure(self):
+        guard = RAGGuard()
+        chunks = [self._chunk("c1", "wrong")]
+        result = guard.verify_retrieval_context("doc", chunks)
+        self.assertFalse(result["verified"])
+        self.assertIn("irac.issue", result)
+        self.assertIn("irac.conclusion", result)
+
+
+class TestMCPPoisonGuardRound2(unittest.TestCase):
+    """Round-2 specific tests for MCPPoisonGuard."""
+
+    def test_tools_not_a_list_raises(self):
+        """verify_server_config must raise ValueError if 'tools' is not a list."""
+        guard = MCPPoisonGuard()
+        with self.assertRaises(ValueError):
+            guard.verify_server_config({"tools": "not-a-list"})
+
+    def test_custom_pattern_case_insensitive(self):
+        """User-supplied custom patterns must be matched case-insensitively."""
+        guard = MCPPoisonGuard(
+            allowed_domains=[],
+            custom_injection_patterns=[r"evil_keyword"],
+        )
+        result = guard.verify_tool_definition(
+            {"name": "t", "description": "Contains EVIL_KEYWORD here."}
+        )
+        self.assertFalse(result["verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

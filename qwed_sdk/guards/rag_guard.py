@@ -12,7 +12,11 @@ legal/financial documents look structurally identical to embedding
 models, causing cross-document contamination of retrieved context.
 """
 from fractions import Fraction
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Union
+
+
+class RAGGuardConfigError(ValueError):
+    """Raised when RAGGuard is constructed with invalid configuration."""
 
 
 class RAGGuard:
@@ -37,20 +41,28 @@ class RAGGuard:
 
     def __init__(
         self,
-        max_drm_rate: float = 0.0,
+        max_drm_rate: Union[Fraction, float, int] = Fraction(0),
         require_metadata: bool = True,
     ):
         """
         Args:
             max_drm_rate: Maximum tolerable fraction of mismatched chunks
-                (0.0 = zero tolerance, 1.0 = allow all). Default: 0.0.
+                (0 = zero tolerance, 1 = allow all). Accepts ``Fraction``,
+                ``float``, or ``int``. Default: ``Fraction(0)``.
             require_metadata: If True, chunks missing ``document_id`` in
                 metadata are treated as mismatches. Default: True.
         """
-        if not 0.0 <= max_drm_rate <= 1.0:
-            raise ValueError("max_drm_rate must be between 0.0 and 1.0")
-        self.max_drm_rate = max_drm_rate
+        threshold = Fraction(max_drm_rate)
+        if not Fraction(0) <= threshold <= Fraction(1):
+            raise RAGGuardConfigError("max_drm_rate must be between 0 and 1")
+        # Store as exact Fraction — no IEEE-754 round-trip at comparison time
+        self._threshold: Fraction = threshold
         self.require_metadata = require_metadata
+
+    @property
+    def max_drm_rate(self) -> float:
+        """Float view of the DRM threshold (for display/logging)."""
+        return float(self._threshold)
 
     def verify_retrieval_context(
         self,
@@ -62,20 +74,31 @@ class RAGGuard:
 
         Args:
             target_document_id: The expected source document identifier.
+                Must be a non-empty string.
             retrieved_chunks: List of chunk dicts. Each chunk should have
                 ``metadata.document_id`` set.
 
         Returns:
-            ``{"verified": True, "drm_rate": 0.0}`` on success, or
-            ``{"verified": False, "risk": "DOCUMENT_RETRIEVAL_MISMATCH",
-            "drm_rate": float, "message": str, "details": [...]}`` on failure.
+            Dict with ``verified`` bool plus IRAC audit fields.
         """
+        if not target_document_id:
+            raise ValueError("target_document_id must be a non-empty string.")
+
+        _rule = (
+            f"DRM rate must not exceed {float(self._threshold):.1%} "
+            f"(max_drm_rate threshold)."
+        )
+
         if not retrieved_chunks:
             return {
                 "verified": True,
                 "drm_rate": 0.0,
-                "message": "No chunks to verify.",
                 "chunks_checked": 0,
+                "message": "No chunks to verify.",
+                "irac.issue": "None — no chunks to evaluate.",
+                "irac.rule": _rule,
+                "irac.application": "Zero chunks provided; check vacuously passes.",
+                "irac.conclusion": "Verified: no chunks to evaluate.",
             }
 
         mismatched: List[Dict[str, Any]] = []
@@ -86,7 +109,6 @@ class RAGGuard:
             chunk_doc_id = metadata.get("document_id")
 
             if chunk_doc_id is None:
-                # Chunk has no metadata at all
                 if self.require_metadata:
                     mismatched.append({
                         "chunk_id": chunk_id,
@@ -101,12 +123,10 @@ class RAGGuard:
                 })
 
         total = len(retrieved_chunks)
-        # Use exact rational arithmetic to avoid IEEE-754 imprecision
         drm_fraction = Fraction(len(mismatched), total)
         drm_float = round(float(drm_fraction), 4)
-        threshold = Fraction(self.max_drm_rate).limit_denominator(10 ** 6)
 
-        if drm_fraction > threshold:
+        if drm_fraction > self._threshold:
             return {
                 "verified": False,
                 "risk": "DOCUMENT_RETRIEVAL_MISMATCH",
@@ -117,9 +137,16 @@ class RAGGuard:
                     f"Blocked RAG injection: {len(mismatched)}/{total} chunks "
                     f"originated from the wrong source document. "
                     f"DRM rate {float(drm_fraction):.1%} exceeds threshold "
-                    f"{self.max_drm_rate:.1%}. This will cause hallucinations."
+                    f"{float(self._threshold):.1%}. This will cause hallucinations."
                 ),
                 "details": mismatched,
+                "irac.issue": "Document-level retrieval mismatch detected in RAG context.",
+                "irac.rule": _rule,
+                "irac.application": (
+                    f"{len(mismatched)} of {total} chunks originated from "
+                    "wrong or unidentified source documents."
+                ),
+                "irac.conclusion": f"Blocked: DRM rate {drm_float:.1%} exceeds threshold.",
             }
 
         return {
@@ -127,6 +154,10 @@ class RAGGuard:
             "drm_rate": drm_float,
             "chunks_checked": total,
             "message": f"All {total} chunk(s) verified from correct source document.",
+            "irac.issue": "None — all chunks evaluated.",
+            "irac.rule": _rule,
+            "irac.application": f"All {total} chunk(s) passed document_id equality check.",
+            "irac.conclusion": "Verified: DRM rate within acceptable threshold.",
         }
 
     def filter_valid_chunks(

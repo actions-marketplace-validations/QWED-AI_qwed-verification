@@ -8,15 +8,20 @@ policy layer between the agent's tool calls and external APIs.
 Addresses the "if the agent does get tricked" scenario — even if an MCP
 tool or prompt injection succeeds, the data cannot leave your infrastructure.
 """
+import logging
 import re
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 
 # --- PII Detection Patterns ---
 
 _PII_PATTERNS: Dict[str, re.Pattern] = {
     "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    # Credit card: contiguous digits only — formatted numbers are
+    # caught by normalising the payload in _scan_payload_for_pii
     "CREDIT_CARD": re.compile(
         r"\b(?:4[0-9]{12}(?:[0-9]{3})?|"           # Visa
         r"5[1-5][0-9]{14}|"                         # MasterCard
@@ -24,20 +29,30 @@ _PII_PATTERNS: Dict[str, re.Pattern] = {
         r"6(?:011|5[0-9]{2})[0-9]{12})\b"           # Discover
     ),
     "EMAIL": re.compile(
-        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b"
+        # [A-Za-z]{2,} — no pipe inside char class
+        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
     ),
     "PHONE_US": re.compile(
         r"\b(?:\+1\s?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}\b"
     ),
     # PASSPORT: opt-in only — too broad by default (matches version strings etc.)
     # Enable via pii_checks=[..., 'PASSPORT'] in ExfiltrationGuard.__init__
-    "PASSPORT": re.compile(r"\b(?:passport\s*(?:no|number|#)?[:\s]+)?[A-Z]{1,2}[0-9]{6,9}\b", re.IGNORECASE),
-    "IBAN": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}(?:[A-Z0-9]?){0,16}\b"),
-    "AWS_ACCESS_KEY": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "PASSPORT": re.compile(
+        # [:\s]+ — requires at least one separator before the number
+        r"\bpassport\s*(?:no|number|#)?[:\s]+[A-Z]{1,2}\d{6,9}\b",
+        re.IGNORECASE,
+    ),
+    # (?:[A-Z0-9]{1}){0,16} avoids matching the empty string
+    "IBAN": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}(?:[A-Z0-9]{1}){0,16}\b"),
+    # AKIA = long-term, ASIA = temporary/session credentials
+    "AWS_ACCESS_KEY": re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     "PRIVATE_KEY": re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"),
-    "JWT": re.compile(r"\beyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\b"),
-    "BEARER_TOKEN": re.compile(r"Bearer\s+[a-zA-Z0-9_.\-]{20,}", re.IGNORECASE),
+    # \- is a literal hyphen; use \- only once per class (S5869)
+    "JWT": re.compile(r"\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b"),
+    "BEARER_TOKEN": re.compile(r"Bearer\s+[a-zA-Z0-9_.-]{20,}", re.IGNORECASE),
 }
+
+_DEFAULT_PII_CHECKS = frozenset(k for k in _PII_PATTERNS if k != "PASSPORT")
 
 
 class ExfiltrationGuard:
@@ -69,32 +84,30 @@ class ExfiltrationGuard:
         """
         Args:
             allowed_endpoints: URL prefixes or hostnames that agents are
-                permitted to call. Supports prefix matching
-                (``"https://api.openai.com"``) or hostname-only
-                (``"api.openai.com"``). If None, all endpoints are blocked
-                except localhost.
-            pii_checks: List of PII type names to check from the built-in
-                set. Defaults to all. Options: ``SSN``, ``CREDIT_CARD``,
-                ``EMAIL``, ``PHONE_US``, ``PASSPORT``, ``IBAN``,
-                ``AWS_ACCESS_KEY``, ``PRIVATE_KEY``, ``JWT``, ``BEARER_TOKEN``.
-            custom_pii_patterns: Additional ``{name: regex_string}`` patterns
-                to scan for.
+                permitted to call. Pass an **explicit empty list** ``[]``
+                to block all outbound calls. If ``None`` (default), a safe
+                set of well-known AI API endpoints is used.
+            pii_checks: Subset of PII type names to enable. Defaults to all
+                built-in types except ``PASSPORT`` (opt-in).
+            custom_pii_patterns: Additional ``{name: regex_string}`` patterns.
         """
-        self.allowed_endpoints: List[str] = allowed_endpoints or [
-            "https://api.openai.com",
-            "https://api.anthropic.com",
-            "https://generativelanguage.googleapis.com",
-            "http://localhost",
-            "http://127.0.0.1",
-        ]
+        # Distinguish None (use defaults) from [] (block all)
+        if allowed_endpoints is not None:
+            self.allowed_endpoints: List[str] = allowed_endpoints
+        else:
+            self.allowed_endpoints = [
+                "https://api.openai.com",
+                "https://api.anthropic.com",
+                "https://generativelanguage.googleapis.com",
+                "http://localhost",
+                "http://127.0.0.1",
+            ]
 
         # Build active PII patterns
-        # Default checks exclude PASSPORT (too broad, opt-in only)
-        _DEFAULT_CHECKS = {k for k in _PII_PATTERNS if k != "PASSPORT"}
         if pii_checks is not None:
             active_pii = {k: v for k, v in _PII_PATTERNS.items() if k in pii_checks}
         else:
-            active_pii = {k: v for k, v in _PII_PATTERNS.items() if k in _DEFAULT_CHECKS}
+            active_pii = {k: v for k, v in _PII_PATTERNS.items() if k in _DEFAULT_PII_CHECKS}
         if custom_pii_patterns:
             for name, pattern_str in custom_pii_patterns.items():
                 active_pii[name] = re.compile(pattern_str)
@@ -116,12 +129,13 @@ class ExfiltrationGuard:
                 rest = url_lower[len(allowed_lower):]
                 if not rest or rest[0] in ('/', '?', '#', ':'):
                     return True
-            # Hostname-only match (e.g. "api.openai.com")
+            # Hostname-only / exact match
             try:
                 allowed_host = urlparse(allowed).hostname or allowed_lower
             except ValueError:
                 allowed_host = allowed_lower
-            if parsed_host == allowed_host or parsed_host.endswith(f".{allowed_host}"):
+            # Exact match only — no implicit subdomain matching
+            if parsed_host == allowed_host:
                 return True
         return False
 
@@ -152,7 +166,7 @@ class ExfiltrationGuard:
 
         # 1. Endpoint allowlist check
         if not self._is_allowed_endpoint(destination_url):
-            return {
+            verdict = {
                 "verified": False,
                 "risk": "DATA_EXFILTRATION",
                 "destination": destination_url,
@@ -161,13 +175,18 @@ class ExfiltrationGuard:
                     f"{destination_url}. Call blocked by ExfiltrationGuard."
                 ),
             }
+            logger.warning(
+                "ExfiltrationGuard blocked outbound call",
+                extra={"risk": "DATA_EXFILTRATION", "destination": destination_url, "method": method},
+            )
+            return verdict
 
         # 2. PII scan on payload
         if payload:
             pii_hits = self._scan_payload_for_pii(payload)
             if pii_hits:
                 pii_types = ", ".join(hit["type"] for hit in pii_hits)
-                return {
+                verdict = {
                     "verified": False,
                     "risk": "PII_LEAK",
                     "destination": destination_url,
@@ -178,6 +197,16 @@ class ExfiltrationGuard:
                         "Mask or redact before sending."
                     ),
                 }
+                logger.warning(
+                    "ExfiltrationGuard blocked PII in payload",
+                    extra={
+                        "risk": "PII_LEAK",
+                        "destination": destination_url,
+                        "method": method,
+                        "pii_detected": [h["type"] for h in pii_hits],
+                    },
+                )
+                return verdict
 
         return {
             "verified": True,
@@ -189,8 +218,13 @@ class ExfiltrationGuard:
     def _scan_payload_for_pii(self, payload: str) -> List[Dict[str, Any]]:
         """Scan payload string for PII matches. Returns list of findings."""
         findings: List[Dict[str, Any]] = []
+        # Normalise: also scan a copy with spaces/hyphens removed to
+        # catch formatted card numbers like "4111 1111 1111 1111"
+        normalised = re.sub(r"[\s\-]", "", payload)
+
         for pii_type, pattern in self._pii_patterns.items():
-            matches = pattern.findall(payload)
+            text_to_scan = normalised if pii_type == "CREDIT_CARD" else payload
+            matches = pattern.findall(text_to_scan)
             if matches:
                 findings.append({
                     "type": pii_type,

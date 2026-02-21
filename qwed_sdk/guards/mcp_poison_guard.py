@@ -30,7 +30,8 @@ _DEFAULT_INJECTION_PATTERNS: List[str] = [
 
 # URL pattern — catches http(s):// URLs; excludes trailing punctuation
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"',;)\}\]]+", re.IGNORECASE)
-_TRAILING_PUNCT = frozenset('.,;:!?)>\'"]}\'')
+# Centralised trailing-punctuation strip used at both URL-cleaning sites
+_TRAILING_PUNCT = '.,;:!?)>\'"_}]'
 
 
 
@@ -79,14 +80,15 @@ class MCPPoisonGuard:
         patterns = list(_DEFAULT_INJECTION_PATTERNS)
         if custom_injection_patterns:
             patterns.extend(custom_injection_patterns)
+        # re.IGNORECASE covers user-supplied custom patterns; re.DOTALL lets
+        # patterns span newlines. Inline (?i) in default patterns is harmless.
         self._compiled_patterns = [
-            re.compile(p, re.DOTALL) for p in patterns
+            re.compile(p, re.DOTALL | re.IGNORECASE) for p in patterns
         ]
 
     def _is_allowed_url(self, url: str) -> bool:
         """Return True if the URL's hostname is in the allow-list."""
-        # Strip trailing punctuation that the regex may have captured
-        clean_url = url.rstrip('.,;:!?)>\'"}_')
+        clean_url = url.rstrip(_TRAILING_PUNCT)
         try:
             host = urlparse(clean_url).hostname or ""
         except ValueError:
@@ -111,7 +113,7 @@ class MCPPoisonGuard:
 
         # Check for unauthorized URLs (separate from injection patterns)
         for url_match in _URL_PATTERN.finditer(text):
-            url = url_match.group(0).rstrip('.,;:!?)>\'"}')
+            url = url_match.group(0).rstrip(_TRAILING_PUNCT)
             if not self._is_allowed_url(url):
                 flags.append(f"UNAUTHORIZED_URL: {url}")
 
@@ -201,10 +203,23 @@ class MCPPoisonGuard:
         """
         tools: List[Dict[str, Any]] = []
 
-        # Support both flat tool list and Claude Desktop mcpServers format
-        if "tools" in server_config:
-            tools = server_config["tools"]
-        elif "mcpServers" in server_config:
+        # Support both flat tool list and Claude Desktop mcpServers format.
+        # Warn if both keys present — "tools" takes precedence.
+        has_tools = "tools" in server_config
+        has_mcp = "mcpServers" in server_config
+        if has_tools and has_mcp:
+            logger.warning(
+                "verify_server_config: both 'tools' and 'mcpServers' keys present; "
+                "'tools' takes precedence and 'mcpServers' will be ignored."
+            )
+        if has_tools:
+            raw = server_config["tools"]
+            if not isinstance(raw, list):
+                raise ValueError(
+                    f"'tools' must be a list, got {type(raw).__name__!r}"
+                )
+            tools = raw
+        elif has_mcp:
             for _server_name, server_def in server_config["mcpServers"].items():
                 tools.extend(server_def.get("tools", []))
 
