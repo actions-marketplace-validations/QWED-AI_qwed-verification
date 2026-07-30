@@ -11,6 +11,7 @@ Thank you for your interest in contributing! Before you start, please read this 
 | File | Why It Matters |
 |------|----------------|
 | [README.md](./README.md) | Understand what QWED is |
+| [QWED_RULES.md](./QWED_RULES.md) | Canonical enforcement rules for contributors and tools |
 | [docs/architecture.md](./docs/architecture.md) | System design and engine architecture |
 | [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) | Community standards |
 | [SECURITY.md](./SECURITY.md) | How to report vulnerabilities |
@@ -26,7 +27,23 @@ QWED is NOT just another LLM wrapper. Our philosophy:
 1. **LLMs are untrusted translators** - They convert natural language to structured queries
 2. **Symbolic engines are trusted verifiers** - SymPy, Z3, SQLGlot, etc. do the actual verification
 3. **Determinism is required** - Given the same input, output must be identical every time
-4. **LLM fallback is last resort** - Only when deterministic methods cannot handle the query
+4. **LLM output is never proof** - Models may assist with translation or enrichment, but they must not weaken deterministic enforcement
+
+When contributor guidance and enforcement guidance appear to conflict, follow
+`QWED_RULES.md` as the authoritative source for boundary behavior.
+
+### ✅ Approved Paths
+
+Sensitive operations must go through approved wrappers — never bare calls:
+
+| Dangerous Operation | Approved Path |
+|---------------------|---------------|
+| `eval()` / `exec()` | `code_engine.safe_eval()` / `code_engine.safe_exec()` |
+| `parse_expr()` | `safe_parser.safe_parse_expr()` |
+| `os.system()` / `subprocess.Popen()` | `code_engine.safe_shell()` |
+
+Direct calls to these dangerous functions outside their approved wrappers will
+be caught by the CI boundary gate (see `scripts/check_boundary.py`).
 
 ### ❌ Common Misunderstandings
 
@@ -36,6 +53,8 @@ QWED is NOT just another LLM wrapper. Our philosophy:
 | "Add more LLM prompts to fix edge cases" | Add deterministic patterns/rules |
 | "Cache LLM responses" | Deterministic verification doesn't need caching |
 | "Trust LLM confidence scores" | Use symbolic proof verification |
+| "The system prompt will prevent X" | Add an explicit deterministic guard |
+| "The model said it's correct" | Verify with deterministic computation |
 
 ---
 

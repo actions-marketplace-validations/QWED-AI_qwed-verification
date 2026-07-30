@@ -10,13 +10,19 @@ Enhanced Features:
 """
 
 from typing import List, Dict, Any, Optional, Tuple, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+from decimal import Decimal
 import time
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
 import threading
+
+
+logger = logging.getLogger(__name__)
+SECURE_EXECUTION_REQUIRED = "SECURE_EXECUTION_REQUIRED"
+_NONE_CONSENSUS_KEY = object()
 
 
 class VerificationMode(str, Enum):
@@ -39,10 +45,11 @@ class EngineResult:
     engine_name: str
     method: str
     result: Any
-    confidence: float  # 0.0 to 1.0
+    confidence: float  # 0.0 to 1.0 — advisory only
     latency_ms: float
     success: bool
     error: Optional[str] = None
+    status: Optional[str] = None  # DiagnosticStatus value — preserves status through consensus
 
 
 @dataclass
@@ -55,6 +62,7 @@ class ConsensusResult:
     verification_chain: List[EngineResult]
     total_latency_ms: float
     parallel_execution: bool = False
+    status: Optional[str] = None  # DiagnosticStatus — preserved from engines
 
 
 @dataclass
@@ -231,7 +239,6 @@ class ConsensusVerifier:
         "Python": 10000,
         "Z3": 5000,
         "Stats": 10000,
-        "Fact": 3000,
         "Image": 15000
     }
     
@@ -241,7 +248,6 @@ class ConsensusVerifier:
         "Z3": 0.995,       # Formal logic solver
         "Python": 0.99,    # Code execution
         "Stats": 0.98,     # Statistical analysis
-        "Fact": 0.85,      # Depends on external sources
         "Image": 0.80      # VLM-dependent
     }
     
@@ -267,7 +273,9 @@ class ConsensusVerifier:
         self._math_verifier = None
         self._logic_verifier = None
         self._code_verifier = None
+        self._secure_executor = None
         self._stats_verifier = None
+        self._translator = None
         self._reasoning_verifier = None
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
     
@@ -278,6 +286,13 @@ class ConsensusVerifier:
             from qwed_new.core.verifier import VerificationEngine
             self._math_verifier = VerificationEngine()
         return self._math_verifier
+
+    @property
+    def translator(self):
+        if self._translator is None:
+            from qwed_new.core.translator import TranslationLayer
+            self._translator = TranslationLayer()
+        return self._translator
     
     @property
     def logic_verifier(self):
@@ -292,6 +307,13 @@ class ConsensusVerifier:
             from qwed_new.core.code_verifier import CodeVerifier
             self._code_verifier = CodeVerifier()
         return self._code_verifier
+
+    @property
+    def secure_executor(self):
+        if self._secure_executor is None:
+            from qwed_new.core.secure_code_executor import SecureCodeExecutor
+            self._secure_executor = SecureCodeExecutor()
+        return self._secure_executor
     
     @property
     def stats_verifier(self):
@@ -356,7 +378,8 @@ class ConsensusVerifier:
             agreement_status=consensus["status"],
             verification_chain=results,
             total_latency_ms=total_latency,
-            parallel_execution=parallel and len(engine_methods) > 1
+            parallel_execution=parallel and len(engine_methods) > 1,
+            status=consensus.get("diagnostic_status"),
         )
     
     # =========================================================================
@@ -415,10 +438,22 @@ class ConsensusVerifier:
                         confidence=0.0,
                         latency_ms=timeout_seconds * 1000,
                         success=False,
-                        error="Timeout"
+                        error="Timeout",
+                        status="BLOCKED",
                     ))
         except Exception as e:
-            pass
+            # Partial engine results are still usable for consensus calculation.
+            logger.exception("Unexpected async aggregation failure")
+            results.append(EngineResult(
+                engine_name="consensus_orchestrator",
+                method="async_aggregation",
+                result=None,
+                confidence=0.0,
+                latency_ms=(time.time() - start_time) * 1000,
+                success=False,
+                error=str(e),
+                status="BLOCKED",
+            ))
         
         consensus = self._calculate_consensus(results)
         total_latency = (time.time() - start_time) * 1000
@@ -430,7 +465,8 @@ class ConsensusVerifier:
             agreement_status=consensus["status"],
             verification_chain=results,
             total_latency_ms=total_latency,
-            parallel_execution=True
+            parallel_execution=True,
+            status=consensus.get("diagnostic_status"),
         )
     
     # =========================================================================
@@ -454,10 +490,6 @@ class ConsensusVerifier:
             query_lower = query.lower()
             if any(kw in query_lower for kw in ["average", "mean", "median", "variance"]):
                 engines.append(("Stats", self._verify_with_stats))
-            
-            # Add fact for knowledge queries
-            if any(kw in query_lower for kw in ["capital", "president", "population"]):
-                engines.append(("Fact", self._verify_with_fact))
         
         return engines
     
@@ -503,7 +535,8 @@ class ConsensusVerifier:
                     confidence=0.0,
                     latency_ms=0,
                     success=False,
-                    error=str(e)
+                    error=str(e),
+                    status="BLOCKED",
                 ))
         
         return results
@@ -526,7 +559,8 @@ class ConsensusVerifier:
                         confidence=0.0,
                         latency_ms=0,
                         success=False,
-                        error=str(e)
+                        error=str(e),
+                        status="BLOCKED",
                     ))
         
         return results
@@ -542,14 +576,28 @@ class ConsensusVerifier:
             expression, expected = self._parse_math_query(query)
             result = self.math_verifier.verify_math(expression, expected)
             latency = (time.time() - start) * 1000
-            
+            is_correct = result.get("is_correct", False)
+
             return EngineResult(
                 engine_name="SymPy",
                 method="symbolic_math",
                 result=result.get("calculated_value"),
-                confidence=1.0 if result["is_correct"] else 0.0,
+                confidence=1.0 if is_correct else 0.0,
                 latency_ms=latency,
-                success=True
+                success=is_correct,
+                status="VERIFIED" if is_correct else "UNVERIFIABLE",
+            )
+        except ValueError as e:
+            # Translation failure — blocked, not fabricated
+            return EngineResult(
+                engine_name="SymPy",
+                method="symbolic_math",
+                result=None,
+                confidence=0.0,
+                latency_ms=(time.time() - start) * 1000,
+                success=False,
+                error=str(e),
+                status="BLOCKED",
             )
         except Exception as e:
             return EngineResult(
@@ -559,50 +607,49 @@ class ConsensusVerifier:
                 confidence=0.0,
                 latency_ms=(time.time() - start) * 1000,
                 success=False,
-                error=str(e)
+                error=str(e),
+                status="BLOCKED",
             )
     
     def _verify_with_code(self, query: str) -> EngineResult:
-        """Verify by executing Python code."""
+        """Verify by executing Python code in the secure Docker sandbox."""
         start = time.time()
         try:
             code = self._generate_verification_code(query)
-            
-            # Safety check
+
             safety_result = self.code_verifier.verify_code(code)
             if not safety_result["is_safe"]:
                 return EngineResult(
-                    engine_name="Python",
-                    method="code_execution",
-                    result=None,
-                    confidence=0.0,
-                    latency_ms=(time.time() - start) * 1000,
-                    success=False,
-                    error=f"Unsafe code: {safety_result['issues']}"
+                    engine_name="Python", method="code_execution",
+                    result=None, confidence=0.0,
+                    latency_ms=(time.time() - start) * 1000, success=False,
+                    error=f"Unsafe code: {safety_result['issues']}",
+                    status="BLOCKED",
                 )
-            
-            # Execute
-            from qwed_new.core.code_executor import CodeExecutor
-            executor = CodeExecutor()
-            output = executor.execute(code)
-            
+
+            success, error, output = self.secure_executor.execute(code, {})
+            if not success:
+                if error == "SECURE_RUNTIME_UNAVAILABLE":
+                    error = SECURE_EXECUTION_REQUIRED
+                return EngineResult(
+                    engine_name="Python", method="code_execution",
+                    result=None, confidence=0.0,
+                    latency_ms=(time.time() - start) * 1000, success=False,
+                    error=error, status="BLOCKED",
+                )
+
             return EngineResult(
-                engine_name="Python",
-                method="code_execution",
-                result=output,
-                confidence=0.99,
-                latency_ms=(time.time() - start) * 1000,
-                success=True
+                engine_name="Python", method="code_execution",
+                result=output, confidence=0.99,
+                latency_ms=(time.time() - start) * 1000, success=True,
+                status="VERIFIED",
             )
         except Exception as e:
             return EngineResult(
-                engine_name="Python",
-                method="code_execution",
-                result=None,
-                confidence=0.0,
-                latency_ms=(time.time() - start) * 1000,
-                success=False,
-                error=str(e)
+                engine_name="Python", method="code_execution",
+                result=None, confidence=0.0,
+                latency_ms=(time.time() - start) * 1000, success=False,
+                error=str(e), status="BLOCKED",
             )
     
     def _verify_with_logic(self, query: str) -> EngineResult:
@@ -611,24 +658,21 @@ class ConsensusVerifier:
         try:
             variables, constraints = self._model_as_logic(query)
             result = self.logic_verifier.verify_logic(variables, constraints)
-            
+            is_sat = result.is_verified
+
             return EngineResult(
-                engine_name="Z3",
-                method="constraint_solving",
-                result=result.status,
-                confidence=0.995 if result.status == "SAT" else 0.0,
-                latency_ms=(time.time() - start) * 1000,
-                success=True
+                engine_name="Z3", method="constraint_solving",
+                result=result.developer_fields.get("deterministic_verdict", result.status.value),
+                confidence=0.995 if is_sat else 0.0,
+                latency_ms=(time.time() - start) * 1000, success=is_sat,
+                status="VERIFIED" if is_sat else "UNVERIFIABLE",
             )
         except Exception as e:
             return EngineResult(
-                engine_name="Z3",
-                method="constraint_solving",
-                result=None,
-                confidence=0.0,
-                latency_ms=(time.time() - start) * 1000,
-                success=False,
-                error=str(e)
+                engine_name="Z3", method="constraint_solving",
+                result=None, confidence=0.0,
+                latency_ms=(time.time() - start) * 1000, success=False,
+                error=str(e), status="BLOCKED",
             )
     
     def _verify_with_stats(self, query: str) -> EngineResult:
@@ -651,81 +695,86 @@ class ConsensusVerifier:
                 result = None
             
             return EngineResult(
-                engine_name="Stats",
-                method="statistical_analysis",
+                engine_name="Stats", method="statistical_analysis",
                 result=result,
-                confidence=0.98 if result else 0.0,
+                confidence=0.98 if result is not None else 0.0,
                 latency_ms=(time.time() - start) * 1000,
-                success=result is not None
+                success=result is not None,
+                status="VERIFIED" if result is not None else "UNVERIFIABLE",
             )
         except Exception as e:
             return EngineResult(
-                engine_name="Stats",
-                method="statistical_analysis",
-                result=None,
-                confidence=0.0,
-                latency_ms=(time.time() - start) * 1000,
-                success=False,
-                error=str(e)
+                engine_name="Stats", method="statistical_analysis",
+                result=None, confidence=0.0,
+                latency_ms=(time.time() - start) * 1000, success=False,
+                error=str(e), status="BLOCKED",
             )
     
-    def _verify_with_fact(self, query: str) -> EngineResult:
+    def _verify_with_fact(self, _query: str) -> EngineResult:
         """Verify using Fact engine."""
         start = time.time()
-        try:
-            from qwed_new.core.fact_verifier import FactVerifier
-            verifier = FactVerifier()
-            
-            # Simple extraction - in production would use proper NER
-            result = verifier.verify_fact(query, query)  # Self-reference for demo
-            
-            return EngineResult(
-                engine_name="Fact",
-                method="knowledge_retrieval",
-                result=result.get("verdict"),
-                confidence=result.get("confidence", 0.5),
-                latency_ms=(time.time() - start) * 1000,
-                success=True
-            )
-        except Exception as e:
-            return EngineResult(
-                engine_name="Fact",
-                method="knowledge_retrieval",
-                result=None,
-                confidence=0.0,
-                latency_ms=(time.time() - start) * 1000,
-                success=False,
-                error=str(e)
-            )
+        return EngineResult(
+            engine_name="Fact",
+            method="knowledge_retrieval",
+            result=None,
+            confidence=0.0,
+            latency_ms=(time.time() - start) * 1000,
+            success=False,
+            error="External fact context is required for consensus fact verification"
+        )
     
     # =========================================================================
     # Consensus Calculation
     # =========================================================================
     
     def _calculate_consensus(self, results: List[EngineResult]) -> Dict[str, Any]:
-        """Calculate weighted consensus from engine results."""
+        """Calculate weighted consensus from engine results.
+
+        Preserves DiagnosticStatus through aggregation:
+        - BLOCKED engines are filtered out for counting but prevent VERIFIED
+        - All BLOCKED → consensus BLOCKED
+        - Any BLOCKED → maximum outcome is UNVERIFIABLE (fail-closed)
+        - All UNVERIFIABLE → consensus UNVERIFIABLE
+        - No BLOCKED, unanimous → VERIFIED
+        """
         if not results:
-            return {"answer": None, "confidence": 0.0, "status": "no_results"}
-        
-        successful = [r for r in results if r.success]
-        
+            return {"answer": None, "confidence": 0.0, "status": "no_results", "diagnostic_status": "UNVERIFIABLE"}
+
+        if any(r.error == SECURE_EXECUTION_REQUIRED for r in results):
+            return {"answer": None, "confidence": 0.0, "status": "blocked_secure_execution", "diagnostic_status": "BLOCKED"}
+
+        blocked = [r for r in results if r.status == "BLOCKED"]
+        active = [r for r in results if r.status != "BLOCKED"]
+
+        if not active:
+            blocked_errors = [r.error for r in blocked if r.error]
+            return {
+                "answer": None,
+                "confidence": 0.0,
+                "status": "blocked",
+                "diagnostic_status": "BLOCKED",
+                "errors": blocked_errors,
+            }
+
+        successful = [r for r in active if r.success]
+
         if not successful:
-            return {"answer": None, "confidence": 0.0, "status": "all_failed"}
-        
+            return {"answer": None, "confidence": 0.0, "status": "all_failed", "diagnostic_status": "UNVERIFIABLE"}
+
         # Weight answers by engine reliability
         weighted_answers: Dict[str, float] = {}
+        answer_values: Dict[str, Any] = {}
         for r in successful:
-            answer_key = str(r.result)
+            answer_key = self._consensus_answer_key(r.result)
             weight = self.ENGINE_WEIGHTS.get(r.engine_name, 0.5) * r.confidence
             weighted_answers[answer_key] = weighted_answers.get(answer_key, 0) + weight
-        
-        # Find best answer
+            answer_values.setdefault(answer_key, r.result)
+
         best_answer = max(weighted_answers, key=weighted_answers.get)
         total_weight = sum(weighted_answers.values())
         best_weight = weighted_answers[best_answer]
-        
-        # Determine agreement status
-        if len(set(str(r.result) for r in successful)) == 1:
+
+        if len({self._consensus_answer_key(r.result) for r in successful}) == 1:
             status = "unanimous"
             confidence = min(0.999, best_weight / len(successful))
         elif best_weight > total_weight / 2:
@@ -735,40 +784,50 @@ class ConsensusVerifier:
             status = "split"
             confidence = min(0.7, best_weight / total_weight)
         
+        # Fail closed: a BLOCKED engine means verification did not fully complete,
+        # so the outcome can never be VERIFIED even if survivors agree.
+        diagnostic_status = "VERIFIED" if (status == "unanimous" and not blocked) else "UNVERIFIABLE"
+
         return {
-            "answer": best_answer,
+            "answer": answer_values[best_answer],
             "confidence": confidence,
-            "status": status
+            "status": status,
+            "diagnostic_status": diagnostic_status,
         }
+
+    @staticmethod
+    def _consensus_answer_key(result: Any) -> str:
+        """Normalize consensus answer keys without collapsing null to the string 'None'."""
+        if result is None:
+            return _NONE_CONSENSUS_KEY
+        return str(result)
     
     # =========================================================================
     # Helper Methods
     # =========================================================================
     
-    def _parse_math_query(self, query: str) -> Tuple[str, float]:
-        """Parse query into expression and expected value."""
+    def _parse_math_query(self, query: str) -> Tuple[str, Decimal]:
+        """Parse query into expression and expected value.
+        
+        Raises ValueError on translation failure — no fabricated fallback.
+        claimed_answer is guaranteed non-null by the Pydantic schema.
+        """
         try:
             from qwed_new.core.translator import TranslationLayer
             translator = TranslationLayer()
             task = translator.translate(query)
-            return task.expression, task.expected_value or 0.0
-        except:
-            # Fallback: extract simple expression
-            import re
-            nums = re.findall(r"\d+", query)
-            if len(nums) >= 2:
-                return f"{nums[0]} + {nums[1]}", float(nums[0]) + float(nums[1])
-            return "0", 0.0
+        except Exception as exc:
+            raise ValueError(f"Query translation failed: {exc}") from exc
+
+        return task.expression, Decimal(str(task.claimed_answer))
     
     def _generate_verification_code(self, query: str) -> str:
         """Generate Python code for verification."""
         try:
-            from qwed_new.core.translator import TranslationLayer
-            translator = TranslationLayer()
-            task = translator.translate(query)
-            return f"print({task.expression})"
-        except:
-            return "print('Unable to generate code')"
+            task = self.translator.translate(query)
+            return f"result = {task.expression}"
+        except Exception as e:
+            raise ValueError(f"Verification code generation failed: {e}") from e
     
     def _model_as_logic(self, query: str) -> Tuple[Dict, List]:
         """Model query as logic constraints."""
@@ -776,8 +835,8 @@ class ConsensusVerifier:
             from qwed_new.core.translator import TranslationLayer
             translator = TranslationLayer()
             return translator.translate_logic(query)
-        except:
-            return {}, []
+        except Exception as e:
+            raise ValueError(f"Logic translation failed: {e}") from e
     
     # =========================================================================
     # Health Monitoring

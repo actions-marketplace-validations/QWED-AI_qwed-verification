@@ -14,15 +14,14 @@ Usage:
     chain = LLMChain(llm=llm, callbacks=[QWEDVerificationCallback()])
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
-import json
 
 # Import QWED client
 try:
-    from qwed_sdk import QWEDClient, QWEDAsyncClient
+    from qwed_sdk import QWEDClient
 except ImportError:
-    from ..client import QWEDClient, QWEDAsyncClient
+    from ..client import QWEDClient
 
 
 # ============================================================================
@@ -32,8 +31,7 @@ except ImportError:
 try:
     from langchain.tools import BaseTool
     from langchain.callbacks.base import BaseCallbackHandler
-    from langchain.schema import LLMResult, AgentAction, AgentFinish
-    from langchain.schema.messages import BaseMessage
+    from langchain.schema import LLMResult, AgentFinish
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
@@ -255,6 +253,7 @@ class QWEDVerificationCallback(BaseCallbackHandler if LANGCHAIN_AVAILABLE else o
                     "status": result.status
                 })
             except Exception:
+                # Optional auto-verification should not interrupt LangChain execution.
                 pass
         
         # Detect and verify code blocks
@@ -269,6 +268,7 @@ class QWEDVerificationCallback(BaseCallbackHandler if LANGCHAIN_AVAILABLE else o
                         "vulnerabilities": len(result.result.get("vulnerabilities", []))
                     })
             except Exception:
+                # Optional auto-verification should not interrupt LangChain execution.
                 pass
         
         # Detect and verify SQL
@@ -282,6 +282,7 @@ class QWEDVerificationCallback(BaseCallbackHandler if LANGCHAIN_AVAILABLE else o
                         "verified": result.verified
                     })
             except Exception:
+                # Optional auto-verification should not interrupt LangChain execution.
                 pass
         
         self.verification_results.append(results)

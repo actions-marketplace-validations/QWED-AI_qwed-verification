@@ -1,7 +1,19 @@
-
 import unittest
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-from qwed_sdk.qwed_local import QWEDLocal
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from qwed_sdk import qwed_local as qwed_local_module
+
+QWEDLocal = qwed_local_module.QWEDLocal
+
+
+def _build_test_token(provider: str) -> str:
+    return "-".join(("unit", "test", "token", provider))
 
 
 class TestQWEDLocalCoverage(unittest.TestCase):
@@ -9,28 +21,30 @@ class TestQWEDLocalCoverage(unittest.TestCase):
 
     def test_init_openai_provider(self):
         """Test initialization with OpenAI provider."""
-        with patch("qwed_sdk.qwed_local.OpenAI") as MockOpenAI:
-            client = QWEDLocal(provider="openai", api_key="sk-test", cache=False)
+        openai_test_token = _build_test_token("openai")
+        with patch.object(qwed_local_module, "OpenAI") as MockOpenAI:
+            client = QWEDLocal(provider="openai", api_key=openai_test_token, cache=False)
             self.assertEqual(client.client_type, "openai")
-            MockOpenAI.assert_called_with(api_key="sk-test")
+            MockOpenAI.assert_called_with(api_key=openai_test_token)
 
     def test_init_anthropic_provider(self):
         """Test initialization with Anthropic provider."""
-        with patch("qwed_sdk.qwed_local.Anthropic") as MockAnthropic:
-            client = QWEDLocal(provider="anthropic", api_key="sk-ant", cache=False)
+        anthropic_test_token = _build_test_token("anthropic")
+        with patch.object(qwed_local_module, "Anthropic") as MockAnthropic:
+            client = QWEDLocal(provider="anthropic", api_key=anthropic_test_token, cache=False)
             self.assertEqual(client.client_type, "anthropic")
-            MockAnthropic.assert_called_with(api_key="sk-ant")
+            MockAnthropic.assert_called_with(api_key=anthropic_test_token)
 
     def test_init_gemini_provider(self):
         """Test initialization with Gemini provider."""
-        with patch("qwed_sdk.qwed_local.genai") as MockGenAI:
+        with patch.object(qwed_local_module, "genai") as MockGenAI:
             client = QWEDLocal(provider="gemini", api_key="AIza", cache=False)
             self.assertEqual(client.client_type, "gemini")
             MockGenAI.configure.assert_called_with(api_key="AIza")
 
     def test_init_custom_base_url(self):
         """Test initialization with custom base_url (Ollama style)."""
-        with patch("qwed_sdk.qwed_local.OpenAI") as MockOpenAI:
+        with patch.object(qwed_local_module, "OpenAI") as MockOpenAI:
             client = QWEDLocal(base_url="http://localhost:11434", cache=False)
             self.assertEqual(client.client_type, "openai")
             MockOpenAI.assert_called()
@@ -64,8 +78,8 @@ class TestQWEDLocalCoverage(unittest.TestCase):
 
     def test_check_verifiers_missing(self):
         """Test _check_verifiers when deps are missing."""
-        with patch("qwed_sdk.qwed_local.sympy", new=None), \
-             patch("qwed_sdk.qwed_local.Solver", new=None):
+        with patch.object(qwed_local_module, "sympy", new=None), \
+             patch.object(qwed_local_module, "Solver", new=None):
             client = QWEDLocal(base_url="http://mock", cache=False)
             self.assertFalse(client.has_sympy)
             self.assertFalse(client.has_z3)
@@ -76,48 +90,47 @@ class TestQWEDLocalCoverage(unittest.TestCase):
         
         # Reset counters
         mod._verification_count = 0
-        mod._has_shown_nudge = False
-        
-        # 1st time - no show
-        mod._show_github_nudge()
-        self.assertFalse(mod._has_shown_nudge)
-        
-        # 2nd time - no show
-        mod._show_github_nudge()
-        
-        # 3rd time - SHOW
-        mod._show_github_nudge()
-        self.assertTrue(mod._has_shown_nudge)
-        
+
+        with patch('builtins.print') as mock_print:
+            # 1st time - no show
+            mod._show_github_nudge()
+            self.assertEqual(mock_print.call_count, 0)
+
+            # 2nd time - no show
+            mod._show_github_nudge()
+            self.assertEqual(mock_print.call_count, 0)
+
+            # 3rd time - SHOW
+            mod._show_github_nudge()
+            self.assertGreater(mock_print.call_count, 0)
+
         # 10th time - SHOW again
         mod._verification_count = 9
-        mod._show_github_nudge()
+        with patch('builtins.print') as mock_print:
+            mod._show_github_nudge()
+            self.assertGreater(mock_print.call_count, 0)
 
     def test_show_github_nudge_no_color(self):
         """Test nudge without color (non-colored fallback path)."""
         from qwed_sdk import qwed_local as mod
         
         old_count = mod._verification_count
-        old_shown = mod._has_shown_nudge
         old_has_color = mod.HAS_COLOR
         
         try:
             # Directly set the module-level variable
             mod.HAS_COLOR = False
             mod._verification_count = 2
-            mod._has_shown_nudge = False
             
             with patch('builtins.print') as mock_print:
                 mod._show_github_nudge()
-                
-                self.assertTrue(mod._has_shown_nudge)
+                self.assertGreater(mock_print.call_count, 0)
                 
                 # Verify print was called with non-colored separator
                 args, _ = mock_print.call_args_list[0]
                 self.assertIn("─" * 60, args[0])
         finally:
             mod._verification_count = old_count
-            mod._has_shown_nudge = old_shown
             mod.HAS_COLOR = old_has_color
 
     def test_cache_hit_printing_logic(self):

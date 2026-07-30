@@ -28,6 +28,7 @@ wheels/
 venv/
 ENV/
 env/
+test_venv/
 
 # IDEs
 .vscode/
@@ -55,6 +56,30 @@ Thumbs.db
 
 # Node.js
 node_modules/
+package-lock.json
 npm-debug.log
 yarn-error.log
 .pnpm-debug.log
+.aider*
+
+# Debug / test output artifacts
+out.txt
+git_logs*.txt
+pytest_out.txt
+test_*.txt
+test_*.log
+err.log
+
+# Coverage
+coverage.xml
+htmlcov/
+.coverage
+*.py,cover
+
+# Local helper scripts (not part of project)
+check_prs.py
+update_cache.py
+fix_cache.py
+
+# Kubernetes secrets (contain credentials)
+deploy/kubernetes/secret.yaml

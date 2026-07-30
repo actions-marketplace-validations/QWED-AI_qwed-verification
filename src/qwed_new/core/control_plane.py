@@ -5,6 +5,7 @@ This module orchestrates the entire request lifecycle:
 Request -> Policy Check -> Routing -> Translation -> Verification -> Response
 """
 
+import hashlib
 import time
 import logging
 from typing import Dict, Any, Optional
@@ -17,6 +18,7 @@ from qwed_new.core.schemas import MathVerificationTask
 from qwed_new.core.observability import metrics_collector
 from qwed_new.core.security import EnhancedSecurityGateway, redact_pii
 from qwed_new.core.output_sanitizer import OutputSanitizer
+from qwed_new.core.diagnostics import DiagnosticResult, enforce_trust_decision
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,34 @@ class ControlPlane:
         # Enterprise security components
         self.security_gateway = EnhancedSecurityGateway()
         self.output_sanitizer = OutputSanitizer()
+
+    @staticmethod
+    def _build_math_trust_boundary(
+        provider: str,
+        verification_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Describe exactly what the math pipeline did and did not prove."""
+        expression_status = verification_result.get("status")
+        deterministic_evaluation = expression_status in {"VERIFIED", "CORRECTION_NEEDED"}
+        return {
+            "query_interpretation_source": "llm_translation",
+            "query_semantics_verified": False,
+            "verification_scope": "translated_expression_only",
+            "deterministic_expression_evaluation": deterministic_evaluation,
+            "formal_proof": False,
+            "translation_claim_self_consistent": verification_result.get("is_correct"),
+            "provider_used": provider,
+        }
+
+    @staticmethod
+    def _determine_math_response_status(verification_result: Dict[str, Any]) -> str:
+        """Avoid representing translated-query evaluation as a proven user-query verdict."""
+        expression_status = verification_result.get("status")
+        if expression_status in {"VERIFIED", "CORRECTION_NEEDED"}:
+            return "INCONCLUSIVE"
+        if expression_status == "SYNTAX_ERROR":
+            return "ERROR"
+        return expression_status or "ERROR"
         
     async def process_natural_language(
         self, 
@@ -99,14 +129,43 @@ class ControlPlane:
                 expression=task.expression,
                 expected_value=task.claimed_answer
             )
+            response_status = self._determine_math_response_status(verification_result)
+            trust_boundary = self._build_math_trust_boundary(provider, verification_result)
+            trust_boundary["overall_status"] = response_status
+
+            # 4.5 Trust Boundary Enforcement (Issue #191)
+            # Convert legacy dict to DiagnosticResult for enforcement.
+            # Advisory mode (require_attestation=False) until engines are
+            # fully migrated to DiagnosticResult.
+            try:
+                dr = DiagnosticResult.from_legacy_dict(verification_result, engine="math")
+                enforced = enforce_trust_decision(
+                    dr,
+                    require_attestation=False,
+                    query=query,
+                )
+                trust_boundary["trust_enforced"] = enforced.status.value
+                trust_boundary["attestation_policy"] = "advisory"
+            except ValueError as exc:
+                # Legacy VERIFIED results without proof_ref cannot be
+                # represented as DiagnosticResult (from_legacy_dict raises).
+                # Log the specific reason and mark enforcement as skipped.
+                logger.warning(
+                    "trust_boundary.enforcement_skipped query_hash=%s reason=from_legacy_dict error=%s",
+                    hashlib.sha256(query.encode()).hexdigest()[:16] if query else "unknown",
+                    exc,
+                )
+                trust_boundary["trust_enforced"] = "not_applicable"
+                trust_boundary["attestation_policy"] = "advisory"
             
             # 5. Response Construction
             response = {
-                "status": verification_result["status"],
+                "status": response_status,
                 "final_answer": verification_result.get("calculated_value"),
                 "user_query": query,
                 "translation": task.dict(),
                 "verification": verification_result,
+                "trust_boundary": trust_boundary,
                 "provider_used": provider,
                 "latency_ms": (time.time() - start_time) * 1000
             }
@@ -172,6 +231,7 @@ class ControlPlane:
 
         # 2. Routing
         provider = self.router.route(query, preferred_provider)
+        last_known_provider = provider
 
         # 3. DSL Logic Pipeline
         try:
@@ -181,13 +241,15 @@ class ControlPlane:
                 query=query,
                 provider=provider
             )
+            resolved_provider = result.provider_used or provider
+            last_known_provider = resolved_provider
             
             response = {
                 "status": result.status,
                 "model": result.model,
                 "dsl_code": result.dsl_code, # Expose DSL for transparency
                 "error": result.error,
-                "provider_used": provider,
+                "provider_used": resolved_provider,
                 "latency_ms": (time.time() - start_time) * 1000
             }
             
@@ -203,7 +265,7 @@ class ControlPlane:
                     organization_id=organization_id,
                     status=response["status"],
                     latency_ms=response["latency_ms"],
-                    provider=provider
+                    provider=resolved_provider
                 )
             
             return response
@@ -217,6 +279,7 @@ class ControlPlane:
             return {
                 "status": "ERROR",
                 "error": "Internal pipeline error",
+                "provider_used": last_known_provider,
                 "latency_ms": (time.time() - start_time) * 1000
             }
 

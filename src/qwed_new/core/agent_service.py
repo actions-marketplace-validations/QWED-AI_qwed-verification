@@ -5,14 +5,18 @@ Implements the QWED-Agent specification for AI agent verification.
 Provides registration, verification, budget management, and audit logging.
 """
 
-import hashlib
 import time
 import uuid
+import hmac
+import json
+import threading
+import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Set
 from enum import Enum
-import json
+
+from qwed_new.guards.doom_loop_guard import ProgressAwareDoomLoopGuard
 
 
 class AgentType(Enum):
@@ -106,6 +110,8 @@ class ActionContext:
     conversation_id: Optional[str] = None
     step_number: Optional[int] = None
     user_intent: Optional[str] = None
+    pre_action_state_hash: Optional[str] = None
+    state_source: Optional[str] = None
 
 
 @dataclass
@@ -161,11 +167,26 @@ class AgentService:
         "verify_logic": "logic",
         "verify_fact": "fact",
     }
+    MAX_CONVERSATION_STEPS = 50
+    MAX_CONSECUTIVE_IDENTICAL_ACTIONS = 2
+    # Server-side flag: when True, callers MUST provide state hash for LOOP-004.
+    # Set to False during gradual rollout; set to True once all callers are updated.
+    DOOM_LOOP_GUARD_REQUIRED = False
+    RISK_RANKS = {
+        RiskLevel.LOW: 0,
+        RiskLevel.MEDIUM: 1,
+        RiskLevel.HIGH: 2,
+        RiskLevel.CRITICAL: 3,
+    }
     
     def __init__(self):
         self._agents: Dict[str, AgentInfo] = {}
         self._activity_logs: List[ActivityLog] = []
         self._suspended_agents: Set[str] = set()
+        self._conversation_state: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._conversation_reservations: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._conversation_state_lock = threading.Lock()
+        self._doom_loop_guard = ProgressAwareDoomLoopGuard()
     
     def _generate_agent_id(self) -> str:
         return f"agent_{uuid.uuid4().hex[:12]}"
@@ -253,13 +274,16 @@ class AgentService:
     def verify_agent_token(self, agent_id: str, agent_token: str) -> bool:
         """Verify agent authentication"""
         agent = self._agents.get(agent_id)
-        return agent is not None and agent.agent_token == agent_token
+        return (
+            agent is not None
+            and hmac.compare_digest(agent.agent_token, agent_token)
+        )
     
     def verify_action(
         self,
         agent_id: str,
         action: AgentAction,
-        context: Optional[ActionContext] = None,
+        context: ActionContext,
         require_attestation: bool = False,
         risk_threshold: str = "medium",
     ) -> Dict[str, Any]:
@@ -280,6 +304,13 @@ class AgentService:
                 "decision": AgentDecision.DENIED.value,
                 "error": {"code": "QWED-AGENT-003", "message": "Agent suspended"},
             }
+
+        context_error, context_state = self._enforce_action_context(agent_id, action, context)
+        if context_error:
+            return {
+                "decision": AgentDecision.DENIED.value,
+                "error": context_error,
+            }
         
         # Reset budget counters if needed
         self._reset_budget_if_needed(agent.budget)
@@ -287,6 +318,7 @@ class AgentService:
         # Check budget
         budget_check = self._check_budget(agent)
         if not budget_check["passed"]:
+            self._release_action_context(context_state)
             return {
                 "decision": AgentDecision.BUDGET_EXCEEDED.value,
                 "error": {
@@ -295,26 +327,37 @@ class AgentService:
                     "details": budget_check.get("details", {}),
                 },
             }
+
+        engine = self._resolve_action_engine(action.action_type)
+        if not self._is_registered_action(action.action_type):
+            self._release_action_context(context_state)
+            return {
+                "decision": AgentDecision.DENIED.value,
+                "error": {
+                    "code": "QWED-AGENT-ACTION-001",
+                    "message": (
+                        f"Unknown action_type '{action.action_type}' cannot be verified "
+                        "without explicit registered semantics"
+                    ),
+                },
+            }
         
         # Assess risk level
         risk_level = self._assess_risk(action, agent)
         
         # Run verification checks
-        checks = self._run_verification_checks(agent, action, risk_level)
+        checks = self._run_verification_checks(agent, action, risk_level, engine)
         passed = [c.name for c in checks if c.passed]
         failed = [c.name for c in checks if not c.passed]
         
         # Determine decision
-        if failed:
-            decision = AgentDecision.DENIED
-        elif risk_level.value > RiskLevel[risk_threshold.upper()].value:
-            if agent.trust_level.value < TrustLevel.AUTONOMOUS.value:
-                decision = AgentDecision.PENDING
-            else:
-                decision = AgentDecision.APPROVED
-        else:
-            decision = AgentDecision.APPROVED
+        decision = self._determine_decision(
+            failed, risk_level, risk_threshold, agent.trust_level,
+        )
         
+        # Commit or release action context based on decision.
+        self._finalize_action_context(decision, context, context_state)
+
         # Update budget tracking
         if decision == AgentDecision.APPROVED:
             estimated_cost = 0.01  # Base cost
@@ -336,11 +379,11 @@ class AgentService:
         )
         self._activity_logs.append(log)
         
-        response = {
+        return {
             "decision": decision.value,
             "verification": {
                 "status": "VERIFIED" if decision == AgentDecision.APPROVED else "FAILED",
-                "engine": self.ACTION_ENGINES.get(action.action_type, "security"),
+                "engine": engine,
                 "risk_level": risk_level.value,
                 "checks_passed": passed,
                 "checks_failed": failed,
@@ -350,8 +393,292 @@ class AgentService:
                 "hourly_requests": agent.budget.max_requests_per_hour - agent.budget.current_hour_requests,
             },
         }
-        
-        return response
+
+    def _resolve_action_engine(self, action_type: str) -> Optional[str]:
+        """Return the registered engine label for an action, or None if it has no engine binding."""
+        if action_type in self.ACTION_ENGINES:
+            return self.ACTION_ENGINES[action_type]
+        if action_type in self.TOOL_RISK_LEVELS:
+            return "tool_control"
+        return None
+
+    def _is_registered_action(self, action_type: str) -> bool:
+        """True when an action_type has explicit semantics in QWED."""
+        return action_type in self.ACTION_ENGINES or action_type in self.TOOL_RISK_LEVELS
+
+    def _determine_decision(
+        self,
+        failed: list,
+        risk_level: RiskLevel,
+        risk_threshold: str,
+        trust_level: TrustLevel,
+    ) -> AgentDecision:
+        """Map verification results + risk to a deterministic decision."""
+        if failed:
+            return AgentDecision.DENIED
+        if self._risk_exceeds_threshold(risk_level, RiskLevel[risk_threshold.upper()]):
+            if trust_level.value < TrustLevel.AUTONOMOUS.value:
+                return AgentDecision.PENDING
+            return AgentDecision.APPROVED
+        return AgentDecision.APPROVED
+
+    def _finalize_action_context(
+        self,
+        decision: AgentDecision,
+        context: ActionContext,
+        context_state: Optional[Dict[str, Any]],
+    ) -> None:
+        """Commit or release action context based on decision.
+
+        LOOP-004 fingerprint is only committed on APPROVED.
+        PENDING actions still commit step/replay tracking (LOOP-001/002/003)
+        but clear the fingerprint since PENDING may be rejected later.
+        """
+        if decision in {AgentDecision.APPROVED, AgentDecision.PENDING}:
+            if decision == AgentDecision.PENDING and context_state is not None:
+                context_state["loop_004_fingerprint"] = None
+            self._commit_action_context(context, context_state)
+        else:
+            self._release_action_context(context_state)
+
+    def _enforce_action_context(
+        self,
+        agent_id: str,
+        action: AgentAction,
+        context: Optional[ActionContext],
+    ) -> tuple[Optional[Dict[str, str]], Optional[Dict[str, Any]]]:
+        """Require deterministic action context and detect replay/loop patterns."""
+        if context is None or not context.conversation_id or context.step_number is None:
+            return ({
+                "code": "QWED-AGENT-CTX-001",
+                "message": "Action context with conversation_id and step_number is required",
+            }, None)
+
+        if context.step_number < 1:
+            return ({
+                "code": "QWED-AGENT-CTX-002",
+                "message": "step_number must be >= 1",
+            }, None)
+
+        if context.step_number > self.MAX_CONVERSATION_STEPS:
+            return ({
+                "code": "QWED-AGENT-LOOP-001",
+                "message": "Conversation step limit exceeded",
+            }, None)
+
+        state_key = (agent_id, context.conversation_id)
+        try:
+            fingerprint = self._action_fingerprint(action)
+        except TypeError as exc:
+            return ({
+                "code": "QWED-AGENT-STATE-004",
+                "message": f"Action parameters must be deterministic JSON-compatible values: {exc}",
+            }, None)
+
+        with self._conversation_state_lock:
+            reservation = self._conversation_reservations.get(state_key)
+            if reservation and context.step_number <= reservation["step_number"]:
+                return ({
+                    "code": "QWED-AGENT-LOOP-002",
+                    "message": "Replay or in-flight action step detected",
+                }, None)
+
+            state = self._conversation_state.get(
+                state_key,
+                {"last_step": 0, "last_fingerprint": None, "repeat_count": 0},
+            )
+
+            if context.step_number <= state["last_step"]:
+                return ({
+                    "code": "QWED-AGENT-LOOP-002",
+                    "message": "Replay or out-of-order action step detected",
+                }, None)
+
+            repeat_count = (
+                state["repeat_count"] + 1
+                if fingerprint == state["last_fingerprint"]
+                else 1
+            )
+
+            if repeat_count > self.MAX_CONSECUTIVE_IDENTICAL_ACTIONS:
+                return ({
+                    "code": "QWED-AGENT-LOOP-003",
+                    "message": "Repetitive action loop detected",
+                }, None)
+
+            next_state = {
+                "last_step": context.step_number,
+                "last_fingerprint": fingerprint,
+                "repeat_count": repeat_count,
+            }
+            reservation_id = uuid.uuid4().hex
+            self._conversation_reservations[state_key] = {
+                "step_number": context.step_number,
+                "reservation_id": reservation_id,
+            }
+
+        # --- LOOP-004: Progress-aware no-progress detection ---
+        loop_004_result = self._check_progress_doom_loop(
+            agent_id, action, context, state_key, reservation_id,
+        )
+        if isinstance(loop_004_result, dict) and "code" in loop_004_result:
+            return (loop_004_result, None)
+
+        return None, {
+            "state_key": state_key,
+            "next_state": next_state,
+            "reservation_id": reservation_id,
+            "loop_004_fingerprint": loop_004_result,  # str or None
+            "agent_id": agent_id,
+            "conversation_id": context.conversation_id,
+        }
+
+    def _check_progress_doom_loop(
+        self,
+        agent_id: str,
+        action: AgentAction,
+        context: ActionContext,
+        state_key: tuple,
+        reservation_id: str,
+    ) -> Optional[Dict[str, str]]:
+        """Run LOOP-004 progress check; returns error dict or None."""
+        has_hash = context.pre_action_state_hash is not None
+        has_source = context.state_source is not None
+
+        # Neither supplied: check server-side enforcement flag.
+        if not has_hash and not has_source:
+            if self.DOOM_LOOP_GUARD_REQUIRED:
+                self._release_reservation(state_key, reservation_id)
+                return {
+                    "code": "QWED-AGENT-STATE-001",
+                    "message": (
+                        "pre_action_state_hash and state_source are required "
+                        "when DOOM_LOOP_GUARD_REQUIRED is enabled."
+                    ),
+                }
+            return None
+
+        # Partial supply → fail closed.
+        if has_hash != has_source:
+            self._release_reservation(state_key, reservation_id)
+            return {
+                "code": "QWED-AGENT-STATE-001",
+                "message": "pre_action_state_hash and state_source must be provided together.",
+            }
+
+        progress = self._doom_loop_guard.verify_progress(
+            agent_id=agent_id,
+            conversation_id=context.conversation_id,
+            tool_name=action.action_type,
+            arguments={
+                "query": action.query,
+                "code": action.code,
+                "target": action.target,
+                "parameters": action.parameters,
+            },
+            pre_action_state_hash=context.pre_action_state_hash,
+            state_source=context.state_source,
+        )
+        if not progress["verified"]:
+            self._release_reservation(state_key, reservation_id)
+            return {
+                "code": progress["error_code"],
+                "message": progress["message"],
+            }
+        # Return the fingerprint so it can be committed after approval.
+        return progress.get("fingerprint")
+
+    def _release_reservation(self, state_key: tuple, reservation_id: str) -> None:
+        """Release a pending reservation under the conversation state lock."""
+        with self._conversation_state_lock:
+            reservation = self._conversation_reservations.get(state_key)
+            if reservation and reservation["reservation_id"] == reservation_id:
+                self._conversation_reservations.pop(state_key, None)
+
+    def _commit_action_context(
+        self,
+        context: ActionContext,
+        context_state: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist conversation progress only after the action is approved."""
+        if context_state is None:
+            return
+
+        state_key = context_state["state_key"]
+        next_state = context_state["next_state"]
+        reservation_id = context_state["reservation_id"]
+
+        with self._conversation_state_lock:
+            reservation = self._conversation_reservations.get(state_key)
+            if reservation is None or reservation["reservation_id"] != reservation_id:
+                return
+            state = self._conversation_state.get(state_key, {"last_step": 0})
+            if context.step_number <= state["last_step"]:
+                self._conversation_reservations.pop(state_key, None)
+                return
+            self._conversation_state[state_key] = next_state
+            self._conversation_reservations.pop(state_key, None)
+
+            # Phase 2: commit LOOP-004 fingerprint now that action is approved.
+            # Executed within the lock to prevent TOCTOU concurrent bypasses.
+            fp = context_state.get("loop_004_fingerprint")
+            if fp is not None:
+                self._doom_loop_guard.commit_progress(
+                    agent_id=context_state["agent_id"],
+                    conversation_id=context_state["conversation_id"],
+                    fingerprint=fp,
+                )
+
+    def _release_action_context(self, context_state: Optional[Dict[str, Any]]) -> None:
+        """Release an in-flight context reservation when execution does not proceed."""
+        if context_state is None:
+            return
+
+        state_key = context_state["state_key"]
+        reservation_id = context_state["reservation_id"]
+
+        with self._conversation_state_lock:
+            reservation = self._conversation_reservations.get(state_key)
+            if reservation and reservation["reservation_id"] == reservation_id:
+                self._conversation_reservations.pop(state_key, None)
+
+    @staticmethod
+    def _action_fingerprint(action: AgentAction) -> str:
+        """Create a deterministic fingerprint for loop detection."""
+        payload = {
+            "action_type": action.action_type,
+            "query": action.query,
+            "code": action.code,
+            "target": action.target,
+            "parameters": AgentService._sanitize_fingerprint_value(action.parameters),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _sanitize_fingerprint_value(value: Any) -> Any:
+        """Allow only deterministic JSON-compatible values in action fingerprints."""
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise TypeError("Non-finite floats are not allowed in action parameters")
+            return value
+        if isinstance(value, list):
+            return [AgentService._sanitize_fingerprint_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [AgentService._sanitize_fingerprint_value(item) for item in value]
+        if isinstance(value, dict):
+            sanitized: Dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("Action parameter keys must be strings")
+                sanitized[key] = AgentService._sanitize_fingerprint_value(item)
+            return sanitized
+        raise TypeError(f"Unsupported action parameter type: {type(value).__name__}")
+
+    def _risk_exceeds_threshold(self, risk_level: RiskLevel, threshold: RiskLevel) -> bool:
+        """Compare risk levels by their enforcement rank, not string value."""
+        return self.RISK_RANKS[risk_level] > self.RISK_RANKS[threshold]
     
     def _check_budget(self, agent: AgentInfo) -> Dict[str, Any]:
         """Check if agent is within budget"""
@@ -383,6 +710,11 @@ class AgentService:
     
     def _assess_risk(self, action: AgentAction, agent: AgentInfo) -> RiskLevel:
         """Assess risk level of an action"""
+        if not self._is_registered_action(action.action_type):
+            raise ValueError(
+                f"Unknown action_type '{action.action_type}' cannot be risk-assessed deterministically"
+            )
+
         # Check tool-based risk
         if action.action_type in self.TOOL_RISK_LEVELS:
             return self.TOOL_RISK_LEVELS[action.action_type]
@@ -403,13 +735,19 @@ class AgentService:
         agent: AgentInfo,
         action: AgentAction,
         risk_level: RiskLevel,
+        engine: Optional[str],
     ) -> List[VerificationCheck]:
         """Run verification checks on an action"""
         checks = []
         
         # Check permissions
-        engine = self.ACTION_ENGINES.get(action.action_type)
-        if engine and engine not in agent.permissions.allowed_engines:
+        if engine is None:
+            checks.append(VerificationCheck(
+                name="action_registered",
+                passed=False,
+                message=f"Unknown action_type '{action.action_type}' has no registered engine",
+            ))
+        elif action.action_type in self.ACTION_ENGINES and engine not in agent.permissions.allowed_engines:
             checks.append(VerificationCheck(
                 name="engine_allowed",
                 passed=False,

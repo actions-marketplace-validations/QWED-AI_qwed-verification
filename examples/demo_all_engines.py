@@ -12,7 +12,6 @@ from qwed_new.core.verifier import VerificationEngine
 from qwed_new.core.logic_verifier import LogicVerifier
 from qwed_new.core.code_verifier import CodeSecurityVerifier
 from qwed_new.core.sql_verifier import SQLVerifier
-from qwed_new.core.stats_verifier import StatsVerifier
 
 
 def demo_math_engine():
@@ -96,15 +95,16 @@ def demo_code_engine():
     # Example 1: Safe code
     print("\n🔒 Example 1: Safe Code")
     result = verifier.analyze_code("def add(a, b): return a + b")
-    print(f"   Code: def add(a, b): return a + b")
-    print(f"   QWED result: SAFE ✅")
+    is_safe = result.get('is_safe', len(result.get('issues', [])) == 0)
+    print("   Code: def add(a, b): return a + b")
+    print(f"   QWED result: {'SAFE ✅' if is_safe else 'UNSAFE ❌'}")
     
     # Example 2: Dangerous code
     print("\n⚠️ Example 2: Dangerous Code")
     result = verifier.analyze_code("eval(user_input)")
     is_safe = result.get('is_safe', len(result.get('issues', [])) == 0)
     print(f"   Code: eval(user_input)")
-    print(f"   QWED result: UNSAFE ❌ (eval detected)")
+    print(f"   QWED result: {'SAFE ✅' if is_safe else 'UNSAFE ❌'}")
 
 
 def demo_sql_engine():

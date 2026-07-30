@@ -50,9 +50,7 @@ def clean_code(code: str) -> str:
     return code.strip()
 
 # QWED Verification Engines
-import sympy as sp
-from sympy import Matrix, symbols, simplify, factorial
-import ast
+from sympy import Matrix
 import re
 
 # ============================================================================
@@ -598,6 +596,8 @@ if __name__ == "__main__":
     models = ["gpt-4o"]  # Default
     tests = None  # All tests
     
+    allow_unsafe_exec = "--allow-unsafe-exec" in sys.argv
+
     if len(sys.argv) > 1:
         if "--models" in sys.argv:
             idx = sys.argv.index("--models")
@@ -606,4 +606,10 @@ if __name__ == "__main__":
             idx = sys.argv.index("--tests")
             tests = sys.argv[idx+1].split(",")
     
-    results = run_benchmark(models, tests)
+    if not allow_unsafe_exec:
+        raise SystemExit(
+            "Refusing to run benchmark: generated code execution requires "
+            "--allow-unsafe-exec."
+        )
+
+    run_benchmark(models, tests)

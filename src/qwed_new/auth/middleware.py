@@ -1,11 +1,10 @@
 from fastapi import HTTPException, Security, Depends
 from fastapi.security import APIKeyHeader
 from sqlmodel import Session, select
-from typing import Optional
-import hashlib
 
 from qwed_new.core.database import get_session
 from qwed_new.core.models import ApiKey
+from qwed_new.auth.security import hash_api_key
 
 # Define the API Key header scheme
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)

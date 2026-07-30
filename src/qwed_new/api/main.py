@@ -1,42 +1,56 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from sqlmodel import Session
+from pydantic import BaseModel, field_validator
+from typing import Optional, Annotated
+from sqlmodel import Session, select
 import os
 import logging
+from fractions import Fraction
 
 from qwed_new.core.security import redact_pii
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+INTERNAL_VERIFICATION_ERROR = "Internal verification error"
+INTERNAL_PROCESSING_ERROR = "Internal processing error"
 
 from qwed_new.core.control_plane import ControlPlane
 from qwed_new.core.tenant_context import get_current_tenant, TenantContext
 from qwed_new.core.database import create_db_and_tables, get_session
-from qwed_new.core.models import VerificationLog, User, Organization, ApiKey
+from qwed_new.core.models import VerificationLog, ApiKey, User
 from qwed_new.core.rate_limiter import check_rate_limit
 
-# Import auth router
 # Import auth router
 from qwed_new.auth import auth_router
 from qwed_new.auth.audit_routes import router as audit_router
 from qwed_new.auth.middleware import get_api_key
+from qwed_new.auth.routes import get_current_user_token
+from qwed_new.auth.security import hash_api_key
+
+TenantDependency = Annotated[TenantContext, Depends(get_current_tenant)]
+SessionDependency = Annotated[Session, Depends(get_session)]
+AgentTokenHeader = Annotated[str, Header(...)]
+
+APP_VERSION = "5.3.0"
 
 app = FastAPI(
     title="QWED API",
     description="The Deterministic Verification Protocol for AI",
-    version="2.0.0"
+    version=APP_VERSION
 )
 
 # CORS - configurable via environment variable
 # Default allows all origins for development, restrict in production
-CORS_ORIGINS = os.environ.get("QWED_CORS_ORIGINS", "*").split(",")
+raw_cors_origins = os.environ.get("QWED_CORS_ORIGINS", "")
+CORS_ORIGINS = [origin.strip() for origin in raw_cors_origins.split(",") if origin.strip()]
+if not CORS_ORIGINS:
+    logger.critical("QWED_CORS_ORIGINS must be configured")
+    raise RuntimeError("QWED_CORS_ORIGINS must be configured")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=CORS_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -45,8 +59,50 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(audit_router)
 
+STARTUP_ALLOWED_PTH_FILES = {
+    "__editable__.qwed_a2a-0.1.0.pth",
+    "__editable__.qwed_finance-2.0.1.pth",
+    "__editable__.qwed_mcp-0.2.0.pth",
+    "_qwed.pth",
+    "_qwed_legal.pth",
+    "_qwed_new.pth",
+    "_qwed_ucp.pth",
+    "a1_coverage.pth",
+    "pywin32.pth",
+}
+
+
+def _get_env_allowlisted_pth_files() -> set[str]:
+    """Parse deployment-provided exact startup hook allowlist entries."""
+    extra = os.environ.get("QWED_ALLOWED_STARTUP_PTH_FILES", "")
+    return {name.strip() for name in extra.split(",") if name.strip()}
+
+
+def _get_startup_hook_allowlist() -> set[str]:
+    """Return additional expected startup hook files for this deployment."""
+    allowlist = set(STARTUP_ALLOWED_PTH_FILES)
+    allowlist.update(_get_env_allowlisted_pth_files())
+    return allowlist
+
+
+def _enforce_environment_integrity() -> None:
+    """Fail startup if Python startup hooks cannot be verified as safe."""
+    if os.environ.get("QWED_SKIP_ENV_INTEGRITY_CHECK") == "true":
+        logger.warning("Bypassing environment integrity check due to QWED_SKIP_ENV_INTEGRITY_CHECK")
+        return
+
+    from qwed_sdk.guards.environment_guard import StartupHookGuard
+
+    guard = StartupHookGuard(allowed_pth_files=_get_startup_hook_allowlist())
+    result = guard.verify_environment_integrity()
+    if not result.get("verified"):
+        logger.critical(f"Startup environment integrity check failed: {result}")
+        raise RuntimeError(f"Environment integrity verification failed: {result.get('risk')}")
+
+
 @app.on_event("startup")
 def on_startup():
+    _enforce_environment_integrity()
     create_db_and_tables()
 
 # Initialize Kernel (Control Plane)
@@ -58,7 +114,77 @@ class VerifyRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "QWED OS is Running", "version": "1.0.0"}
+    return {"message": "QWED OS is Running", "version": APP_VERSION}
+
+
+def get_optional_current_user(
+    authorization: Optional[str] = Header(None),
+    session: Session = Depends(get_session),
+) -> Optional[User]:
+    """Resolve a JWT-authenticated user when present."""
+    if not authorization:
+        return None
+    if not authorization.startswith("Bearer "):
+        return None
+
+    payload = get_current_user_token(authorization)
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Missing sub claim in token")
+
+    try:
+        user = session.get(User, int(user_id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid token subject") from exc
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+
+
+def get_optional_api_key_record(
+    x_api_key: Optional[str] = Header(None),
+    session: Session = Depends(get_session),
+) -> Optional[ApiKey]:
+    """Resolve an API key record when the caller provides x-api-key."""
+    if not x_api_key:
+        return None
+
+    hashed_key = hash_api_key(x_api_key)
+    statement = select(ApiKey).where(ApiKey.key_hash == hashed_key, ApiKey.is_active)
+    api_key = session.execute(statement).scalars().first()
+
+    if not api_key:
+        raise HTTPException(status_code=403, detail="Invalid or revoked API Key")
+
+    return api_key
+
+
+def _has_metrics_admin_role(user: Optional[User]) -> bool:
+    """Return True when the user can access global operational metrics."""
+    return user is not None and user.is_active and user.role in {"owner", "admin"}
+
+
+def require_metrics_access(
+    current_user: Annotated[Optional[User], Depends(get_optional_current_user)],
+    api_key_record: Annotated[Optional[ApiKey], Depends(get_optional_api_key_record)],
+    session: Annotated[Session, Depends(get_session)],
+) -> None:
+    """Restrict operational metrics to admin JWT users or admin-linked API keys."""
+    if _has_metrics_admin_role(current_user):
+        return
+
+    if api_key_record is not None:
+        api_key_user = session.get(User, api_key_record.user_id) if api_key_record.user_id else None
+        if _has_metrics_admin_role(api_key_user):
+            return
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    if current_user is not None:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 @app.post("/verify/natural_language")
 async def verify_natural_language(
@@ -141,12 +267,25 @@ async def verify_logic(
         raise
     except Exception as e:
         logger.error(f"Logic verification error: {redact_pii(str(e))}", exc_info=False)
+        response_result = locals().get("result")
+        provider_used = (
+            response_result.get("provider_used")
+            if isinstance(response_result, dict) and response_result.get("provider_used")
+            else control_plane.router.route(request.query, request.provider)
+        )
         return {
             "status": "ERROR",
-            "error": "Internal verification error"
+            "error": INTERNAL_VERIFICATION_ERROR,
+            "provider_used": provider_used,
         }
 
-@app.post("/verify/stats")
+@app.post(
+    "/verify/stats",
+    responses={
+        403: {"description": "Verification blocked by security policy."},
+        503: {"description": "Secure execution runtime unavailable."},
+    },
+)
 async def verify_stats(
     file: UploadFile = File(...),
     query: str = Form(...),
@@ -166,10 +305,14 @@ async def verify_stats(
         import pandas as pd
         df = pd.read_csv(file.file)
         
-        from qwed_new.core.stats_verifier import StatsVerifier
+        from qwed_new.core.stats_verifier import StatsVerifier, SECURE_STATS_BLOCKED_CODE
         verifier = StatsVerifier()
         
         result = verifier.verify_stats(query, df, provider=None)
+        if result.get("status") == "BLOCKED" and result.get("error") == SECURE_STATS_BLOCKED_CODE:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable")
+        if result.get("status") == "BLOCKED":
+            raise HTTPException(status_code=403, detail="Verification blocked by security policy")
         
         log = VerificationLog(
             organization_id=tenant.organization_id,
@@ -182,12 +325,14 @@ async def verify_stats(
         session.commit()
         
         return result
+    except HTTPException:
+        raise
         
     except Exception as e:
         logger.error(f"Stats verification error: {redact_pii(str(e))}", exc_info=False)
         return {
             "status": "ERROR",
-            "error": "Internal processing error"
+            "error": INTERNAL_PROCESSING_ERROR
         }
 
 
@@ -226,19 +371,19 @@ async def verify_fact(
             organization_id=tenant.organization_id,
             query=claim,
             result=str(result),
-            is_verified=(result.get("verdict") == "SUPPORTED"),
+            is_verified=result.is_verified,
             domain="FACT"
         )
         session.add(log)
         session.commit()
         
-        return result
+        return result.to_dict()
         
     except Exception as e:
         logger.error(f"Fact verification error: {redact_pii(str(e))}", exc_info=False)
         return {
             "status": "ERROR",
-            "error": "Internal verification error",
+            "error": INTERNAL_VERIFICATION_ERROR,
             "verdict": "ERROR"
         }
 
@@ -288,7 +433,7 @@ async def verify_code(
         logger.error(f"Code verification error: {redact_pii(str(e))}", exc_info=False)
         return {
             "status": "ERROR",
-            "error": "Internal verification error",
+            "error": INTERNAL_VERIFICATION_ERROR,
             "is_safe": False
         }
 
@@ -312,7 +457,7 @@ async def verify_math(
     
     try:
         import sympy
-        from sympy.parsing.sympy_parser import parse_expr
+        from qwed_new.core.safe_parser import safe_parse_expr
         from sympy import simplify, symbols, Eq, solve
         
         expression = request.get("expression")
@@ -327,8 +472,8 @@ async def verify_math(
             left_str, right_str = expression.split("=", 1)
             
             # Parse both sides
-            left = parse_expr(left_str)
-            right = parse_expr(right_str)
+            left = safe_parse_expr(left_str)
+            right = safe_parse_expr(right_str)
             
             # Simplify and check equivalence
             difference = simplify(left - right)
@@ -356,7 +501,7 @@ async def verify_math(
                     if re.search(r'/\d+\(', expression.replace(" ", "")):
                         is_ambiguous = True
                 
-                parsed = parse_expr(expression_normalized)
+                parsed = safe_parse_expr(expression_normalized)
                 
                 # Check for division by zero before simplifying
                 if "/0" in expression.replace(" ", "") or "/ 0" in expression:
@@ -395,7 +540,9 @@ async def verify_math(
                 elif is_ambiguous:
                     simplified = simplify(parsed)
                     result = {
-                        "is_valid": True,
+                        "is_valid": False,
+                        "result": False,
+                        "status": "BLOCKED",
                         "warning": "ambiguous",
                         "message": "Expression may be ambiguous due to implicit multiplication after division",
                         "simplified": str(simplified),
@@ -416,7 +563,7 @@ async def verify_math(
                             "simplified": str(simplified),
                             "original": str(parsed)
                         }
-                    except:
+                    except Exception:
                         # Symbolic expression
                         result = {
                             "is_valid": True,
@@ -456,7 +603,7 @@ async def verify_math(
         logger.error(f"Math verification error: {redact_pii(str(e))}", exc_info=False)
         return {
             "status": "ERROR",
-            "error": "Internal verification error",
+            "error": INTERNAL_VERIFICATION_ERROR,
             "is_valid": False
         }
 
@@ -508,7 +655,7 @@ async def verify_sql(
         logger.error(f"SQL verification error: {redact_pii(str(e))}", exc_info=False)
         return {
             "status": "ERROR",
-            "error": "Internal verification error",
+            "error": INTERNAL_VERIFICATION_ERROR,
             "is_valid": False
         }
 
@@ -556,13 +703,13 @@ async def verify_image(
             organization_id=tenant.organization_id,
             query=f"Image claim: {claim}",
             result=str(result),
-            is_verified=result.get("verdict") == "SUPPORTED",
+            is_verified=result.is_verified,
             domain="IMAGE"
         )
         session.add(log)
         session.commit()
-        
-        return result
+
+        return result.to_dict()
         
     except HTTPException:
         raise
@@ -575,13 +722,172 @@ async def verify_image(
             "confidence": 0.0
         }
 
+class RAGVerifyRequest(BaseModel):
+    target_document_id: str
+    chunks: list[dict]
+    max_drm_rate: str = "0"  # Accepts Fraction-compatible strings: "0", "1/10", etc.
+
+    @field_validator("target_document_id")
+    @classmethod
+    def validate_target_document_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("target_document_id must be a non-empty string.")
+        return stripped
+
+    @field_validator("chunks")
+    @classmethod
+    def validate_chunks(cls, value: list[dict]) -> list[dict]:
+        if not value:
+            raise ValueError("chunks must be a non-empty list.")
+        if any(not isinstance(chunk, dict) or not chunk for chunk in value):
+            raise ValueError("Each chunk must be a non-empty object.")
+        return value
+
+    @field_validator("max_drm_rate")
+    @classmethod
+    def validate_max_drm_rate(cls, value: str) -> str:
+        try:
+            threshold = Fraction(value)
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            raise ValueError("max_drm_rate must be a Fraction-compatible string.") from exc
+        if not Fraction(0) <= threshold <= Fraction(1):
+            raise ValueError("max_drm_rate must be between 0 and 1.")
+        return value
+
+@app.post(
+    "/verify/rag",
+    responses={
+        400: {"description": "Invalid RAG verification request payload."},
+    },
+)
+async def verify_rag(
+    request: RAGVerifyRequest,
+    tenant: TenantDependency,
+    session: SessionDependency
+):
+    """
+    Document-Level Retrieval Mismatch Defender.
+    Verifies that context chunks align with the target document.
+    """
+    check_rate_limit(tenant.api_key)
+    
+    try:
+        from qwed_sdk.guards.rag_guard import RAGGuard
+
+        try:
+            guard = RAGGuard(max_drm_rate=request.max_drm_rate)
+            result = guard.verify_retrieval_context(
+                target_document_id=request.target_document_id,
+                retrieved_chunks=request.chunks
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        
+        audit_result = {
+            "verified": result.get("verified", False),
+            "risk": result.get("risk"),
+            "drm_rate": result.get("drm_rate"),
+            "chunks_checked": result.get("chunks_checked"),
+            "mismatched_count": result.get("mismatched_count"),
+        }
+
+        log = VerificationLog(
+            organization_id=tenant.organization_id,
+            query=f"RAG Document Verify: {request.target_document_id}",
+            result=str(audit_result),
+            is_verified=result.get("verified", False),
+            domain="RAG"
+        )
+        session.add(log)
+        session.commit()
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"RAG verification error: {redact_pii(str(e))}", exc_info=False)
+        return {
+            "status": "ERROR",
+            "error": INTERNAL_PROCESSING_ERROR,
+            "verified": False
+        }
+
+class ProcessVerifyRequest(BaseModel):
+    trace: str
+    mode: str = "irac"
+    milestones: Optional[list[str]] = None
+
+@app.post(
+    "/verify/process",
+    responses={
+        400: {"description": "Invalid process mode or missing milestones for milestones mode."},
+    },
+)
+async def verify_process(
+    request: ProcessVerifyRequest,
+    tenant: TenantDependency,
+    session: SessionDependency
+):
+    """
+    Glass-Box Reasoning Process Verifier.
+    Checks IRAC structural compliance or milestone process rates.
+    """
+    check_rate_limit(tenant.api_key)
+    
+    try:
+        from qwed_new.guards.process_guard import ProcessVerifier
+        verifier = ProcessVerifier()
+        
+        if request.mode == "irac":
+            result = verifier.verify_irac_structure(request.trace)
+        elif request.mode == "milestones":
+            if not request.milestones:
+                raise HTTPException(
+                    status_code=400,
+                    detail="'milestones' is required when mode=\"milestones\""
+                )
+            result = verifier.verify_trace(request.trace, request.milestones)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid mode. Use 'irac' or 'milestones'."
+            )
+            
+        log = VerificationLog(
+            organization_id=tenant.organization_id,
+            query=f"Process Verification ({request.mode})",
+            result=str(result),
+            is_verified=result.get("verified", False),
+            domain="PROCESS"
+        )
+        session.add(log)
+        session.commit()
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Process verification error: {redact_pii(str(e))}", exc_info=False)
+        return {
+            "status": "ERROR",
+            "error": INTERNAL_PROCESSING_ERROR,
+            "verified": False
+        }
+
 
 # ============================================================
 # OBSERVABILITY ENDPOINTS
 # ============================================================
 
-from qwed_new.core.observability import metrics_collector
-from datetime import datetime
+from qwed_new.core.observability import (
+    get_prometheus_content_type,
+    get_prometheus_metrics,
+    metrics_collector,
+)
+from datetime import datetime, timezone
 from sqlmodel import select
 
 @app.get("/health")
@@ -593,17 +899,18 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "QWED Platform",
-        "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat()
+        "version": APP_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 @app.get("/metrics")
-async def get_global_metrics():
+async def get_global_metrics(
+    current_user: Annotated[None, Depends(require_metrics_access)],
+):
     """
     Get system-wide metrics.
-    
-    Note: In production, this should require admin authentication.
     """
+    del current_user
     global_metrics = metrics_collector.get_global_metrics()
     all_tenant_metrics = metrics_collector.get_all_tenant_metrics()
     
@@ -611,6 +918,22 @@ async def get_global_metrics():
         "global": global_metrics,
         "tenants": all_tenant_metrics
     }
+
+@app.get("/metrics/prometheus", tags=["Observability"])
+async def prometheus_metrics(
+    current_user: Annotated[None, Depends(require_metrics_access)],
+):
+    """
+    Prometheus-compatible metrics endpoint.
+    
+    Returns metrics in Prometheus text format for scraping.
+    """
+    del current_user
+    content = get_prometheus_metrics()
+    return Response(
+        content=content,
+        media_type=get_prometheus_content_type()
+    )
 
 @app.get("/metrics/{organization_id}")
 async def get_tenant_metrics(
@@ -652,7 +975,7 @@ async def get_tenant_logs(
         VerificationLog.organization_id == tenant.organization_id
     ).order_by(VerificationLog.timestamp.desc()).limit(limit)
     
-    logs = session.exec(statement).all()
+    logs = session.execute(statement).scalars().all()
     
     return {
         "organization_id": tenant.organization_id,
@@ -689,9 +1012,85 @@ class AgentRegistrationRequest(BaseModel):
 class AgentVerifyRequest(BaseModel):
     query: str
     provider: Optional[str] = None
+    tool_schema: Optional[dict] = None
 
 class ToolCallRequest(BaseModel):
     tool_params: dict
+
+def _require_authenticated_agent(session: Session, agent_id: int, x_agent_token: str) -> Agent:
+    agent = agent_registry.authenticate_agent(session, x_agent_token)
+    if not agent or agent.id != agent_id:
+        raise HTTPException(status_code=401, detail="Invalid agent token")
+    return agent
+
+def _enforce_agent_budget(session: Session, agent_id: int, agent: Agent, query: str) -> None:
+    budget_ok, budget_reason = agent_registry.check_budget(session, agent_id)
+    if budget_ok:
+        return
+
+    agent_registry.log_activity(
+        session, agent_id, agent.organization_id,
+        "verification_request", "Budget exceeded", "blocked",
+        input_data=query
+    )
+    raise HTTPException(status_code=403, detail=budget_reason)
+
+def _run_exfiltration_check(session: Session, agent_id: int, agent: Agent, query: str) -> None:
+    from qwed_sdk.guards.exfiltration_guard import ExfiltrationGuard
+
+    guard = ExfiltrationGuard()
+    res = guard.scan_payload(query)
+    if res.get("verified"):
+        return
+
+    agent_registry.log_activity(
+        session, agent_id, agent.organization_id,
+        "verification_request", "Exfiltration blocked", "blocked",
+        input_data=None
+    )
+    raise HTTPException(status_code=403, detail="Potential exfiltration detected: " + res.get("message", ""))
+
+def _run_mcp_poison_check(session: Session, agent_id: int, agent: Agent, tool_schema: Optional[dict]) -> None:
+    if not tool_schema:
+        raise HTTPException(
+            status_code=400,
+            detail="'tool_schema' is required when mcp_poison check is enabled"
+        )
+
+    from qwed_sdk.guards.mcp_poison_guard import MCPPoisonGuard
+
+    guard = MCPPoisonGuard()
+    res = guard.verify_tool_definition(tool_schema)
+    if res.get("verified"):
+        return
+
+    agent_registry.log_activity(
+        session, agent_id, agent.organization_id,
+        "verification_request", "MCP Poisoning blocked", "blocked",
+        input_data=None
+    )
+    raise HTTPException(status_code=403, detail="Potential MCP Model Context Poisoning detected")
+
+def _run_agent_security_checks(
+    session: Session,
+    agent_id: int,
+    agent: Agent,
+    request: AgentVerifyRequest,
+) -> None:
+    _run_exfiltration_check(session, agent_id, agent, request.query)
+    if request.tool_schema:
+        _run_mcp_poison_check(session, agent_id, agent, request.tool_schema)
+
+async def _process_agent_verification(agent: Agent, request: AgentVerifyRequest) -> dict:
+    try:
+        return await control_plane.process_natural_language(
+            request.query,
+            organization_id=agent.organization_id,
+            preferred_provider=request.provider
+        )
+    except Exception as e:
+        logger.error(f"Agent verification failed: {redact_pii(str(e))}", exc_info=False)
+        raise HTTPException(status_code=500, detail="Internal agent verification error") from e
 
 @app.post("/agents/register")
 async def register_agent(
@@ -726,12 +1125,20 @@ async def register_agent(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/agents/{agent_id}/verify")
+@app.post(
+    "/agents/{agent_id}/verify",
+    responses={
+        400: {"description": "Invalid security check configuration or agent verification payload."},
+        401: {"description": "Invalid agent token."},
+        403: {"description": "Agent budget exceeded or request blocked by security checks."},
+        500: {"description": "Internal agent verification error."},
+    },
+)
 async def agent_verify(
     agent_id: int,
     request: AgentVerifyRequest,
-    x_agent_token: str = Header(...),
-    session: Session = Depends(get_session)
+    x_agent_token: AgentTokenHeader,
+    session: SessionDependency
 ):
     """
     Agent makes a verification request through QWED.
@@ -740,31 +1147,10 @@ async def agent_verify(
     import time
     start_time = time.time()
     
-    # 1. Authenticate agent
-    agent = agent_registry.authenticate_agent(session, x_agent_token)
-    if not agent or agent.id != agent_id:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
-    
-    # 2. Check budget
-    budget_ok, budget_reason = agent_registry.check_budget(session, agent_id)
-    if not budget_ok:
-        agent_registry.log_activity(
-            session, agent_id, agent.organization_id,
-            "verification_request", "Budget exceeded", "blocked",
-            input_data=request.query
-        )
-        raise HTTPException(status_code=403, detail=budget_reason)
-    
-    # 3. Process via control plane
-    try:
-        result = await control_plane.process_natural_language(
-            request.query,
-            organization_id=agent.organization_id,
-            preferred_provider=request.provider
-        )
-    except Exception as e:
-        logger.error(f"Agent verification failed: {redact_pii(str(e))}", exc_info=False)
-        raise HTTPException(status_code=500, detail="Internal agent verification error")
+    agent = _require_authenticated_agent(session, agent_id, x_agent_token)
+    _enforce_agent_budget(session, agent_id, agent, request.query)
+    _run_agent_security_checks(session, agent_id, agent, request)
+    result = await _process_agent_verification(agent, request)
     
     # 4. Log activity
     latency = (time.time() - start_time) * 1000
@@ -873,7 +1259,7 @@ async def get_agent_activity(
         AgentActivity.agent_id == agent_id
     ).order_by(AgentActivity.timestamp.desc()).limit(limit)
     
-    activities = session.exec(statement).all()
+    activities = session.execute(statement).scalars().all()
     
     return {
         "agent_id": agent_id,
@@ -905,7 +1291,14 @@ class ConsensusVerifyRequest(BaseModel):
     verification_mode: str = "single"  # "single", "high", "maximum"
     min_confidence: float = 0.95  # 0.0 to 1.0
 
-@app.post("/verify/consensus")
+@app.post(
+    "/verify/consensus",
+    responses={
+        400: {"description": "Invalid verification mode."},
+        422: {"description": "Consensus confidence below requested minimum."},
+        503: {"description": "Secure execution runtime unavailable for required consensus depth."},
+    },
+)
 async def verify_with_consensus(
     request: ConsensusVerifyRequest,
     tenant: TenantContext = Depends(get_current_tenant),
@@ -921,6 +1314,8 @@ async def verify_with_consensus(
     
     Returns detailed verification chain and confidence score.
     """
+    check_rate_limit(tenant.api_key)
+
     try:
         # Parse mode
         mode = VerificationMode(request.verification_mode)
@@ -936,6 +1331,9 @@ async def verify_with_consensus(
         mode=mode,
         min_confidence=request.min_confidence
     )
+
+    if result.agreement_status == "blocked_secure_execution":
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
     
     # Check if confidence meets requirement
     if result.confidence < request.min_confidence:
@@ -980,7 +1378,7 @@ async def verify_with_consensus(
 from qwed_new.core.compliance_exporter import ComplianceExporter
 from qwed_new.core.threat_detector import threat_detector
 from qwed_new.core.key_rotation import key_manager
-from qwed_new.core.rbac import require_role, RBACMiddleware
+from qwed_new.core.rbac import require_role
 
 compliance_exporter = ComplianceExporter()
 
@@ -1066,7 +1464,7 @@ async def startup_security_tasks():
 # BATCH VERIFICATION ENDPOINTS (Phase 4)
 # ============================================================
 
-from qwed_new.core.batch import batch_service, VerificationType
+from qwed_new.core.batch import batch_service
 from typing import List
 
 class BatchVerifyRequest(BaseModel):
@@ -1154,18 +1552,3 @@ async def get_batch_status(
 # ============================================================
 # PROMETHEUS METRICS ENDPOINT
 # ============================================================
-
-from qwed_new.core.observability import get_prometheus_metrics, get_prometheus_content_type
-
-@app.get("/metrics/prometheus", tags=["Observability"])
-async def prometheus_metrics():
-    """
-    Prometheus-compatible metrics endpoint.
-    
-    Returns metrics in Prometheus text format for scraping.
-    """
-    content = get_prometheus_metrics()
-    return Response(
-        content=content,
-        media_type=get_prometheus_content_type()
-    )

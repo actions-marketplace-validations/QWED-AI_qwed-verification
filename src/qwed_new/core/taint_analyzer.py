@@ -528,7 +528,6 @@ class TaintAnalyzer:
         if source_var == sink_var:
             return [source_var]
         
-        path = [source_var]
         visited = {source_var}
         
         # BFS to find path
@@ -547,7 +546,7 @@ class TaintAnalyzer:
                     queue.append((var, new_path))
         
         # Direct path if BFS fails
-        return [source_var, sink_var] if source_var != sink_var else [source_var]
+        return [source_var, sink_var]
     
     def _get_all_tainted(self) -> Set[str]:
         """Get all tainted variables."""

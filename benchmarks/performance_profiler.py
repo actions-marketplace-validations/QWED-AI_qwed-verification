@@ -16,7 +16,7 @@ import statistics
 import tracemalloc
 import argparse
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Callable
+from typing import List, Callable
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import sys
@@ -79,6 +79,7 @@ class PerformanceProfiler:
             try:
                 func(*args, **kwargs)
             except Exception:
+                # Warmup failures are ignored so the benchmark can still proceed.
                 pass
         
         # Actual benchmark runs
@@ -91,6 +92,7 @@ class PerformanceProfiler:
                 func(*args, **kwargs)
                 successes += 1
             except Exception:
+                # Failed runs still contribute timing data but not success counts.
                 pass
             end = time.perf_counter()
             

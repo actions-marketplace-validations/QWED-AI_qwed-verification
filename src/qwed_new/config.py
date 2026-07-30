@@ -5,17 +5,36 @@ This module handles environment variables and provider selection.
 """
 
 import os
-from dotenv import load_dotenv
+import secrets
+from pathlib import Path
 from enum import Enum
 
-load_dotenv()
+def load_dotenv_ordered(override: bool = False) -> None:
+    """Load config from user project dir first, then global qwed dir."""
+    try:
+        from dotenv import load_dotenv
+        if override:
+            load_dotenv(Path.home() / ".qwed" / ".env", override=True)
+            load_dotenv(Path.cwd() / ".env", override=True)
+        else:
+            load_dotenv(Path.cwd() / ".env", override=False)
+            load_dotenv(Path.home() / ".qwed" / ".env", override=False)
+    except ImportError as exc:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"python-dotenv not installed or failed to import; skipping .env loading: {exc}")
+
+load_dotenv_ordered(override=False)
 
 class ProviderType(str, Enum):
     OPENAI = "openai"
+    OPENAI_DIRECT = "openai_direct"
     AZURE_OPENAI = "azure_openai"
     ANTHROPIC = "anthropic"
     CLAUDE_OPUS = "claude_opus"
     GEMINI = "gemini"
+    OLLAMA = "ollama"
+    OPENAI_COMPAT = "openai_compat"
     AUTO = "auto"
 
 class Settings:
@@ -26,10 +45,15 @@ class Settings:
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # Security
-    API_KEY_SECRET = os.getenv("API_KEY_SECRET", "change-me-in-production")
+    API_KEY_SECRET = os.getenv("API_KEY_SECRET")
+    if not API_KEY_SECRET:
+        raise RuntimeError(
+            "API_KEY_SECRET environment variable must be set. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        )
 
-    # Default to Azure OpenAI if not specified
-    ACTIVE_PROVIDER = os.getenv("ACTIVE_PROVIDER", ProviderType.AZURE_OPENAI)
+    # Default to Ollama if not specified (safer local fallback)
+    ACTIVE_PROVIDER = os.getenv("ACTIVE_PROVIDER", ProviderType.OLLAMA)
     
     # OpenAI Config (Direct API)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -55,5 +79,29 @@ class Settings:
     # Google Gemini Config
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+
+    # Ollama Config (Local)
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
+    # OpenAI-Compatible Config (DO, Groq, Together, etc.)
+    CUSTOM_BASE_URL = os.getenv("CUSTOM_BASE_URL")
+    CUSTOM_API_KEY = os.getenv("CUSTOM_API_KEY")
+    CUSTOM_MODEL = os.getenv("CUSTOM_MODEL", "gpt-4o-mini")
+
+
+def ensure_jwt_secret(min_bytes: int = 32) -> str:
+    """
+    Ensure QWED_JWT_SECRET_KEY exists for local auth bootstrap.
+    Generates and exports a strong secret when missing.
+    """
+    existing = os.getenv("QWED_JWT_SECRET_KEY", "").strip()
+    if existing:
+        return existing
+
+    # token_urlsafe(48) gives >= 32 bytes entropy and an env-safe string.
+    secret = secrets.token_urlsafe(max(min_bytes, 48))
+    os.environ["QWED_JWT_SECRET_KEY"] = secret
+    return secret
 
 settings = Settings()

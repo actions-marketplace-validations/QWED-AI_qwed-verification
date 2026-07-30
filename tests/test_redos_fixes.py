@@ -1,5 +1,6 @@
 from qwed_new.core.fact_verifier import FactVerifier
 from qwed_new.core.image_verifier import ImageVerifier, ImageAnalysisResult
+from qwed_new.core.diagnostics import DiagnosticStatus
 
 def test_fact_verifier_bounded_regex():
     """
@@ -16,7 +17,9 @@ def test_fact_verifier_bounded_regex():
     result = verifier.verify_fact(claim, context)
     
     # Verify entity matching logic still works
-    assert "2024" in result["reasoning"] or result["scores"]["entity_match"] > 0.5
+    entity_match = result.developer_fields["scores"]["entity_match"]
+    evidence = result.developer_fields.get("evidence", "")
+    assert "2024" in evidence or entity_match > 0.5
     
     # 2. Long Input - Should be truncated/handled safely
     # Create valid sentence structure but very long
@@ -26,7 +29,7 @@ def test_fact_verifier_bounded_regex():
     # This triggers _segment_sentences with the new safe_pattern
     result = verifier.verify_fact("test", long_context)
     # Should run without timeout/error
-    assert result["verdict"] is not None
+    assert result.status is not None
 
 def test_image_verifier_bounded_regex():
     """
@@ -53,9 +56,9 @@ def test_image_verifier_bounded_regex():
     # Must call verify_image to hit the length guard
     result_blocked = verifier.verify_image(b"fake_bytes", long_claim)
     
-    # Note: result_blocked is dict from verify_image, NOT object
-    assert result_blocked["verdict"] == "INCONCLUSIVE"
-    assert "Claim text too long" in result_blocked["reasoning"]
+    assert not result_blocked.is_verified
+    assert result_blocked.status == DiagnosticStatus.UNVERIFIABLE
+    assert result_blocked.constraint_id == "image_verifier.claim_too_long"
     
     # 3. Mixed spaces - Should match with bounded \s{0,5}
     claim_spaces = "800   x   600"

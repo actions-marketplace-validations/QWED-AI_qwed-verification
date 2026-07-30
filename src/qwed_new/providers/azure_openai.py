@@ -4,7 +4,7 @@ Azure OpenAI Provider Implementation.
 
 import os
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any
 from openai import AzureOpenAI
 from qwed_new.core.schemas import MathVerificationTask
 from qwed_new.providers.base import LLMProvider
@@ -378,7 +378,6 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
                 
-            return content
             return content
             
         except Exception as e:

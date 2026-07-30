@@ -9,16 +9,16 @@ Features:
 """
 
 import secrets
-import hashlib
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from sqlmodel import select
 
-from qwed_new.core.models import ApiKey, User
+from qwed_new.core.models import ApiKey
 from qwed_new.core.database import engine
 from sqlmodel import Session
 from qwed_new.core.alerting import alert_manager
+from qwed_new.auth.security import hash_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,8 @@ class KeyManager:
         # Generate secure random key
         raw_key = f"qwed_live_{secrets.token_urlsafe(32)}"
         
-        # Hash for storage
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        # Hash for storage (using PBKDF2 to match auth/security.py)
+        key_hash = hash_api_key(raw_key)
         key_preview = f"{raw_key[:10]}...{raw_key[-4:]}"
         
         expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
@@ -90,7 +90,7 @@ class KeyManager:
             session.add(old_key)
             session.commit()
             
-            logger.info(f"Rotated key {old_key_id} -> {new_key.id}")
+            logger.info("Rotated key %d -> %d", int(old_key_id), int(new_key.id))
             return new_key, raw_new_key
 
     def check_expiring_keys(self):

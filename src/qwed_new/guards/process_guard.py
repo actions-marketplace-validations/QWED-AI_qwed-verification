@@ -1,5 +1,6 @@
 
 import re
+from decimal import Decimal
 from typing import List, Dict, Any
 
 class ProcessVerifier:
@@ -34,19 +35,22 @@ class ProcessVerifier:
         for step, pattern in self.irac_patterns.items():
             match = pattern.search(reasoning_trace)
             if match:
-                matches[step] = True
+                matches[step] = match.group(0)
             else:
                 missing_steps.append(step)
         
-        # Calculate score (0.0 to 1.0)
-        # 4 steps total
-        score = (4 - len(missing_steps)) / 4.0
+        # Calculate score (0 to 1) using Decimal for deterministic arithmetic
+        score = float(Decimal(4 - len(missing_steps)) / Decimal(4))
         
         return {
             "verified": len(missing_steps) == 0,
             "score": score,
             "missing_steps": missing_steps,
-            "mechanism": "Regex Pattern Matching (Deterministic)"
+            "mechanism": "Regex Pattern Matching (Deterministic)",
+            "irac.issue": matches.get("issue", ""),
+            "irac.rule": matches.get("rule", ""),
+            "irac.application": matches.get("application", ""),
+            "irac.conclusion": matches.get("conclusion", ""),
         }
 
     def verify_trace(self, text: str, key_middle: List[str]) -> Dict[str, Any]:
@@ -73,8 +77,8 @@ class ProcessVerifier:
             kw for kw in key_middle 
             if re.search(rf"\b{re.escape(kw.lower())}\b", text_lc)
         ]
-        process_rate = len(found_milestones) / len(key_middle)
-        
+        process_rate = float(Decimal(len(found_milestones)) / Decimal(len(key_middle)))
+
         return {
             "verified": process_rate == 1.0,
             "process_rate": process_rate,

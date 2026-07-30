@@ -182,6 +182,73 @@ class TestMathEngineEdgeCases:
         )
         assert result["status"] == "ERROR"
 
+    # =========================================================================
+    # Mode ambiguity fail-closed (Issue #129)
+    # =========================================================================
+
+    def test_mode_ambiguous_blocked(self, engine):
+        """Multi-mode dataset must return BLOCKED, not VERIFIED (Issue #129)."""
+        result = engine.verify_statistics(
+            data=[1, 1, 2, 2],
+            statistic="mode",
+            expected=1
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+        assert "Ambiguous mode" in result["error"]
+        assert sorted(result["ambiguous_modes"]) == [1, 2]
+
+    def test_mode_ambiguous_blocked_other_claim(self, engine):
+        """Multi-mode dataset blocks regardless of which value is claimed."""
+        result = engine.verify_statistics(
+            data=[1, 1, 2, 2],
+            statistic="mode",
+            expected=2
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+
+    def test_mode_unique_verified(self, engine):
+        """Unique mode matches claim -> VERIFIED."""
+        result = engine.verify_statistics(
+            data=[1, 1, 2],
+            statistic="mode",
+            expected=1
+        )
+        assert result["is_correct"] is True
+        assert result["status"] == "VERIFIED"
+
+    def test_mode_unique_correction_needed(self, engine):
+        """Unique mode does NOT match claim -> CORRECTION_NEEDED."""
+        result = engine.verify_statistics(
+            data=[1, 1, 2],
+            statistic="mode",
+            expected=2
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "CORRECTION_NEEDED"
+
+    def test_mode_all_equal_verified(self, engine):
+        """All-equal dataset has a unique deterministic mode."""
+        result = engine.verify_statistics(
+            data=[3, 3, 3],
+            statistic="mode",
+            expected=3
+        )
+        assert result["is_correct"] is True
+        assert result["status"] == "VERIFIED"
+
+    def test_mode_three_way_tie_blocked(self, engine):
+        """Three-way tie must also be BLOCKED."""
+        result = engine.verify_statistics(
+            data=[1, 2, 3, 1, 2, 3],
+            statistic="mode",
+            expected=1
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+        assert sorted(result["ambiguous_modes"]) == [1, 2, 3]
+
 
 class TestPercentageCalculations:
     """Test percentage verification."""
@@ -219,3 +286,177 @@ class TestPercentageCalculations:
             operation="decrease"
         )
         assert result["is_correct"] is True
+
+
+class TestEigenvalueCompleteness:
+    """Eigenvalue verification must require complete claims (Issue #130)."""
+
+    @pytest.fixture
+    def engine(self):
+        return VerificationEngine()
+
+    def test_incomplete_eigenvalue_claim_rejected(self, engine):
+        """Claiming [2] for a matrix with eigenvalues [2, 3] must NOT verify."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[2, 0], [0, 3]]},
+            expected=[2],
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "CORRECTION_NEEDED"
+        assert "cardinality mismatch" in result["error"]
+        assert result["calculated_count"] == 2
+        assert result["claimed_count"] == 1
+
+    def test_complete_eigenvalue_claim_verified(self, engine):
+        """Claiming [2, 3] for a matrix with eigenvalues [2, 3] must verify."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[2, 0], [0, 3]]},
+            expected=[2, 3],
+        )
+        assert result["is_correct"] is True
+        assert result["status"] == "VERIFIED"
+
+    def test_complete_eigenvalue_wrong_values(self, engine):
+        """Claiming [2, 4] for eigenvalues [2, 3] -> CORRECTION_NEEDED."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[2, 0], [0, 3]]},
+            expected=[2, 4],
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "CORRECTION_NEEDED"
+
+    def test_overcomplete_eigenvalue_claim_rejected(self, engine):
+        """Claiming MORE eigenvalues than exist must also fail."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[2, 0], [0, 3]]},
+            expected=[2, 3, 5],
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "CORRECTION_NEEDED"
+        assert result["calculated_count"] == 2
+        assert result["claimed_count"] == 3
+
+    def test_single_eigenvalue_verified(self, engine):
+        """1x1 matrix with single eigenvalue — complete claim verifies."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[5]]},
+            expected=[5],
+        )
+        assert result["is_correct"] is True
+        assert result["status"] == "VERIFIED"
+
+    def test_repeated_eigenvalue_incomplete_rejected(self, engine):
+        """diag(2,2) has eigenvalue 2 with multiplicity 2 — claim [2] is incomplete."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[2, 0], [0, 2]]},
+            expected=[2],
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "CORRECTION_NEEDED"
+        assert result["calculated_count"] == 2
+        assert result["claimed_count"] == 1
+
+    def test_repeated_eigenvalue_complete_verified(self, engine):
+        """diag(2,2) with claim [2, 2] accounts for multiplicity — VERIFIED."""
+        result = engine.verify_matrix_operation(
+            operation="eigenvalues",
+            matrices={"A": [[2, 0], [0, 2]]},
+            expected=[2, 2],
+        )
+        assert result["is_correct"] is True
+        assert result["status"] == "VERIFIED"
+
+
+class TestIRRConvergenceProof:
+    """IRR verification must prove convergence (Issue #131)."""
+
+    @pytest.fixture
+    def engine(self):
+        return VerificationEngine()
+
+    def test_multi_sign_change_blocked(self, engine):
+        """Multiple sign changes -> ambiguous IRR -> BLOCKED."""
+        result = engine.verify_irr(
+            cash_flows=[-100, 230, -132],
+            expected=0.1,
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+        assert "Ambiguous IRR" in result["error"]
+        assert result["sign_changes"] == 2
+
+    def test_zero_hidden_sign_change_blocked(self, engine):
+        """Zeros between sign changes must not hide multi-root ambiguity."""
+        result = engine.verify_irr(
+            cash_flows=[-100, 0, 230, -132],
+            expected=0.1,
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+        assert result["sign_changes"] == 2
+
+    def test_simple_irr_converges_verified(self, engine):
+        """Standard cash flow with single sign change converges and verifies."""
+        result = engine.verify_irr(
+            cash_flows=[-1000, 300, 400, 400, 300],
+            expected=0.149,
+            tolerance=0.001,
+        )
+        assert result["is_correct"] is True
+        assert result["status"] == "VERIFIED"
+        assert result["converged"] is True
+
+    def test_simple_irr_wrong_claim(self, engine):
+        """Converged IRR that doesn't match claim -> CORRECTION_NEEDED."""
+        result = engine.verify_irr(
+            cash_flows=[-1000, 300, 400, 400, 300],
+            expected=0.50,
+            tolerance=0.001,
+        )
+        assert result["is_correct"] is False
+        assert result["status"] == "CORRECTION_NEEDED"
+        assert result["converged"] is True
+
+    def test_zero_cash_flow_irr(self, engine):
+        """Cash flow [-100, 0, 0, 100] — single sign change, should converge."""
+        result = engine.verify_irr(
+            cash_flows=[-100, 0, 0, 100],
+            expected=0.0,
+            tolerance=0.01,
+        )
+        # IRR of [-100, 0, 0, 100] is 0% (100/100 = 1, (1+r)^3 = 1, r=0)
+        assert result["status"] in ("VERIFIED", "BLOCKED")
+        # If it converges, it should verify at 0%
+        if result["status"] == "VERIFIED":
+            assert result["is_correct"] is True
+
+    def test_empty_cash_flows_error(self, engine):
+        """Empty cash flows -> ERROR."""
+        result = engine.verify_irr(cash_flows=[], expected=0.1)
+        assert result["status"] == "ERROR"
+
+    def test_single_cash_flow_error(self, engine):
+        """Single cash flow -> ERROR (need at least 2)."""
+        result = engine.verify_irr(cash_flows=[-100], expected=0.1)
+        assert result["status"] == "ERROR"
+
+    def test_all_zero_cash_flows_blocked(self, engine):
+        """All-zero cash flows: IRR is undefined -> BLOCKED."""
+        result = engine.verify_irr(cash_flows=[0, 0, 0], expected=0.1)
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+        assert "undefined" in result["error"]
+
+    def test_same_sign_cash_flows_blocked(self, engine):
+        """All positive cash flows: no real IRR exists -> BLOCKED."""
+        result = engine.verify_irr(cash_flows=[100, 200, 300], expected=0.1)
+        assert result["is_correct"] is False
+        assert result["status"] == "BLOCKED"
+        assert "same sign" in result["error"]
+        assert result["sign_changes"] == 0

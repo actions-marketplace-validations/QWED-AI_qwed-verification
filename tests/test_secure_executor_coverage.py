@@ -2,7 +2,11 @@
 import unittest
 import docker
 from unittest.mock import MagicMock, patch
-from src.qwed_new.core.secure_code_executor import SecureCodeExecutor, ExecutionError
+from src.qwed_new.core.secure_code_executor import (
+    SECURE_RUNTIME_UNAVAILABLE,
+    SecureCodeExecutor,
+    ExecutionError,
+)
 
 class TestSecureExecutorCoverage(unittest.TestCase):
     """Targeted tests to improve coverage of secure_code_executor.py"""
@@ -19,7 +23,27 @@ class TestSecureExecutorCoverage(unittest.TestCase):
             executor = SecureCodeExecutor()
             success, error, _ = executor.execute("print(1)", {})
             self.assertFalse(success)
-            self.assertIn("Docker is not available", error)
+            self.assertEqual(SECURE_RUNTIME_UNAVAILABLE, error)
+
+    def test_is_available_rechecks_docker_health(self):
+        """Test live Docker health check instead of relying on cached startup state."""
+        executor = SecureCodeExecutor()
+        executor.docker_available = True
+        executor.client = MagicMock()
+        executor.client.ping.side_effect = Exception("Docker daemon unavailable")
+
+        self.assertFalse(executor.is_available())
+        self.assertTrue(executor.docker_available)
+
+    def test_is_available_recovers_after_transient_ping_failure(self):
+        """Test Docker availability check recovers once ping succeeds again."""
+        executor = SecureCodeExecutor()
+        executor.docker_available = True
+        executor.client = MagicMock()
+        executor.client.ping.side_effect = [Exception("Temporary Docker issue"), None]
+
+        self.assertFalse(executor.is_available())
+        self.assertTrue(executor.is_available())
 
     def test_execute_os_error_tempdir(self):
         """Test execute when tempfile creation fails."""
@@ -90,19 +114,54 @@ class TestSecureExecutorCoverage(unittest.TestCase):
         with self.assertRaises(ExecutionError):
             executor._run_in_container("/tmp", "exec_1")
 
-    def test_code_verifier_fallback_and_safety_check(self):
-        """Test fallback to basic safety check when CodeVerifier missing."""
-        # 1. Mock import error for CodeVerifier
+    def test_code_verifier_import_error_fails_closed(self):
+        """CodeVerifier import failures must block execution safety checks."""
         with patch.dict("sys.modules", {"qwed_new.core.code_verifier": None}):
-             executor = SecureCodeExecutor()
-             # 2. Test Safe Code
-             is_safe, _ = executor._is_safe_code("print('hello')")
-             self.assertTrue(is_safe)
-             
-             # 3. Test Unsafe Code (loop coverage)
-             is_safe, reason = executor._is_safe_code("import os; os.system('ls')")
-             self.assertFalse(is_safe)
-             self.assertIn("dangerous operation", reason)
+            executor = SecureCodeExecutor()
+
+            is_safe, reason = executor._is_safe_code("print('hello')")
+            self.assertFalse(is_safe)
+            self.assertIn("CodeVerifier unavailable", reason)
+
+    def test_execute_fails_closed_when_code_verifier_missing(self):
+        """Execution must not proceed when CodeVerifier cannot be imported."""
+        with patch.dict("sys.modules", {"qwed_new.core.code_verifier": None}):
+            executor = SecureCodeExecutor()
+            executor.client = MagicMock()
+            executor.client.ping.return_value = None
+
+            success, error, result = executor.execute("print('hello')", {})
+
+            self.assertFalse(success)
+            self.assertIn("Code safety validation failed", error)
+            self.assertIn("CodeVerifier unavailable", error)
+            self.assertIsNone(result)
+            executor.client.containers.run.assert_not_called()
+
+    def test_execute_import_error_returns_advisory_reason_without_authorizing(self):
+        """Heuristic fallback may inform the error but must never authorize execution."""
+        with patch.dict("sys.modules", {"qwed_new.core.code_verifier": None}):
+            executor = SecureCodeExecutor()
+            executor.client = MagicMock()
+            executor.client.ping.return_value = None
+
+            success, error, result = executor.execute("import os; result = os.name", {})
+
+            self.assertFalse(success)
+            self.assertIn("CodeVerifier unavailable", error)
+            self.assertIn("Advisory-only fallback also flagged", error)
+            self.assertIn("dangerous operation", error)
+            self.assertIsNone(result)
+            executor.client.containers.run.assert_not_called()
+
+    def test_code_verifier_runtime_failure_fails_closed(self):
+        """Runtime failures inside CodeVerifier must block execution deterministically."""
+        executor = SecureCodeExecutor()
+        with patch("qwed_new.core.code_verifier.CodeVerifier.verify_code", side_effect=RuntimeError("engine down")):
+            is_safe, reason = executor._is_safe_code("print('hello')")
+
+        self.assertFalse(is_safe)
+        self.assertIn("CodeVerifier unavailable", reason)
 
 if __name__ == '__main__':
     unittest.main()

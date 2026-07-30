@@ -18,6 +18,7 @@ from typing import Any, Dict, Tuple, Optional
 
 
 logger = logging.getLogger(__name__)
+SECURE_RUNTIME_UNAVAILABLE = "SECURE_RUNTIME_UNAVAILABLE"
 
 def _sanitize_log_msg(msg: str) -> str:
     """Strip newline characters to prevent log injection."""
@@ -37,6 +38,7 @@ class SecureCodeExecutor:
     """
     
     def __init__(self):
+        self.client = None
         try:
             self.client = docker.from_env()
             self.docker_available = True
@@ -65,8 +67,8 @@ class SecureCodeExecutor:
         Returns:
             (success, error_message, result)
         """
-        if not self.docker_available:
-            return False, "Docker is not available. Cannot execute code securely.", None
+        if not self.is_available():
+            return False, SECURE_RUNTIME_UNAVAILABLE, None
         
         # 1. Pre-execution validation using AST
         is_safe, safety_reason = self._is_safe_code(code)
@@ -99,7 +101,7 @@ class SecureCodeExecutor:
                 
                 # 3. Run in Docker container
                 try:
-                    result = self._run_in_container(tmpdir, execution_id)
+                    self._run_in_container(tmpdir, execution_id)
                     
                     # 4. Parse result
                     result_file = os.path.join(tmpdir, "result.json")
@@ -156,15 +158,15 @@ class SecureCodeExecutor:
         try:
             # Wait for completion with timeout
             # Note: docker-py wait() timeout is in seconds since v3.0.0
-            wait_result = container.wait(timeout=self.timeout)
+            container.wait(timeout=self.timeout)
             return container
         except Exception as e:
             logger.warning(f"Container timeout or error: {e}")
             try:
                 container.kill()
-            except:
-                pass
-            raise ExecutionError(f"Execution timed out after {self.timeout}s")
+            except Exception:
+                logger.debug("Failed to kill container after timeout", exc_info=True)
+            raise ExecutionError(f"Execution timed out after {self.timeout}s") from e
     
     def _is_safe_code(self, code: str) -> Tuple[bool, Optional[str]]:
         """
@@ -186,9 +188,25 @@ class SecureCodeExecutor:
             return True, None
             
         except ImportError:
-            logger.warning("CodeVerifier not available, using basic validation")
-            # Fallback: basic keyword check
-            return self._basic_safety_check(code)
+            logger.error("CodeVerifier not available; blocking execution")
+            return self._build_fail_closed_safety_denial(code)
+        except Exception as e:
+            logger.error(
+                "CodeVerifier failed during safety validation; blocking execution: %s",
+                _sanitize_log_msg(str(e)),
+            )
+            return self._build_fail_closed_safety_denial(code)
+
+    def _build_fail_closed_safety_denial(self, code: str) -> Tuple[bool, str]:
+        """Return a deterministic fail-closed denial when CodeVerifier cannot be used."""
+        is_basic_safe, advisory_reason = self._basic_safety_check(code)
+        advisory_suffix = ""
+        if not is_basic_safe and advisory_reason:
+            advisory_suffix = f" Advisory-only fallback also flagged: {advisory_reason}"
+        return (
+            False,
+            f"CodeVerifier unavailable; cannot validate code safety.{advisory_suffix}",
+        )
     
     def _basic_safety_check(self, code: str) -> Tuple[bool, Optional[str]]:
         """Basic safety check if CodeVerifier is not available."""
@@ -304,8 +322,16 @@ except Exception as e:
         return self.execution_count
     
     def is_available(self) -> bool:
-        """Check if Docker is available."""
-        return self.docker_available
+        """Check if Docker is currently available."""
+        if self.client is None:
+            return False
+
+        try:
+            self.client.ping()
+            return True
+        except Exception as e:
+            logger.warning("Docker availability check failed: %s", e)
+            return False
 
 
 class ExecutionError(Exception):

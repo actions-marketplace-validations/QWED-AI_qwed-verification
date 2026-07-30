@@ -12,13 +12,11 @@ import json
 import time
 import os
 import requests
-from typing import Dict, List, Any
+from typing import Dict
 import sys
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-from src.qwed_new.core.verifier import VerificationEngine
 
 # Azure Claude API config - USE ENVIRONMENT VARIABLES
 AZURE_ENDPOINT = os.getenv(
@@ -96,7 +94,7 @@ def call_claude(query: str) -> str:
         if numbers:
             return float(numbers[0])
         return None
-    except:
+    except Exception:
         return None
 
 def verify_with_qwed(query: str, llm_answer: float, expected: float) -> Dict:
@@ -213,9 +211,7 @@ def run_benchmark():
         
         try:
             # Get Claude's answer
-            start = time.time()
             claude_answer = call_claude(item["query"])
-            latency = time.time() - start
             
             if claude_answer is None:
                 print(f"  ⚠️ Claude returned invalid response")

@@ -9,10 +9,14 @@ or used in downstream systems, preventing XSS, code injection, and other attacks
 import re
 import html
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Compiled pattern for data URI prefix — used in a loop with re.search + str.find
+# to avoid the polynomial ReDoS flagged by CodeQL on the naive re.sub approach.
+_DATA_URI_PREFIX = re.compile(r'data:text/html', re.IGNORECASE)
 
 
 class OutputSanitizer:
@@ -50,6 +54,13 @@ class OutputSanitizer:
         # Sanitization event counter
         self.sanitization_count = 0
     
+    def _sanitize_for_log(self, value: Any) -> str:
+        """Return a log-safe string to prevent log injection/forgery."""
+        text = str(value)
+        text = text.replace("\r", "\\r").replace("\n", "\\n")
+        text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+        return text
+
     def sanitize_output(
         self, 
         result: Dict[str, Any], 
@@ -78,8 +89,9 @@ class OutputSanitizer:
                 sanitized_value = self._strip_dangerous_content(value)
                 if sanitized_value != value:
                     changes_made = True
+                    safe_key = self._sanitize_for_log(key)
                     logger.warning(
-                        f"Sanitized output field '{key}' for org {organization_id}: "
+                        f"Sanitized output field '{safe_key}' for org {organization_id}: "
                         f"removed {len(value) - len(sanitized_value)} dangerous chars"
                     )
                 sanitized_result[key] = sanitized_value
@@ -136,7 +148,27 @@ class OutputSanitizer:
             cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
         
         # Layer 2: Remove data URIs (can contain base64-encoded malicious content)
-        cleaned = re.sub(r'data:text/html[^,]*,', '', cleaned, flags=re.IGNORECASE)
+        # Uses re.search + str.find instead of re.sub with [^,]* to avoid
+        # the polynomial backtracking flagged by CodeQL py/polynomial-redos.
+        _out = []
+        _pos = 0
+        while True:
+            _m = _DATA_URI_PREFIX.search(cleaned, _pos)
+            if not _m:
+                _out.append(cleaned[_pos:])
+                break
+            _idx = _m.start()
+            # Bound comma search to this URI only (stop at next prefix)
+            _next_m = _DATA_URI_PREFIX.search(cleaned, _idx + 1)
+            _search_end = _next_m.start() if _next_m else len(cleaned)
+            _comma = cleaned.find(',', _idx, _search_end)
+            if _comma == -1:
+                _out.append(cleaned[_pos:_search_end])
+                _pos = _search_end
+                continue
+            _out.append(cleaned[_pos:_idx])
+            _pos = _comma + 1
+        cleaned = ''.join(_out)
         
         # Layer 3: HTML encode special characters
         # This prevents any remaining HTML from being executed

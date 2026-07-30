@@ -220,14 +220,14 @@ class BatchVerificationService:
             )
         
         elif item.verification_type == VerificationType.MATH:
-            from sympy.parsing.sympy_parser import parse_expr
+            from qwed_new.core.safe_parser import safe_parse_expr
             from sympy import simplify
             
             expression = item.query
             if "=" in expression:
                 left, right = expression.split("=", 1)
-                left_expr = parse_expr(left)
-                right_expr = parse_expr(right)
+                left_expr = safe_parse_expr(left)
+                right_expr = safe_parse_expr(right)
                 diff = simplify(left_expr - right_expr)
                 is_valid = diff == 0
                 return {
@@ -236,12 +236,17 @@ class BatchVerificationService:
                     "message": "Identity verified" if is_valid else "Not equal"
                 }
             else:
-                parsed = parse_expr(expression)
+                parsed = safe_parse_expr(expression)
                 simplified = simplify(parsed)
                 return {
-                    "is_valid": True,
+                    "is_valid": False,
+                    "status": "SIMPLIFIED",
                     "simplified": str(simplified),
-                    "type": "math"
+                    "type": "math",
+                    "message": (
+                        "Expression simplified, but no equality or proof claim "
+                        "was provided"
+                    ),
                 }
         
         elif item.verification_type == VerificationType.CODE:
@@ -255,10 +260,11 @@ class BatchVerificationService:
         elif item.verification_type == VerificationType.FACT:
             from qwed_new.core.fact_verifier import FactVerifier
             verifier = FactVerifier()
-            return verifier.verify_fact(
+            result = verifier.verify_fact(
                 item.query,
                 item.params.get("context", "")
             )
+            return result.to_dict()
         
         elif item.verification_type == VerificationType.SQL:
             from qwed_new.core.sql_verifier import SQLVerifier

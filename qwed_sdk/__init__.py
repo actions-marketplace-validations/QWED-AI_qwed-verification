@@ -1,4 +1,4 @@
-# Copyright (c) 2024 QWED Team
+# Copyright (c) 2025 QWED Team
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -37,7 +37,7 @@ from qwed_sdk.models import (
     VerificationType,
 )
 
-__version__ = "2.1.0-dev"
+__version__ = "5.3.0"
 __all__ = [
     "QWEDClient",
     "QWEDAsyncClient",

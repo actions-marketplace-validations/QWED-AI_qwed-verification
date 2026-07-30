@@ -12,7 +12,16 @@ Provides AST-based SQL analysis to prevent:
 import sqlglot
 from sqlglot import exp, parse_one
 from typing import List, Dict, Any, Optional, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+
+def _available_expression_types(*names: str) -> Set[type]:
+    """Return the sqlglot expression classes that exist in the installed version."""
+    return {
+        expression
+        for name in names
+        if (expression := getattr(exp, name, None)) is not None
+    }
 
 
 @dataclass
@@ -60,15 +69,26 @@ class SQLVerifier:
     """
     
     # Destructive commands (Blocked by default)
-    DESTRUCTIVE_COMMANDS = {
-        exp.Drop, exp.Delete, exp.Update, exp.Insert, 
-        exp.Alter, exp.TruncateTable, exp.Create, exp.Merge
-    }
+    DESTRUCTIVE_COMMANDS = _available_expression_types(
+        "Drop",
+        "Delete",
+        "Update",
+        "Insert",
+        "Alter",
+        "Truncate",
+        "TruncateTable",
+        "Create",
+        "Merge",
+    )
 
     # Administrative / Permission commands
-    ADMIN_COMMANDS = {
-        exp.Grant, exp.Revoke, exp.Transaction, exp.Set, exp.Command
-    }
+    ADMIN_COMMANDS = _available_expression_types(
+        "Grant",
+        "Revoke",
+        "Set",
+        "Transaction",
+        "Command",
+    )
 
     # Sensitive columns (Forbidden in SELECT/WHERE by default)
     DEFAULT_SENSITIVE_COLUMNS = {

@@ -13,20 +13,24 @@ Enterprise Features:
 - Decimal precision for financial calculations
 """
 
-import sympy
 from sympy import (
-    Symbol, symbols, Matrix, sqrt, sin, cos, tan, log, exp, pi, E,
-    diff, integrate, limit, oo, factorial, binomial, gcd, lcm,
-    simplify, expand, factor, solve, Eq, summation, product,
-    Rational, Float, N
+    Symbol, Matrix,
+    diff, integrate, limit, oo,
+    simplify, expand
 )
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
-from sympy.stats import Normal, Exponential, Poisson, Binomial, density, E as ExpectedValue, variance, std
-from typing import Any, Dict, List, Optional, Union, Tuple
+from qwed_new.core.safe_parser import safe_parse_expr, get_safe_symbol
+from sympy.parsing.sympy_parser import standard_transformations, implicit_multiplication_application
+from typing import Any, Dict, List, Optional
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import dataclass
-import re
 import math
+
+INVALID_TEMPERATURE_UNIT_ERROR = "Invalid temperature unit"
+INVALID_TOLERANCE_ERROR = "Invalid tolerance"
+TOLERANCE_POLICY_ERROR = "Tolerance exceeds deterministic verification bound"
+VERIFY_LOGIC_RULE_DEPRECATED_ERROR = (
+    "verify_logic_rule is deprecated and fail-closed; use LogicVerifier instead"
+)
 
 
 @dataclass
@@ -50,6 +54,8 @@ class VerificationEngine:
     
     # Parsing transformations for more natural input
     TRANSFORMATIONS = standard_transformations + (implicit_multiplication_application,)
+    MAX_VERIFY_MATH_TOLERANCE_RATIO = Decimal("0.01")
+    MIN_VERIFY_MATH_TOLERANCE_CAP = Decimal("0.01")
     
     def __init__(self):
         """Initialize the verification engine."""
@@ -62,6 +68,24 @@ class VerificationEngine:
             't': Symbol('t'),
             'r': Symbol('r'),
         }
+
+    def _parse_tolerance(self, tolerance: float | Decimal) -> Decimal:
+        """Parse and validate caller-provided tolerance deterministically."""
+        try:
+            tolerance_decimal = Decimal(str(tolerance))
+        except Exception as exc:
+            raise ValueError(INVALID_TOLERANCE_ERROR) from exc
+
+        if not tolerance_decimal.is_finite() or tolerance_decimal < 0:
+            raise ValueError(INVALID_TOLERANCE_ERROR)
+
+        return tolerance_decimal
+
+    def _max_verify_math_tolerance(self, calculated_value: Decimal) -> Decimal:
+        """Bound tolerance as a deterministic function of computed magnitude."""
+        magnitude = abs(calculated_value)
+        dynamic_cap = magnitude * self.MAX_VERIFY_MATH_TOLERANCE_RATIO
+        return max(self.MIN_VERIFY_MATH_TOLERANCE_CAP, dynamic_cap)
     
     # =========================================================================
     # Core Math Verification
@@ -70,7 +94,7 @@ class VerificationEngine:
     def verify_math(
         self, 
         expression: str, 
-        expected_value: float, 
+        expected_value: float | Decimal, 
         tolerance: float = 1e-6,
         use_decimal: bool = True
     ) -> Dict[str, Any]:
@@ -79,7 +103,7 @@ class VerificationEngine:
         
         Args:
             expression: The math string (e.g., "2 * (5 + 10)")
-            expected_value: The value the LLM claims it is (e.g., 30)
+            expected_value: The value the LLM claims it is (e.g., 30 or Decimal("30"))
             tolerance: Floating point tolerance
             use_decimal: If True, use Decimal for exact arithmetic (financial)
             
@@ -87,8 +111,17 @@ class VerificationEngine:
             Dict containing is_correct, calculated_value, and status.
         """
         try:
+            tolerance_decimal = self._parse_tolerance(tolerance)
+        except ValueError as e:
+            return {
+                "is_correct": False,
+                "error": str(e),
+                "status": "BLOCKED"
+            }
+
+        try:
             # 1. Parse the expression safely
-            expr = parse_expr(expression, transformations=self.TRANSFORMATIONS)
+            expr = safe_parse_expr(expression)
             
             # 2. Evaluate deterministically
             if use_decimal:
@@ -98,9 +131,21 @@ class VerificationEngine:
                     rounding=ROUND_HALF_UP
                 )
                 expected_decimal = Decimal(str(expected_value))
+                max_tolerance = self._max_verify_math_tolerance(calculated_value)
+
+                if tolerance_decimal > max_tolerance:
+                    return {
+                        "is_correct": False,
+                        "error": TOLERANCE_POLICY_ERROR,
+                        "requested_tolerance": str(tolerance_decimal),
+                        "max_allowed_tolerance": str(max_tolerance),
+                        "calculated_value": str(calculated_value),
+                        "precision_mode": "decimal",
+                        "status": "BLOCKED",
+                    }
                 
                 diff = abs(calculated_value - expected_decimal)
-                is_correct = diff <= Decimal(str(tolerance))
+                is_correct = diff <= tolerance_decimal
                 
                 return {
                     "is_correct": is_correct,
@@ -111,20 +156,32 @@ class VerificationEngine:
                     "precision_mode": "decimal",
                     "status": "VERIFIED" if is_correct else "CORRECTION_NEEDED"
                 }
-            else:
-                calculated_value = float(expr.evalf())
-                diff = abs(calculated_value - expected_value)
-                is_correct = diff <= tolerance
-                
+
+            calculated_value = float(expr.evalf())
+            max_tolerance = self._max_verify_math_tolerance(Decimal(str(calculated_value)))
+
+            if tolerance_decimal > max_tolerance:
                 return {
-                    "is_correct": is_correct,
-                    "calculated_value": calculated_value,
-                    "claimed_value": expected_value,
-                    "diff": diff,
+                    "is_correct": False,
+                    "error": TOLERANCE_POLICY_ERROR,
+                    "requested_tolerance": str(tolerance_decimal),
+                    "max_allowed_tolerance": str(max_tolerance),
+                    "calculated_value": str(calculated_value),
                     "precision_mode": "float",
-                    "status": "VERIFIED" if is_correct else "CORRECTION_NEEDED"
+                    "status": "BLOCKED",
                 }
+
+            diff = abs(calculated_value - expected_value)
+            is_correct = diff <= float(tolerance_decimal)
             
+            return {
+                "is_correct": is_correct,
+                "calculated_value": calculated_value,
+                "claimed_value": expected_value,
+                "diff": diff,
+                "precision_mode": "float",
+                "status": "VERIFIED" if is_correct else "CORRECTION_NEEDED"
+            }
         except Exception as e:
             return {
                 "is_correct": False,
@@ -141,8 +198,8 @@ class VerificationEngine:
             verify_identity("sin(x)**2 + cos(x)**2", "1")  # True
         """
         try:
-            left = parse_expr(lhs, transformations=self.TRANSFORMATIONS)
-            right = parse_expr(rhs, transformations=self.TRANSFORMATIONS)
+            left = safe_parse_expr(lhs)
+            right = safe_parse_expr(rhs)
             
             # Method 1: Simplify difference
             diff = simplify(left - right)
@@ -166,21 +223,28 @@ class VerificationEngine:
             x = Symbol('x')
             test_values = [0.5, 1, 2, -1, 0.1]
             matches = 0
+            evaluated_points = 0
             for val in test_values:
                 try:
                     left_val = float(left.subs(x, val).evalf())
                     right_val = float(right.subs(x, val).evalf())
+                    evaluated_points += 1
                     if abs(left_val - right_val) < 1e-10:
                         matches += 1
-                except:
+                except Exception:
+                    # Some sample points may be outside the domain; skip those values.
                     pass
             
-            if matches == len(test_values):
+            if evaluated_points > 0 and matches == evaluated_points:
                 return {
-                    "is_equivalent": True,
-                    "status": "LIKELY_EQUIVALENT",
-                    "method": "numerical_sampling",
-                    "confidence": 0.99
+                    "is_equivalent": False,
+                    "status": "BLOCKED",
+                    "method": "numerical_sampling_rejected",
+                    "confidence": 0.0,
+                    "reason": (
+                        "Numerical sampling matched at fixed points, but no formal proof "
+                        "was established"
+                    ),
                 }
             
             return {
@@ -218,9 +282,9 @@ class VerificationEngine:
             order: Order of derivative (1 for first, 2 for second, etc.)
         """
         try:
-            expr = parse_expr(expression, transformations=self.TRANSFORMATIONS)
-            var = Symbol(variable)
-            expected_expr = parse_expr(expected, transformations=self.TRANSFORMATIONS)
+            expr = safe_parse_expr(expression)
+            var = get_safe_symbol(variable)
+            expected_expr = safe_parse_expr(expected)
             
             # Calculate derivative
             actual_derivative = diff(expr, var, order)
@@ -265,14 +329,14 @@ class VerificationEngine:
             upper_bound: Upper bound for definite integral
         """
         try:
-            expr = parse_expr(expression, transformations=self.TRANSFORMATIONS)
-            var = Symbol(variable)
-            expected_expr = parse_expr(expected, transformations=self.TRANSFORMATIONS)
+            expr = safe_parse_expr(expression)
+            var = get_safe_symbol(variable)
+            expected_expr = safe_parse_expr(expected)
             
             if lower_bound is not None and upper_bound is not None:
                 # Definite integral
-                lower = parse_expr(lower_bound, transformations=self.TRANSFORMATIONS)
-                upper = parse_expr(upper_bound, transformations=self.TRANSFORMATIONS)
+                lower = safe_parse_expr(lower_bound)
+                upper = safe_parse_expr(upper_bound)
                 actual_integral = integrate(expr, (var, lower, upper))
                 
                 # For definite integrals, compare values
@@ -322,9 +386,9 @@ class VerificationEngine:
             direction: "+" for right, "-" for left, "+-" for both
         """
         try:
-            expr = parse_expr(expression, transformations=self.TRANSFORMATIONS)
-            var = Symbol(variable)
-            expected_expr = parse_expr(expected, transformations=self.TRANSFORMATIONS)
+            expr = safe_parse_expr(expression)
+            var = get_safe_symbol(variable)
+            expected_expr = safe_parse_expr(expected)
             
             # Parse the point (handle infinity)
             if point.lower() in ['oo', 'inf', 'infinity']:
@@ -332,7 +396,7 @@ class VerificationEngine:
             elif point.lower() in ['-oo', '-inf', '-infinity']:
                 pt = -oo
             else:
-                pt = parse_expr(point, transformations=self.TRANSFORMATIONS)
+                pt = safe_parse_expr(point)
             
             # Calculate limit
             actual_limit = limit(expr, var, pt, dir=direction)
@@ -364,7 +428,7 @@ class VerificationEngine:
         self, 
         operation: str,
         matrices: Dict[str, List[List[float]]],
-        expected: Union[List[List[float]], float, List[float]]
+        expected: List[List[float]] | float | List[float]
     ) -> Dict[str, Any]:
         """
         Verify matrix operations.
@@ -415,9 +479,28 @@ class VerificationEngine:
                 
             elif operation == "eigenvalues":
                 mat = list(sympy_matrices.values())[0]
-                eigenvals = list(mat.eigenvals().keys())
+                # Expand by algebraic multiplicity so repeated roots are counted
+                eigen_multiset = mat.eigenvals()
+                eigenvals = [v for v, m in eigen_multiset.items() for _ in range(m)]
                 eigenvals_float = sorted([complex(v.evalf()).real for v in eigenvals])
                 expected_sorted = sorted(expected)
+                # Cardinality check: claim must match exact eigenvalue count (Issue #130)
+                if len(eigenvals_float) != len(expected_sorted):
+                    return {
+                        "is_correct": False,
+                        "status": "CORRECTION_NEEDED",
+                        "error": (
+                            f"Eigenvalue cardinality mismatch: matrix has "
+                            f"{len(eigenvals_float)} eigenvalue(s) (counting "
+                            f"multiplicity) but {len(expected_sorted)} claimed. "
+                            f"All eigenvalues including repeated roots must be "
+                            f"specified for verification."
+                        ),
+                        "calculated_eigenvalues": eigenvals_float,
+                        "claimed_eigenvalues": list(expected),
+                        "calculated_count": len(eigenvals_float),
+                        "claimed_count": len(expected_sorted),
+                    }
                 is_correct = all(
                     abs(a - b) < 1e-6 
                     for a, b in zip(eigenvals_float, expected_sorted)
@@ -426,7 +509,7 @@ class VerificationEngine:
                     "is_correct": is_correct,
                     "status": "VERIFIED" if is_correct else "CORRECTION_NEEDED",
                     "calculated_eigenvalues": eigenvals_float,
-                    "claimed_eigenvalues": expected
+                    "claimed_eigenvalues": list(expected)
                 }
             else:
                 return {"is_correct": False, "status": "ERROR", "error": f"Unknown operation: {operation}"}
@@ -531,6 +614,59 @@ class VerificationEngine:
         except Exception as e:
             return {"is_correct": False, "status": "ERROR", "error": str(e)}
     
+    @staticmethod
+    def _count_sign_changes(cash_flows: List[float]) -> int:
+        """Count sign changes in cash flows, skipping zeros (Descartes' rule)."""
+        sign_changes = 0
+        last_sign = 0
+        for cf in cash_flows:
+            if cf > 0:
+                if last_sign < 0:
+                    sign_changes += 1
+                last_sign = 1
+            elif cf < 0:
+                if last_sign > 0:
+                    sign_changes += 1
+                last_sign = -1
+        return sign_changes
+
+    @staticmethod
+    def _find_irr_newton(cash_flows: List[float]) -> Dict[str, Any]:
+        """Run Newton-Raphson to find IRR. Returns result dict with convergence info."""
+        r = Decimal("0.1")
+        convergence_threshold = Decimal("0.0001")
+        max_iterations = 100
+
+        for iteration in range(max_iterations):
+            npv = Decimal("0")
+            npv_derivative = Decimal("0")
+
+            for t, cf in enumerate(cash_flows):
+                cf_dec = Decimal(str(cf))
+                npv += cf_dec / ((1 + r) ** t)
+                if t > 0:
+                    npv_derivative -= t * cf_dec / ((1 + r) ** (t + 1))
+
+            if abs(npv) < convergence_threshold:
+                return {"converged": True, "irr": float(r), "iterations": iteration + 1}
+
+            if npv_derivative == 0:
+                return {
+                    "converged": False,
+                    "reason": "derivative_stall",
+                    "iterations": iteration + 1,
+                    "r": float(r),
+                }
+
+            r = r - npv / npv_derivative
+
+        return {
+            "converged": False,
+            "reason": "max_iterations",
+            "iterations": max_iterations,
+            "residual": float(abs(npv)),
+        }
+
     def verify_irr(
         self,
         cash_flows: List[float],
@@ -540,29 +676,73 @@ class VerificationEngine:
         """
         Verify Internal Rate of Return calculation.
         
-        IRR is the rate where NPV = 0
+        IRR is the rate where NPV = 0.
+        Fail-closed: non-convergence, derivative stall, and ambiguous
+        (multi-root) cash flow patterns are blocked, not verified.
         """
         try:
-            # Newton-Raphson method to find IRR
-            r = Decimal("0.1")  # Initial guess
-            
-            for _ in range(100):  # Max iterations
-                npv = Decimal("0")
-                npv_derivative = Decimal("0")
-                
-                for t, cf in enumerate(cash_flows):
-                    cf_dec = Decimal(str(cf))
-                    npv += cf_dec / ((1 + r) ** t)
-                    if t > 0:
-                        npv_derivative -= t * cf_dec / ((1 + r) ** (t + 1))
-                
-                if abs(npv) < Decimal("0.0001"):
-                    break
-                    
-                if npv_derivative != 0:
-                    r = r - npv / npv_derivative
-            
-            irr = float(r)
+            if not cash_flows or len(cash_flows) < 2:
+                return {"is_correct": False, "status": "ERROR", "error": "Need at least 2 cash flows"}
+
+            # All-zero cash flows: IRR is mathematically undefined
+            if all(cf == 0 for cf in cash_flows):
+                return {
+                    "is_correct": False,
+                    "status": "BLOCKED",
+                    "error": "IRR is undefined: all cash flows are zero. Any rate satisfies NPV=0.",
+                    "cash_flows": cash_flows,
+                }
+
+            # Descartes' rule of signs: detect multi-root or no-root ambiguity
+            sign_changes = self._count_sign_changes(cash_flows)
+
+            if sign_changes == 0:
+                return {
+                    "is_correct": False,
+                    "status": "BLOCKED",
+                    "error": "No real IRR exists: all cash flows have the same sign (zero sign changes).",
+                    "sign_changes": 0,
+                    "cash_flows": cash_flows,
+                }
+
+            if sign_changes > 1:
+                return {
+                    "is_correct": False,
+                    "status": "BLOCKED",
+                    "error": (
+                        f"Ambiguous IRR: {sign_changes} sign changes in cash flows "
+                        f"implies up to {sign_changes} possible roots. Cannot "
+                        f"deterministically verify a unique IRR."
+                    ),
+                    "sign_changes": sign_changes,
+                    "cash_flows": cash_flows,
+                }
+
+            # Newton-Raphson to find IRR
+            newton_result = self._find_irr_newton(cash_flows)
+
+            if not newton_result["converged"]:
+                if newton_result["reason"] == "derivative_stall":
+                    error_msg = (
+                        f"IRR verification failed: derivative is zero at "
+                        f"iteration {newton_result['iterations']} (r={newton_result['r']:.6f}). "
+                        f"Newton-Raphson cannot converge from this path."
+                    )
+                else:
+                    error_msg = (
+                        f"IRR verification failed: Newton-Raphson did not converge "
+                        f"within {newton_result['iterations']} iterations. Final NPV residual: "
+                        f"{newton_result['residual']:.8f}."
+                    )
+                return {
+                    "is_correct": False,
+                    "status": "BLOCKED",
+                    "error": error_msg,
+                    "iterations_used": newton_result["iterations"],
+                    "cash_flows": cash_flows,
+                }
+
+            irr = newton_result["irr"]
             is_correct = abs(irr - expected) <= tolerance
             
             return {
@@ -570,6 +750,8 @@ class VerificationEngine:
                 "status": "VERIFIED" if is_correct else "CORRECTION_NEEDED",
                 "calculated_irr": irr,
                 "claimed_irr": expected,
+                "converged": True,
+                "iterations_used": newton_result["iterations"],
                 "cash_flows": cash_flows
             }
             
@@ -672,7 +854,22 @@ class VerificationEngine:
             elif statistic == "mode":
                 from collections import Counter
                 counter = Counter(data)
-                calculated = counter.most_common(1)[0][0]
+                max_freq = max(counter.values())
+                modes = [val for val, freq in counter.items() if freq == max_freq]
+                if len(modes) > 1:
+                    return {
+                        "is_correct": False,
+                        "status": "BLOCKED",
+                        "error": (
+                            f"Ambiguous mode: {len(modes)} values share the maximum "
+                            f"frequency ({max_freq}). Cannot deterministically verify "
+                            f"a single mode. Modes: {sorted(modes, key=str)}"
+                        ),
+                        "statistic": statistic,
+                        "data_points": n,
+                        "ambiguous_modes": sorted(modes, key=str),
+                    }
+                calculated = modes[0]
             elif statistic == "variance":
                 mean = sum(data) / n
                 calculated = sum((x - mean) ** 2 for x in data) / n
@@ -859,23 +1056,21 @@ class VerificationEngine:
         to_u = unit_map.get(to_unit)
         
         if not from_u or not to_u:
-            return {"is_correct": False, "status": "ERROR", "error": "Invalid temperature unit"}
-        
+            return {"is_correct": False, "status": "ERROR", "error": INVALID_TEMPERATURE_UNIT_ERROR}
+
         # Convert to Celsius first
-        if from_u == 'celsius':
-            celsius = value
-        elif from_u == 'fahrenheit':
-            celsius = (value - 32) * 5/9
-        elif from_u == 'kelvin':
-            celsius = value - 273.15
-        
+        celsius = {
+            'celsius': value,
+            'fahrenheit': (value - 32) * 5 / 9,
+            'kelvin': value - 273.15,
+        }[from_u]
+
         # Convert from Celsius to target
-        if to_u == 'celsius':
-            calculated = celsius
-        elif to_u == 'fahrenheit':
-            calculated = celsius * 9/5 + 32
-        elif to_u == 'kelvin':
-            calculated = celsius + 273.15
+        calculated = {
+            'celsius': celsius,
+            'fahrenheit': celsius * 9 / 5 + 32,
+            'kelvin': celsius + 273.15,
+        }[to_u]
         
         is_correct = abs(calculated - expected) <= tolerance
         
@@ -894,6 +1089,7 @@ class VerificationEngine:
     
     def verify_logic_rule(self, rule: str, context: Dict[str, Any]) -> bool:
         """
-        Legacy placeholder. Use LogicVerifier instead.
+        Legacy placeholder. Hard-fail closed and direct callers to LogicVerifier.
         """
-        pass
+        _ = (rule, context)
+        raise NotImplementedError(VERIFY_LOGIC_RULE_DEPRECATED_ERROR)
