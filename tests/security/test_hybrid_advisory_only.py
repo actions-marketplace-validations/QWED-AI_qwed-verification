@@ -307,7 +307,48 @@ class TestConsensusVerifierAdvisoryOnly:
         result = self.verifier._verify_with_stats("average of 0, 0, and 0")
         assert result.result == 0
         assert result.confidence == 0.98
-        assert result.status == "VERIFIED"
+        assert result.status == "UNVERIFIABLE"
+
+    def test_stats_unverifiable_cannot_produce_verified_consensus(self):
+        """Stats UNVERIFIABLE result prevents VERIFIED consensus even if unanimous."""
+        results = [
+            EngineResult(
+                engine_name="SymPy", method="math", result=4,
+                confidence=1.0, latency_ms=10, success=True,
+                status="VERIFIED",
+            ),
+            EngineResult(
+                engine_name="Stats", method="statistical_analysis", result=4,
+                confidence=0.98, latency_ms=10, success=True,
+                status="UNVERIFIABLE",
+            ),
+        ]
+        consensus = self.verifier._calculate_consensus(results)
+        assert consensus["diagnostic_status"] == "UNVERIFIABLE"
+        assert consensus["status"] == "unanimous"
+
+    def test_verified_evidence_answer_none_stays_null_and_type_differs(self):
+        """Verified consensus evidence: answer None→null, repr carries type info (#266)."""
+        from decimal import Decimal
+
+        verifier = ConsensusVerifier(enable_circuit_breaker=False)
+
+        none_result = verifier._calculate_consensus([
+            EngineResult("Logic", "logic", None, 1.0, 1.0, True, status="VERIFIED"),
+            EngineResult("Math", "symbolic_math", None, 1.0, 1.0, True, status="VERIFIED"),
+        ])
+        assert none_result["verified_evidence"]["answer"] is None
+
+        typed_result = verifier._calculate_consensus([
+            EngineResult("Logic", "logic", Decimal("1.0"), 1.0, 1.0, True, status="VERIFIED"),
+            EngineResult("Math", "symbolic_math", Decimal("1.0"), 1.0, 1.0, True, status="VERIFIED"),
+        ])
+        float_result = verifier._calculate_consensus([
+            EngineResult("Logic", "logic", 1.0, 1.0, 1.0, True, status="VERIFIED"),
+            EngineResult("Math", "symbolic_math", 1.0, 1.0, 1.0, True, status="VERIFIED"),
+        ])
+
+        assert typed_result["verified_evidence"]["answer"] != float_result["verified_evidence"]["answer"]
 
 
 # ========================================================================
@@ -461,11 +502,16 @@ class TestFactVerifierAdvisoryOnly:
     def setup_method(self):
         self.verifier = FactVerifier(use_llm_fallback=False)
 
-    def test_supported_verified(self):
-        """Deterministic SUPPORTED → VERIFIED with proof_ref."""
+    def test_supported_unverifiable_heuristic_only(self):
+        """Heuristic SUPPORTED → UNVERIFIABLE, never VERIFIED #267."""
         result = self.verifier.verify_fact("The sky is blue", "The sky is blue today")
-        assert result.is_verified
-        assert result.proof_ref is not None
+        assert result.status.value == "UNVERIFIABLE"
+        assert result.is_verified is False
+        assert result.proof_ref is None
+        assert result.developer_fields["deterministic_verdict"] == "SUPPORTED"
+        assert result.developer_fields["constraint_id"] == "fact_verifier.heuristic_supported"
+        # Heuristic verdict must live in advisory_checks, not in status (#267)
+        assert result.developer_fields["advisory_checks"][0].constraint_id == "fact_verifier.tfidf_cosine_similarity"
 
     def test_refuted_blocked(self):
         """REFUTED (negation conflict) → BLOCKED."""
