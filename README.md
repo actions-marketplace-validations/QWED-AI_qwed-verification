@@ -1,79 +1,74 @@
 <div align="center">
   <img src="assets/logo.png" alt="QWED Logo - AI Verification Engine" width="80" height="80">
-  <h1>QWED Protocol</h1>
-  <h3>Model-Agnostic Trust Boundary for AI Systems</h3>
+  <h1>QWED Verification</h1>
+  <h3>Reference implementation of the QWED Verification protocol and Verification Context v1.0</h3>
   
-  > **QWED Verification** - Production-grade deterministic trust boundary for LLMs, AI agents, and tool-driven systems. Works with **ANY LLM** - OpenAI, Anthropic, Gemini, Llama (via Ollama), or any local model. Detect and prevent AI hallucinations through multiple verification engines • agentic security guards • process determinism. **Your LLM, Your Choice, Our Verification.**
-  
-  <p>
-    <b>Don't fix the liar. Verify the lie.</b><br>
-    <i>QWED verifies outputs, processes, and tool interactions before they enter production.</i><br>
-    <i>For supported proof domains, hallucinations cannot bypass deterministic verification.</i>
-  </p>
+  QWED applies deterministic verification to AI outputs before production execution.
 
-  <p>
-    <b>If critical AI output cannot be verified, QWED can block it before production.</b>
-  </p>
+  Every verification returns a <code>DiagnosticResult</code>:
 
-  <p>
-    <b>🌐 Model Agnostic:</b> Local ($0) • Budget ($5/mo) • Premium ($100/mo) - You choose!
-  </p>
+  <b>VERIFIED</b> — proof established, evidence attached<br>
+  <b>UNVERIFIABLE</b> — proof could not be established<br>
+  <b>BLOCKED</b> — policy or rule rejected the action<br>
+
+  Admission: <b>ADMIT</b> | <b>BLOCKED</b>
+
+  Verification Context v1.0 provides the canonical evidence and proof model
+  (admission: <b>ADMIT</b> | <b>DENY</b> at the protocol layer).
+
+  <p><i>Don't fix the liar. Verify the lie.</i></p>
 
   [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/QWED-AI/qwed-verification?utm_source=badge)
   [![PyPI version](https://img.shields.io/pypi/v/qwed.svg)](https://pypi.org/project/qwed/)
   [![Docker Verified](https://img.shields.io/badge/Docker-Verified_Publisher-blue.svg?logo=docker&logoColor=white)](https://hub.docker.com/r/qwedai/qwed-verification)
   [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
   [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11903/badge)](https://www.bestpractices.dev/projects/11903)
-  [![Snyk Security](https://img.shields.io/badge/Snyk-Monitored-4C4A73?logo=snyk&logoColor=white)](https://app.snyk.io)
   [![QWED Security](https://img.shields.io/badge/GitHub_Marketplace-QWED_Security_%E2%9C%93-2ea44f?style=flat&logo=github&logoColor=white)](https://github.com/marketplace/qwed-security)
-  [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=QWED-AI_qwed-verification&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=QWED-AI_qwed-verification)
   [![DOI](https://zenodo.org/badge/1115581942.svg)](https://doi.org/10.5281/zenodo.18111675)
-  [![GitHub stars](https://img.shields.io/github/stars/QWED-AI/qwed-verification?style=social)](https://github.com/QWED-AI/qwed-verification)
-
-  [![Also on GitLab](https://img.shields.io/badge/Also%20on-GitLab%20(Enterprise)-FC6D26?logo=gitlab&logoColor=white)](https://gitlab.com/qwed-ai/qwed-verification)
-
-  <a href="https://www.nvidia.com/en-us/startups/"><img src="./assets/badges/nvidia-inception.png" alt="NVIDIA Inception Program" height="40"></a>
-  <a href="https://github.com/developer-program"><img src="https://img.shields.io/badge/GitHub_Developer_Program-Member-4183C4?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Developer Program" height="40"></a>
 
   <br>
-
-  **💖 Support QWED Development:**
-  
-  <a href="https://github.com/sponsors/QWED-AI"><img src="https://img.shields.io/github/sponsors/QWED-AI?style=for-the-badge&logo=githubsponsors&label=Sponsor&color=EA4AAA" alt="Sponsor QWED on GitHub"></a>
-
-  <br>
-  
-  [![Twitter](https://img.shields.io/badge/Twitter-@rahuldass29-1DA1F2?style=flat&logo=twitter&logoColor=white)](https://x.com/rahuldass29)
-  [![LinkedIn](https://img.shields.io/badge/LinkedIn-Rahul%20Dass-0077B5?style=flat&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/rahul-dass-23b370b0/)
-  [![Blog](https://img.shields.io/badge/Blog-Unreadable%20Code%20Benchmark-FF5722?style=flat&logo=docusaurus&logoColor=white)](https://docs.qwedai.com/blog/unreadable-code-agi-benchmark)
-
-  <br>
-  <a href="#-quick-start-install--verify-in-30-seconds">Quick Start</a> · 
-  <a href="#-first-time-setup-qwed-init">🆕 qwed init</a> ·
-  <a href="#-the-llm-hallucination-problem-why-ai-cant-be-trusted">The Problem</a> · 
-  <a href="#verification-engines-and-agent-security-guards">The Engines & Guards</a> ·
-  <a href="docs/INTEGRATION.md">🔌 Integration</a> ·
-  <a href="docs/QWED_LOCAL.md">⚡ QWEDLocal</a> ·
-  <a href="docs/CLI.md">🖥️ CLI</a> ·
-  <a href="docs/OLLAMA_INTEGRATION.md">🆓 Ollama (FREE!)</a> ·
-  <a href="https://docs.qwedai.com">📖 Full Documentation</a>
+  <a href="#-installation--quick-start">Quick Start</a> · 
+  <a href="#-first-time-setup-qwed-init">qwed init</a> ·
+  <a href="#verification-engines-and-agent-security-guards">Engines & Guards</a> ·
+  <a href="docs/INTEGRATION.md">Integration</a> ·
+  <a href="docs/QWED_LOCAL.md">QWEDLocal</a> ·
+  <a href="docs/CLI.md">CLI</a> ·
+  <a href="https://docs.qwedai.com">Full Documentation</a>
 </div>
 
 ---
 
-## Release Update: v6.0.0 — Trust Boundary Completion
+## Release Update: v7.1.0 — Verification Context v1.0 Rollout
 
-`v6.0.0` completes the **Trust Boundary Completion epic** — every verification API pathway now returns `DiagnosticResult` and routes through `enforce_trust_decision` (12/12 sub-issues, #263).
+`v7.1.0` ships the **Verification Context (VC) v1.0** — the external, interoperable layer on top of `DiagnosticResult`. Verification methods continue to return `DiagnosticResult`; a schema-validated, canonically-encoded, tamper-evident verification document describing *what* was verified, against *what* evidence, under *which* interpretation, with *what* admission decision is produced on demand via the explicit `to_verification_context()` conversion.
 
-- **All `/verify/*` endpoints return `DiagnosticResult`** — unified 3-layer response contract (status / `agent_message` / `developer_fields` / `proof_ref`) across every verification surface
-- **Mandatory attestation in the control plane** — `require_attestation=True`, attestations issued and verified at the admission boundary; enforcement result drives the response status
-- **VERIFIED is a protocol guarantee** — VERIFIED requires a non-empty `proof_ref` bound to the deterministic evidence; heuristic/advisory analysis reports `UNVERIFIABLE` with structured `advisory_checks`
-- **Architecture contract** — API = observation surface (honest witness), Control Plane = admission authority (judge); rules now codify this separation (#13-15)
-- **Security hardening** — TOCTOU closure in `enforce_trust_decision`, tenant-isolated verification cache, attestation signature-verified before claim decode, Unicode-normalized agent state
+- **VC v1.0 spec + ontology (ADR-001..005, #301–#302)** — object of verification, verification context, truth-vs-admission separation, formalization boundary, and root of trust are formally defined
+- **`VerificationContext` model + JSON schema (#308)** — 4-layer document (interpretation / proof / evidence / decision) with RFC 8785 canonical JSON encoding, UTF-16 key ordering, and fail-closed schema validation
+- **Public `proof_ref` generation / resolution (#309)** — content-bound SHA-256 reference generation and resolver exposed as public API
+- **Bridge: `verification_context_from_diagnostic_result()` (#310)** — converts `DiagnosticResult` → VC document; StatsVerifier is the first mapped verifier
+- **SDK / API / CLI exposure (#311)** — VC surfaces across the API routes, CLI, and SDK
+- **Docker action VC outputs (#313)** — the containerized GitHub Action now emits `verdict`, `admission`, `proof_ref`, and `verification_context` outputs
+- **SDK re-exports (#315)** — all VC types re-exported from `qwed_sdk`
+- **`to_verification_context()` on all 13 verifiers (#316)** — full engine coverage; conversion is explicit and returns a `VerificationContextDocument` from a `DiagnosticResult`
 
-> ⚠️ **Breaking change:** `/verify/*` responses now use the `DiagnosticResult` schema. Consumers parsing the previous ad-hoc dict format must migrate to the unified contract.
+> This is an **additive** minor release — no breaking wire changes; existing wire contracts remain unchanged. If you're upgrading from `v7.0.0`, the new VC surface is available but nothing you relied on changed behavior.
 
-If you're upgrading from `v5.3.x`, review the [changelog](CHANGELOG.md) for the full migration notes.
+If you're upgrading from `v6.0.x`, review the [changelog](CHANGELOG.md) for the full migration notes.
+
+---
+
+## Release Update: v7.0.0 — Full DiagnosticResult Engine Conformance
+
+`v7.0.0` completes **Meta #216** — every verification engine now returns the unified `DiagnosticResult`, and execution is never conflated with verification.
+
+- **All 13 engines conform to `DiagnosticResult`** — Schema, SQL, Code, SecureCodeExecutor, and Stats join the previously-migrated Math, Logic, Symbolic, Fact, Image, Graph, Reasoning, and Consensus engines on the 3-layer contract (status / `agent_message` / `developer_fields` / `proof_ref`)
+- **Execution ≠ verification** — a successful computation reports `UNVERIFIABLE`, never `VERIFIED`; `VERIFIED` requires a deterministic, evidence-bound `proof_ref`
+- **Separation of truth and admission** — `POST /verify/code` reports proven-unsafe code as `VERIFIED`-as-unsafe with `admission = BLOCKED`; admission is driven by `admission` / `is_valid`, never by `status` alone
+- **Fail-closed batch verification** — fact / image / SQL / code batches are authoritative only when every item is proven; any refuted or blocked item fails the whole batch closed
+
+> ⚠️ **Breaking change:** `POST /verify/code` now returns `status = "VERIFIED"` for proven-unsafe code (previously `BLOCKED`), and `POST /verify/stats` reports execution success as `UNVERIFIABLE` (previously `VERIFIED`). Consumers branching on `status` for safety gating must use the `admission` / `is_valid` fields.
+
+If you're upgrading from `v6.0.x`, review the [changelog](CHANGELOG.md) for the full migration notes.
 
 ---
 
@@ -671,14 +666,17 @@ We are building the **Universal Verification Standard** for the agentic web.
 - **✔ DiagnosticResult model** — Unified 3-layer diagnostic contract, `proof_ref` authority bit, `AdvisoryCheck` pattern (v5.2.0)
 - **✔ SymbolicVerifier migration** — First fully `DiagnosticResult`-conformant engine; serves as reference implementation (v5.3.0)
 - **✔ Trust Boundary Completion** — All verification API pathways return `DiagnosticResult` + route through `enforce_trust_decision`; mandatory attestation at the admission boundary; VERIFIED requires a non-empty, evidence-bound proof_ref (v6.0.0)
+- **✔ Full DiagnosticResult engine conformance** — All 13 engines return `DiagnosticResult`; execution is never conflated with verification; fail-closed batch verification (META #216, v7.0.0)
+- **✔ Verification Context v1.0 rollout** — All 13 engines expose `to_verification_context()`; schema-validated, canonically-encoded, tamper-evident VC documents across SDK / API / CLI / Docker action (v7.1.0)
 
 ### In Progress
 
-- **Remaining verification engines (#216)** — Migrating the remaining engines to the `DiagnosticResult` model (API surfaces are conformant; engine-internal migration continues under META #216)
+- **Deterministic statistical claim evaluation (#298)** — the path for statistical claims to reach `VERIFIED` with a deterministic, evidence-bound proof
+- **DataFrame schema validation (#299)** — deterministic schema validation for the stats engine
 
 ### Planned
 
-- **v6.1+:** QWED Client-Side (WebAssembly), Distributed Verification Network, cross-ecosystem proof exchange
+- **v7.x+:** QWED Client-Side (WebAssembly), Distributed Verification Network, cross-ecosystem proof exchange
 
 ---
 

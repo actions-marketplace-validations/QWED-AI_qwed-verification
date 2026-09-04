@@ -148,9 +148,18 @@ def test_verify_logic_unsat_path(client):
     assert data["proof_ref"] is None
 
 
-def test_verify_stats_success_verified(client):
-    """Cover stats SUCCESS + claim_supported -> VERIFIED."""
-    with patch("qwed_new.core.stats_verifier.StatsVerifier.verify_stats", return_value={"status": "SUCCESS", "claim_supported": True, "analysis": "mean=2.0"}), \
+def test_verify_stats_verified_pass_through(client):
+    """Cover stats endpoint pass-through of a VERIFIED DiagnosticResult."""
+    dr = DiagnosticResult.verified(
+        "Statistical claim verified",
+        developer_fields={
+            "constraint_id": "stats_verifier.verified",
+            "is_valid": True,
+            "claim_supported": True,
+        },
+        evidence={"engine": "stats", "claim": "mean", "result": 2.0},
+    )
+    with patch("qwed_new.core.stats_verifier.StatsVerifier.verify_stats", return_value=dr), \
          patch("qwed_new.api.main.check_rate_limit"):
         response = client.post(
             "/verify/stats",
@@ -163,11 +172,22 @@ def test_verify_stats_success_verified(client):
     assert data["status"] == "VERIFIED"
     assert data["is_authoritative"] is True
     assert data["proof_ref"]
+    assert data["constraint_id"] == "stats_verifier.verified"
+    assert data["is_valid"] is True
+    assert data["claim_supported"] is True
 
 
-def test_verify_stats_success_without_claim_supported_is_unverifiable(client):
-    """Cover stats SUCCESS without claim_supported -> UNVERIFIABLE (execution ≠ proof)."""
-    with patch("qwed_new.core.stats_verifier.StatsVerifier.verify_stats", return_value={"status": "SUCCESS", "analysis": "mean=2.0"}), \
+def test_verify_stats_unverifiable_pass_through(client):
+    """Cover stats endpoint pass-through of an UNVERIFIABLE DiagnosticResult (execution != proof)."""
+    dr = DiagnosticResult.unverifiable(
+        "Statistical analysis completed, but the claim could not be deterministically verified.",
+        developer_fields={
+            "constraint_id": "stats_verifier.claim_not_verified",
+            "is_valid": False,
+            "claim_supported": False,
+        },
+    )
+    with patch("qwed_new.core.stats_verifier.StatsVerifier.verify_stats", return_value=dr), \
          patch("qwed_new.api.main.check_rate_limit"):
         response = client.post(
             "/verify/stats",
@@ -178,6 +198,11 @@ def test_verify_stats_success_without_claim_supported_is_unverifiable(client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "UNVERIFIABLE"
+    assert data["proof_ref"] is None
+    assert data["is_authoritative"] is False
+    assert data["constraint_id"] == "stats_verifier.claim_not_verified"
+    assert data["is_valid"] is False
+    assert data["claim_supported"] is False
 
 
 def test_verify_fact_heuristic_supported_never_returns_verified(client):
@@ -282,8 +307,38 @@ def test_verify_fact_unknown_result(client):
 
 
 def test_verify_sql_unverified(client):
-    """Cover SQL endpoint is_valid=False -> BLOCKED."""
-    with patch("qwed_new.core.sql_verifier.SQLVerifier.verify_sql", return_value={"is_valid": False, "message": "Invalid syntax"}), \
+    """Engine is_valid=False (VERIFIED-as-malicious) -> endpoint returns verdict unchanged
+    but exposes an explicit BLOCKED admission decision (Greptile P1)."""
+    malicious = DiagnosticResult.verified(
+        "The SQL query failed security verification and is not safe to execute.",
+        {"constraint_id": "sql_verifier.malicious", "is_valid": False},
+        {"query": "SELECT *"},
+    )
+    with patch("qwed_new.core.sql_verifier.SQLVerifier.verify_sql", return_value=malicious), \
+         patch("qwed_new.api.main.check_rate_limit"):
+        response = client.post(
+            "/verify/sql",
+            json={"query": "SELECT *", "schema_ddl": "CREATE TABLE t (id int)", "type": "postgres"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        # Verification truth preserved unchanged.
+        assert data["status"] == "VERIFIED"
+        assert data["proof_ref"] is not None
+        assert data["developer_fields"]["constraint_id"] == "sql_verifier.malicious"
+        assert data["developer_fields"]["is_valid"] is False
+        # Admission is a SEPARATE, fail-closed decision.
+        assert data["admission"] == "BLOCKED"
+
+
+def test_verify_sql_engine_blocked_passthrough(client):
+    """Engine returns BLOCKED (e.g. parse error) -> endpoint passes it through as BLOCKED."""
+    blocked = DiagnosticResult.blocked(
+        "SQL verification could not be completed because the query could not be parsed.",
+        {"constraint_id": "sql_verifier.parse_error", "is_valid": False},
+    )
+    with patch("qwed_new.core.sql_verifier.SQLVerifier.verify_sql", return_value=blocked), \
          patch("qwed_new.api.main.check_rate_limit"):
         response = client.post(
             "/verify/sql",
@@ -294,6 +349,30 @@ def test_verify_sql_unverified(client):
         data = response.json()
         assert data["status"] == "BLOCKED"
         assert data["proof_ref"] is None
+        assert data["developer_fields"]["constraint_id"] == "sql_verifier.parse_error"
+        assert data["admission"] == "BLOCKED"
+
+
+def test_verify_sql_safe_passthrough_verified(client):
+    """Engine returns VERIFIED-as-safe -> endpoint returns VERIFIED and ADMIT."""
+    safe = DiagnosticResult.verified(
+        "The SQL query passed verification and is safe to execute.",
+        {"constraint_id": "sql_verifier.sql_valid", "is_valid": True},
+        {"query": "SELECT *"},
+    )
+    with patch("qwed_new.core.sql_verifier.SQLVerifier.verify_sql", return_value=safe), \
+         patch("qwed_new.api.main.check_rate_limit"):
+        response = client.post(
+            "/verify/sql",
+            json={"query": "SELECT *", "schema_ddl": "CREATE TABLE t (id int)", "type": "postgres"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "VERIFIED"
+        assert data["proof_ref"] is not None
+        assert data["developer_fields"]["is_valid"] is True
+        assert data["admission"] == "ADMIT"
 
 
 def test_verify_code_missing_code_returns_400(client):
@@ -309,8 +388,22 @@ def test_verify_code_missing_code_returns_400(client):
 
 
 def test_verify_code_review_status(client):
-    """Cover REVIEW status -> UNVERIFIABLE."""
-    with patch("qwed_new.core.code_verifier.CodeVerifier.verify_code", return_value={"status": "REVIEW", "is_safe": True, "message": "Minor warnings"}), \
+    """Cover warning-only (formerly REVIEW) code -> VERIFIED safe with warnings."""
+    from qwed_new.core.diagnostics import DiagnosticResult
+
+    fake = DiagnosticResult.verified(
+        "The code passed security verification and is safe to use.",
+        {
+            "constraint_id": "code_verifier.code_safe",
+            "is_valid": True,
+            "is_safe": True,
+            "critical_count": 0,
+            "warning_count": 1,
+            "issues": [],
+        },
+        {"engine": "test", "language": "python", "code": "x = 1", "is_safe": True},
+    )
+    with patch("qwed_new.core.code_verifier.CodeVerifier.verify_code", return_value=fake), \
          patch("qwed_new.api.main.check_rate_limit"):
         response = client.post(
             "/verify/code",
@@ -319,8 +412,9 @@ def test_verify_code_review_status(client):
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "UNVERIFIABLE"
-    assert data["proof_ref"] is None
+    assert data["status"] == "VERIFIED"
+    assert data["proof_ref"] is not None
+    assert data["developer_fields"]["is_valid"] is True
 
 
 def test_verify_consensus_blocked_status(client):

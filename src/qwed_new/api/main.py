@@ -8,7 +8,14 @@ import logging
 from fractions import Fraction
 
 from qwed_new.core.security import redact_pii
-from qwed_new.core.diagnostics import DiagnosticResult, enforce_trust_decision, merge_diagnostic_result
+from qwed_new.core.diagnostics import (
+    AdvisoryCheck,
+    DiagnosticResult,
+    admission_decision,
+    enforce_trust_decision,
+    merge_diagnostic_result,
+)
+from qwed_new.api.verification_context_routes import router as verification_context_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +40,7 @@ TenantDependency = Annotated[TenantContext, Depends(get_current_tenant)]
 SessionDependency = Annotated[Session, Depends(get_session)]
 AgentTokenHeader = Annotated[str, Header(...)]
 
-APP_VERSION = "6.0.0"
+APP_VERSION = "7.1.0"
 
 app = FastAPI(
     title="QWED API",
@@ -59,6 +66,7 @@ app.add_middleware(
 # Include routers
 app.include_router(auth_router)
 app.include_router(audit_router)
+app.include_router(verification_context_router)
 
 STARTUP_ALLOWED_PTH_FILES = {
     "__editable__.qwed_a2a-0.1.0.pth",
@@ -361,53 +369,24 @@ async def verify_stats(
         import pandas as pd
         df = pd.read_csv(file.file)
         
-        from qwed_new.core.stats_verifier import StatsVerifier, SECURE_STATS_BLOCKED_CODE
+        from qwed_new.core.stats_verifier import StatsVerifier
         verifier = StatsVerifier()
-        
-        result = verifier.verify_stats(query, df, provider=None)
 
-        if result.get("status") == "SUCCESS":
-            # SUCCESS means analysis executed — not that the claim was proven.
-            # Only return VERIFIED if the result explicitly confirms the claim.
-            claim_supported = result.get("claim_supported")
-            if claim_supported is True:
-                dr = DiagnosticResult.verified(
-                    "Statistical claim verified",
-                    developer_fields=result,
-                    evidence={"status": "SUCCESS", "claim_supported": True, "analysis": str(result.get("analysis", ""))},
-                )
-            else:
-                dr = DiagnosticResult.unverifiable(
-                    "Statistical analysis completed but claim not established",
-                    developer_fields=result,
-                )
-        elif result.get("status") == "BLOCKED" and result.get("error") == SECURE_STATS_BLOCKED_CODE:
-            dr = DiagnosticResult.blocked(
-                "Service temporarily unavailable",
-                developer_fields=result,
-            )
-        elif result.get("status") == "BLOCKED":
-            dr = DiagnosticResult.blocked(
-                "Verification blocked by security policy",
-                developer_fields=result,
-            )
-        elif result.get("status") in ("ERROR", "EXECUTION_FAILED"):
-            dr = DiagnosticResult.unverifiable(
-                result.get("message", "Statistical analysis failed"),
-                developer_fields=result,
-            )
-        else:
-            dr = DiagnosticResult.blocked(
-                "Statistical analysis failed",
-                developer_fields=result,
-            )
+        dr = verifier.verify_stats(query, df, provider=None)
         dr = _enforce_trust(dr, query=query)
 
+        # Fail-closed audit semantics (P1 #297): never log a BLOCKED / non-
+        # authoritative result as verified. is_authoritative is False for every
+        # fail-closed status (BLOCKED/UNVERIFIABLE proof_ref=None), so a result
+        # cannot be persisted as verified unless it is a proven claim AND its
+        # claim-validity signal is true. developer_fields.is_valid alone is
+        # mutable engine metadata and must not drive the audit bit.
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=query,
             result=str(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=dr.is_authoritative
+            and dr.developer_fields.get("is_valid") is True,
             domain="STATS"
         )
         _safe_commit_log(session, log)
@@ -534,34 +513,28 @@ async def verify_code(
 
         result = verifier.verify_code(code, language=language)
 
-        if result.get("status") == "SAFE":
-            dr = DiagnosticResult.verified(
-                "Code is safe",
-                developer_fields=result,
-                evidence={"language": language, "analysis": result.get("analysis", "")},
-            )
-        elif result.get("status") == "REVIEW":
-            dr = DiagnosticResult.unverifiable(
-                "Code requires manual review",
-                developer_fields=result,
-            )
-        else:
-            dr = DiagnosticResult.blocked(
-                result.get("message", "Code contains security vulnerabilities"),
-                developer_fields=result,
-            )
+        # Verification truth is preserved unchanged: a proven-unsafe snippet is
+        # VERIFIED-as-unsafe (developer_fields.is_valid False, proof_ref bound).
+        # Admission is a SEPARATE decision at this boundary (QWED #7, #13, #15):
+        # unsafe code must never be admitted, so we expose an explicit
+        # AdmissionDecision rather than letting authority-only consumers treat
+        # proof_ref as "safe to execute".
+        dr = result
         dr = _enforce_trust(dr, query=code)
+        admission = admission_decision(dr)
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=code[:200],
             result=str(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=dr.developer_fields.get("is_valid") is True,
             domain="CODE"
         )
         _safe_commit_log(session, log)
 
-        return _merge_response(dr)
+        response = _merge_response(dr)
+        response["admission"] = admission.value
+        return response
 
     except HTTPException:
         raise
@@ -580,7 +553,9 @@ async def verify_code(
             domain="CODE"
         )
         _safe_commit_log(session, log)
-        return _merge_response(dr)
+        response = _merge_response(dr)
+        response["admission"] = admission_decision(dr).value
+        return response
 
 
 @app.post("/verify/math")
@@ -678,6 +653,16 @@ async def verify_math(
                             developer_fields={"is_valid": False, "simplified": str(simplified), "original": str(parsed)},
                         )
 
+        # Precision advisory (issue #347): flag binary floating-point
+        # constants WITHOUT affecting the verdict — advisory_checks are
+        # structurally non-proof-bearing. QWED_RULES.md: flag float math,
+        # suggest decimal.Decimal / sympy. Parse submitted text directly
+        # so equations (including 0.0*x = 0.0*x, 0.5**0 = 1) retain lexical
+        # float literals before symbolic simplification.
+        float_advisory = AdvisoryCheck.float_precision(expression)
+        if float_advisory is not None:
+            dr.developer_fields.setdefault("advisory_checks", []).append(float_advisory)
+
         dr = _enforce_trust(dr, query=expression)
 
         log = VerificationLog(
@@ -736,19 +721,14 @@ async def verify_sql(
 
         result = verifier.verify_sql(query, schema_ddl, dialect=dialect)
 
-        is_valid = result.get("is_valid", False)
-        if is_valid:
-            dr = DiagnosticResult.verified(
-                "SQL query is valid for the given schema",
-                developer_fields=result,
-                evidence={"query": query, "dialect": dialect, "analysis": result.get("analysis", "")},
-            )
-        else:
-            dr = DiagnosticResult.blocked(
-                result.get("message", "SQL query is invalid or unsafe"),
-                developer_fields=result,
-            )
+        # Verification truth is preserved unchanged: a proven-malicious query is
+        # VERIFIED-as-malicious (developer_fields.is_valid False, proof_ref bound).
+        # Admission is a SEPARATE decision at this boundary (QWED #7, #13, #15): unsafe
+        # SQL must never be admitted, so we expose an explicit AdmissionDecision rather
+        # than letting authority-only consumers treat proof_ref as "safe to execute".
+        dr = result
         dr = _enforce_trust(dr, query=query)
+        admission = admission_decision(dr)
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
@@ -759,7 +739,9 @@ async def verify_sql(
         )
         _safe_commit_log(session, log)
 
-        return _merge_response(dr)
+        response = _merge_response(dr)
+        response["admission"] = admission.value
+        return response
 
     except HTTPException:
         raise
@@ -778,7 +760,9 @@ async def verify_sql(
             domain="SQL"
         )
         _safe_commit_log(session, log)
-        return _merge_response(dr)
+        response = _merge_response(dr)
+        response["admission"] = admission_decision(dr).value
+        return response
 
 
 @app.post("/verify/image")

@@ -1,22 +1,25 @@
 [project]
 name = "qwed"
-version = "6.0.0"
-description = "The Deterministic Verification Protocol for AI - 11 verification engines for math, logic, code, SQL, facts, images, and more. Now with Agentic Security Guards."
+version = "7.1.0"
+description = "Open-source AI verification infrastructure for deterministic verification of LLM outputs, tool calls, code, schemas, and agent state before production execution."
 authors = [
     {name = "QWED Team", email = "rahul@qwedai.com"},
 ]
 license = {text = "Apache-2.0"}
 keywords = [
-    "ai",
-    "verification",
-    "llm",
-    "deterministic",
-    "symbolic",
-    "math",
-    "logic",
+    "ai-verification",
+    "llm-verification",
+    "deterministic-verification",
+    "verification-context",
+    "diagnostic-result",
+    "fail-closed",
+    "ai-safety",
     "code-security",
     "sql-validation",
-    "fact-checking"
+    "formal-verification",
+    "symbolic-reasoning",
+    "z3",
+    "sympy",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -56,6 +59,7 @@ dependencies = [
     "requests>=2.31.0",
     "httpx>=0.24.0",
     "pyyaml>=6.0.1",
+    "jsonschema>=4.20.0",
 ]
 requires-python = ">=3.10"
 readme = "README.md"
@@ -93,6 +97,7 @@ dev = [
     "freezegun>=1.4.0",
     "matplotlib>=3.7.0",
     "docker>=7.0.0",
+    "jsonschema>=4.20.0",
 ]
 
 
@@ -103,11 +108,14 @@ pii = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qwed_new", "qwed_sdk"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/qwed_new/core/data/verification-context.schema.json" = "qwed_new/core/data/verification-context.schema.json"
 
 [project.scripts]
 qwed = "qwed_sdk.cli:cli"  # Fixed: cli not main!

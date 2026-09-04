@@ -4,7 +4,98 @@ All notable changes to the QWED Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [7.1.0] - 2026-08-16
+
+### Verification Context v1.0 Rollout
+
+#### Ontology & Spec (#301, #302)
+
+- **ADR-001..005 — verification ontology** — formally define the object of verification, the verification context document, the truth-vs-admission separation, the formalization boundary, and the root of trust.
+- **Verification Context v1.0 spec freeze** — the 4-layer JSON document contract (interpretation / proof / evidence / decision) with canonical RFC 8785 JSON encoding, UTF-16 key ordering, fail-closed schema validation, and content-bound `proof_ref`.
+
+#### Core Model (#308, #309)
+
+- **`VerificationContext` model + JSON schema** — `VerificationContext`, `VerificationContextDocument`, `Verdict`, `Admission`, and nested `Interpretation` / `Proof` / `Evidence` / `Decision` types with fail-closed validation.
+- **Public proof_ref generation / resolution** — `compute_document_proof_ref()` and `resolve_document_proof_ref()` exposed as public API; references are content-bound SHA-256 hashes over the canonical document.
+
+#### Bridge & Verifier Mappings (#310, #316)
+
+- **`verification_context_from_diagnostic_result()`** — converts `DiagnosticResult` → VC document; VERIFIED without attestation demotes to UNVERIFIABLE (fail-closed, consistent with the core contract).
+- **`to_verification_context()` on all 13 verifiers** — complete engine coverage: Math, Logic, Symbolic, SQL, Code, Schema, Fact, Image, Graph, Reasoning, Stats, Consensus, and SecureCodeExecutor.
+
+#### Surface Exposure (#311, #313, #314, #315)
+
+- **SDK / API / CLI exposure** — Verification Context surfaced across the API routes, CLI, and SDK.
+- **Docker action VC outputs** — the containerized GitHub Action emits `verdict`, `admission`, `proof_ref`, and `verification_context` outputs.
+- **Metadata & README alignment** — repository metadata aligned with the v7.0 architecture.
+- **SDK re-exports** — all Verification Context v1.0 types re-exported from `qwed_sdk`.
+
+> **Semver:** minor release — additive public API (VC model, mappings, resolver, routes, outputs). No breaking wire changes.
+
+## [7.0.0] - 2026-08-08
+
+### Engine Migration to DiagnosticResult (Meta #216)
+
+#### SchemaVerifier → DiagnosticResult (#255)
+- **`SchemaVerifier.verify()` and `verify_ucp_transaction()` now return `DiagnosticResult`** (status / `agent_message` / `developer_fields` / `proof_ref`) instead of ad-hoc dicts.
+- **`proof_ref`** is computed deterministically from a canonical `json.dumps` of the schema + instance evidence on VERIFIED results; unsupported values and cyclic structures fail closed to `BLOCKED` (`schema_verifier.validation_error`).
+- **Recursive schema meta-validation** — malformed keyword shapes (non-dict properties, invalid required entries, invalid numeric constraints, non-finite/NaN/±∞ bounds, negative size constraints) return `BLOCKED` (`schema_verifier.parse_error`) instead of being silently treated as empty.
+- **UCP type safety** — string/None amount fields and non-dict transactions are handled deterministically instead of raising `TypeError`/`AttributeError`.
+- **UCP verdict fields are complete on every path** — `verify_ucp_transaction()` always produces `transaction_type`, `currency`, and `schema_verifier.ucp_*` constraint ids in `developer_fields` for both valid and violated verdicts (BLOCKED base results pass through unchanged).
+- **Money arithmetic uses `Decimal`, not float tolerance** — computed-total and tax checks quantize operands to the currency precision and compare exactly, removing 0.01-tolerance rounding noise so boundary transactions deterministically pass/fail.
+- **`tax` is selected by key presence, not truthiness** — a declared `tax: 0` is used instead of silently falling back to `tax_amount`.
+- **Non-finite floats (`NaN`, `±inf`) and hostile `__repr__` set members fail closed** — evidence serialization raises `ValueError` into the existing `BLOCKED` path instead of emitting non-JSON tokens or leaking `RuntimeError`.
+- **`agent_message` sanitized** — no rule IDs, issue types, or schema internals leak into agent-facing output.
+- **Removed orphan `math_verifier` delegation** — the lazy `SymbolicVerifier` instantiation (never called) is gone; computed-field checks use inline exact Decimal comparison.
+- **Hot path cost of the migration reduced (~20% fewer instructions)** — proof evidence is traversed once instead of twice (cycles and unsupported types are detected by the canonical encoder itself), the canonical JSON encoder is reused across calls, and schema meta-validation dispatches on the keywords a schema declares instead of probing the full keyword vocabulary. `proof_ref` values are unchanged.
+- **Oversized integer bounds no longer crash** — `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` / `multipleOf` values beyond float range (e.g. `10**1000`) are finite by construction and no longer raise `OverflowError` out of `verify()`.
+
+#### CodeVerifier & SecureCodeExecutor → DiagnosticResult (#254, PR #296)
+- **`CodeVerifier.verify_code()`, `verify_python_deep()`, and `verify_batch()` now return `DiagnosticResult`** (status / `agent_message` / `developer_fields` / `proof_ref`) instead of ad-hoc dicts.
+- **`VERIFIED` is now emitted for unsafe code — as `VERIFIED`-as-unsafe.** A proven-unsafe snippet is `VERIFIED` with `developer_fields.is_valid = false`, a bound `proof_ref`, and a non-null `critical_count`; it is never emitted `BLOCKED`. This is `VERIFIED` as a *truth* guarantee (the code was checked), not an *admission* guarantee.
+- **`AdmissionDecision` is a separate decision, exposed at the trust boundary** — `POST /verify/code` and batch `CODE` items attach `admission` (`ADMIT` / `BLOCKED`) and treat `is_valid` as the safety gate, so authority-only consumers reading `status == "VERIFIED"` cannot admit unsafe code.
+- **`BLOCKED` is reserved for cases where verification itself failed** — empty code, non-string `language`, internal/execution errors, and (deep) language normalization failures. Blocked results carry **no** `proof_ref`, so they cannot be mistaken for a verdict.
+- **`SecureCodeExecutor.execute()` no longer executes code wholesale on the verifier verdict** — the executor applies an unconditional OWASP LLM06 dangerous-pattern gate (`os.`, `sys.`, `subprocess`, `__import__`, `eval`, `exec`, `compile`, `open(`, `file(`, `input(`, `raw_input(`, `socket`, `urllib`, `requests`, `http`) and blocks execution with `CONSTRAINT_DANGEROUS_PATTERN`. The scan is **AST-aware**: it matches actual executable operations (imports, attribute access, calls), so dangerous keywords that appear only in comments, docstrings, or string literals (e.g. a URL in a docstring) do not cause false denials. The advisory-only fallback is retained only when verification itself fails closed.
+- **`verify_batch()` returns per-item `verdicts` + a `summary` and an overall `is_valid`** — `safe` / `unsafe` / `blocked` counts and `total_critical`; `is_valid` is `true` only when **all** snippets are safe, and the batch is otherwise non-admissible.
+- **`ConsensusVerifier` and `StatsVerifier` code-stages adapt** — expected-status flags were updated to require `is_verified` **and** `developer_fields.is_valid is True`, and `stats_verifier._validate_security` fails closed on any non-true `is_valid`, so consensus results can no longer admit unsafe code.
+
+> **Breaking wire change:** `POST /verify/code` now returns **HTTP 200 with `status = "VERIFIED"`** for proven-unsafe code (previously `status = "BLOCKED"`). Admission is driven by the new `admission` field and `developer_fields.is_valid`. Consumers that branched on `status == "BLOCKED"` or `status == "VERIFIED"` for safety gating **must** switch to the `admission` / `is_valid` fields; `status == "VERIFIED"` alone must never be treated as "safe to execute".
+
+#### StatsVerifier → DiagnosticResult (#256)
+- **`StatsVerifier.verify_stats()` now returns `DiagnosticResult`** (status / `agent_message` / `developer_fields` / `proof_ref`) instead of an ad-hoc dict.
+- **Execution success is **never** `VERIFIED` (computation ≠ verification).** A run that executes cleanly in the Docker sandbox and returns an observed statistic is `UNVERIFIABLE` (`stats_verifier.claim_not_verified`) — the engine has no deterministic claim-proof, so it cannot attest the original natural-language claim. `VERIFIED` + `proof_ref` is reserved for a deterministic claim evaluation tracked in #298; it is never emitted from execution success alone.
+- **`BLOCKED` is reserved for failure states** — translation/validation failure (`stats_verifier.validation_error`), execution failure (`stats_verifier.execution_failure`), and secure Docker sandbox unavailable (`stats_verifier.runtime_unavailable`). Blocked results carry **no** `proof_ref`.
+- **Execution evidence is preserved, not lost.** On `UNVERIFIABLE` the observed result, generated code, columns, a deterministic dataset fingerprint (`dataset_sha256`), sandbox type, timing, and security checks are retained in `developer_fields` for audit/review.
+- **`agent_message` is sanitized** — no raw subprocess output, sandbox identifiers, or error strings leak into the agent-facing layer.
+- **API boundary is now a thin pass-through** — `POST /verify/stats` forwards the engine's `DiagnosticResult` through `enforce_trust_decision()` unchanged instead of re-deriving status from dict fields.
+- **Logging is fail-closed and claim-aware** — the verification log records `is_verified` from the authoritative proof bit AND the claim-validity signal (`dr.is_authoritative and developer_fields.is_valid is True`). A non-authoritative result (BLOCKED / UNVERIFIABLE, `proof_ref = None`) can never be persisted as verified, even if the mutable `developer_fields.is_valid` metadata is `True`.
+- **`compute_statistics()` and `get_sandbox_info()` are deliberately unchanged** — they are utilities (safe direct computation / sandbox introspection), not claim-verification boundaries, so they stay on their existing dict return.
+- **Deferred architecture is tracked, not silently dropped** — deterministic statistical claim evaluation (#298) and deterministic DataFrame schema validation (#299) do not exist in the codebase and were not invented here; both are filed as dedicated issues rather than being fabricated to force a `VERIFIED`.
+- **`FactVerifier`/`ImageVerifier` batch verification now returns `DiagnosticResult`** — `BatchFactVerifier.verify_batch()` and `ImageVerifier.verify_batch()` return a single `DiagnosticResult` with per-claim verdicts in `developer_fields.results` and a `summary`. The batch is authoritative (`VERIFIED` + `proof_ref`) only when **every** claim is deterministically verified; any refuted/blocked claim fails the whole batch closed (`fact_verifier.batch_blocked` / `image_verifier.batch_blocked`), and an empty batch is `BLOCKED` (`*.empty_batch`). The batch `proof_ref` binds full claim digests **and the shared input** (image digest for image batches, context digest for fact batches), never truncated display text. Aggregation is shared via `diagnostics.aggregate_batch_diagnostic()` so the fail-closed logic cannot drift between engines. This closes the last two public engine entry points still returning ad-hoc dicts under META #216.
+- **Stats `observed_result` is JSON-safe** — a non-serializable sandbox result (e.g. a DataFrame) is coerced before entering `developer_fields`, so a legitimate `UNVERIFIABLE` verdict can no longer be silently downgraded to `BLOCKED` when the trust gate snapshots developer fields.
+
+> **Breaking wire change:** `POST /verify/stats` now returns the unified `DiagnosticResult` schema (`status` / `agent_message` / `developer_fields` / `proof_ref`) instead of the legacy `{"status": "SUCCESS" | "ERROR" | "BLOCKED", "result": ..., "code": ...}` shape. Successful execution now reports `status = "UNVERIFIABLE"` with the observed value in `developer_fields.observed_result` — execution success alone is never presented as a proven claim.
+
+#### Version Propagation
+- `qwed` (PyPI): `6.0.0` -> `7.0.0`
+- `qwed_sdk` (Python): `6.0.0` -> `7.0.0`
+- `@qwed-ai/sdk` (NPM): `6.0.0` -> `7.0.0`
+- `qwed` (crates.io/Rust): `6.0.0` -> `7.0.0`
+- API version marker: `6.0.0` -> `7.0.0`
+- Kubernetes deployment image: stays pinned to the published `6.0.0` here; bumped to `7.0.0` only after the release publishes the image (avoids `ImagePullBackOff`)
+- Deployment docs version references updated
+
+#### Included PRs (merged after v6.0.0)
+- `#294` feat(core): migrate SchemaVerifier to DiagnosticResult (#255)
+- `#295` fix(sql): migrate SQLVerifier to DiagnosticResult (#253)
+- `#296` feat(core): migrate CodeVerifier and SecureCodeExecutor to DiagnosticResult (#254)
+- `#297` feat(stats): migrate StatsVerifier.verify_stats to DiagnosticResult (#256)
+
+#### GitHub Action
+- The **QWED Verification GitHub Action** is maintained in its own repository — [`QWED-AI/qwed-verification-action`](https://github.com/QWED-AI/qwed-verification-action). It wraps the `qwedai/qwed-verification` Docker image and is versioned independently of this release; it is **not** published from this repository, so no action release is part of v7.0.0.
+
 ## [6.0.0] - 2026-08-02
+
 ### Trust Boundary Completion (Epic #263)
 
 Completes the Trust Boundary Completion epic — all 12/12 sub-issues closed. Every verification API pathway now returns `DiagnosticResult` and routes through `enforce_trust_decision`. The trust boundary is no longer advisory: the control plane requires and verifies attestation before admitting VERIFIED results, and VERIFIED is a protocol guarantee backed by a non-empty, deterministic `proof_ref`, never by execution, agreement, confidence, or provenance. Engine-level migrations to `DiagnosticResult` remain tracked under META #216.

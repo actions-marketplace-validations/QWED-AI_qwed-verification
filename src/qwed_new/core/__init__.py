@@ -29,6 +29,28 @@ from .diagnostics import (
     enforce_trust_decision,
 )
 
+# Verification Context v1.0 (Issue #303, #302)
+from .verification_context import (
+    Admission,
+    Decision,
+    Evidence,
+    Formalization,
+    Interpretation,
+    Proof,
+    Verdict,
+    VerificationContext,
+    VerificationContextDocument,
+    VerificationContextValidationError,
+    VerifiedObject,
+    compute_context_proof_ref,
+    compute_document_proof_ref,
+    is_valid_document,
+    load_schema,
+    resolve_context_proof_ref,
+    resolve_document_proof_ref,
+    validate_document,
+)
+
 __all__ = [
     # Exceptions
     "QWEDError",
@@ -49,6 +71,25 @@ __all__ = [
     "AdvisoryCheck",
     "compute_proof_ref",
     "enforce_trust_decision",
+    # Verification Context v1.0 (#303, #302)
+    "Admission",
+    "Decision",
+    "Evidence",
+    "Formalization",
+    "Interpretation",
+    "Proof",
+    "Verdict",
+    "VerificationContext",
+    "VerificationContextDocument",
+    "VerificationContextValidationError",
+    "VerifiedObject",
+    "compute_context_proof_ref",
+    "compute_document_proof_ref",
+    "is_valid_document",
+    "load_schema",
+    "resolve_context_proof_ref",
+    "resolve_document_proof_ref",
+    "validate_document",
 ]
 
 # Lazy imports for verifiers (avoid circular imports and missing deps)

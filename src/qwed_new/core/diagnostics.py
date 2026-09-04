@@ -39,8 +39,10 @@ Dict[str, Any] returns to DiagnosticResult) is tracked in blocked issues:
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import keyword
 import logging
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -82,6 +84,25 @@ class DiagnosticStatus(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+class AdmissionDecision(str, Enum):
+    """Admission outcome at an enforcement boundary.
+
+    Distinct from :class:`DiagnosticStatus` by design (QWED #13 Separation of
+    Responsibilities, #15 Truth Before Policy): a ``DiagnosticResult`` answers
+    *"is this claim provably true?"* while an ``AdmissionDecision`` answers
+    *"should this be allowed at this boundary?"* A provably-malicious query is
+    ``VERIFIED`` (truth) yet ``BLOCKED`` (admission), so generic consumers that
+    gate on the admission decision never accept unsafe input even when the
+    underlying verification was authoritative.
+
+    Values:
+        ADMIT:   The boundary may proceed with the verdict.
+        BLOCKED: The boundary must not admit. This is the fail-closed default.
+    """
+    ADMIT = "ADMIT"
+    BLOCKED = "BLOCKED"
+
+
 # ---------------------------------------------------------------------------
 # Advisory check — structured representation of non-proof-bearing analysis.
 # Used for: LLM fallback output, NLI entailment labels, VLM interpretation,
@@ -90,24 +111,238 @@ class DiagnosticStatus(str, Enum):
 # developer_fields.advisory_checks for audit/developer review only.
 # ---------------------------------------------------------------------------
 
+_MAX_EQUATION_SIDE_CHARS = 4000
+
+
+def _is_ident_start(ch: str) -> bool:
+    return ch == "_" or "a" <= ch <= "z" or "A" <= ch <= "Z"
+
+
+def _is_ident_char(ch: str) -> bool:
+    return _is_ident_start(ch) or "0" <= ch <= "9"
+
+
+def _is_word_or_dot(ch: str) -> bool:
+    return _is_ident_char(ch) or ch == "."
+
+
+def _scan_digits(text: str, i: int) -> int:
+    """Advance past ASCII digits starting at *i*; single bounded loop."""
+    n = len(text)
+    while i < n and "0" <= text[i] <= "9":
+        i += 1
+    return i
+
+
+def _scan_exponent_tail(text: str, i: int) -> int:
+    """Consume an ``e[+-]digits`` exponent at *i*, else return *i* unchanged.
+
+    A bare ``e`` (``2ex``) is not an exponent — the caller treats it as an
+    identifier start, matching the old pattern's optional exponent group."""
+    n = len(text)
+    if i >= n or text[i] not in "eE":
+        return i
+    j = i + 1
+    if j < n and text[j] in "+-":
+        j += 1
+    k = _scan_digits(text, j)
+    if k == j:
+        return i
+    return k
+
+
+def _scan_number(text: str, i: int) -> int:
+    """End index (exclusive) of the numeric literal starting at *i*.
+
+    Shape mirrors the old implicit-mul number pattern —
+    ``digits[.digits][e[+-]digits]`` or ``.digits`` — scanned forward with
+    no backtracking. Callers guarantee ``text[i]`` starts a number (an
+    ASCII digit, or ``.`` followed by a digit)."""
+    i = _scan_digits(text, i)
+    if i < len(text) and text[i] == ".":
+        i = _scan_digits(text, i + 1)
+    return _scan_exponent_tail(text, i)
+
+
+def _scan_ident(text: str, i: int) -> int:
+    """End index (exclusive) of the identifier starting at *i*."""
+    n = len(text)
+    while i < n and _is_ident_char(text[i]):
+        i += 1
+    return i
+
+
+def _skip_ws(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i] in " \t":
+        i += 1
+    return i
+
+
+def _starts_number(side: str, i: int) -> bool:
+    """True when a numeric literal starts at *i* (digit, or ``.`` + digit)."""
+    ch = side[i]
+    if "0" <= ch <= "9":
+        return True
+    return ch == "." and i + 1 < len(side) and "0" <= side[i + 1] <= "9"
+
+
+def _emit_number_operand(side: str, i: int, out: List[str]) -> int:
+    """Emit the number at *i* plus any implicit-mul ``*``; return next index."""
+    end = _scan_number(side, i)
+    j = _skip_ws(side, end)
+    n = len(side)
+    if j < n and _is_ident_start(side[j]):
+        m = _scan_ident(side, j)
+        if keyword.iskeyword(side[j:m]):
+            out.append(side[i:end])
+            return end
+        out.append(side[i:end])
+        out.append("*")
+        return j
+    if j < n and side[j] == "(":
+        out.append(side[i:end])
+        out.append("*")
+        return j
+    out.append(side[i:end])
+    return end
+
+
+def _is_implicit_application(side: str, ident: str, end: int, j: int) -> bool:
+    """True for ``sin 0.5``: whitespace-separated identifier applied to a number.
+
+    Keywords are excluded (``not 0.5`` must keep parsing), and the number
+    must genuinely follow whitespace — ``x0.5`` stays untouched."""
+    n = len(side)
+    if j <= end or j >= n or keyword.iskeyword(ident):
+        return False
+    return _starts_number(side, j)
+
+
+def _emit_ident_operand(side: str, i: int, out: List[str]) -> int:
+    """Emit the identifier at *i*, parenthesizing ``f 0.5`` application."""
+    end = _scan_ident(side, i)
+    ident = side[i:end]
+    j = _skip_ws(side, end)
+    if not _is_implicit_application(side, ident, end, j):
+        out.append(ident)
+        return end
+    num_end = _scan_number(side, j)
+    out.append(ident)
+    out.append("(")
+    out.append(side[j:num_end])
+    out.append(")")
+    # A trailing operand (``sin 0.5x``, ``sin 0.5(x+1)``) needs an explicit
+    # ``*`` — otherwise ``sin(0.5)x`` is a syntax error and the advisory is
+    # lost (Sentry on #348).
+    k = _skip_ws(side, num_end)
+    if k < len(side) and (_is_ident_start(side[k]) or side[k] == "("):
+        out.append("*")
+        return k
+    return num_end
+
+
+def _normalize_implicit_mul(side: str) -> str:
+    """Insert explicit ``*`` / call parens for implicit multiplication.
+
+    Single left-to-right pass — O(len(side)), no backtracking by
+    construction (every iteration advances ``i`` by at least one char).
+    Handles ``2x``, ``2 x``, ``2(``, and ``sin 0.5``-style application so
+    the advisory parser sees the constants SymPy accepts.
+
+    Python keywords are never treated as operands: ``0.5 in [0.5, 1]``
+    and ``2 if x else 3`` parse fine today, and rewriting them would
+    break the parse and lose the advisory. Likewise, an identifier
+    directly glued to a number (``x0.5``) is left alone — only genuine
+    whitespace-separated application is parenthesized.
+
+    Advisory-only: the result feeds float-constant extraction, never a
+    verdict."""
+    n = len(side)
+    out: List[str] = []
+    i = 0
+    while i < n:
+        ch = side[i]
+        prev_ok = i == 0 or not _is_word_or_dot(side[i - 1])
+        if _starts_number(side, i) and prev_ok:
+            i = _emit_number_operand(side, i, out)
+        elif _is_ident_start(ch) and prev_ok:
+            i = _emit_ident_operand(side, i, out)
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _parse_expression_side(side: str) -> Optional[ast.AST]:
+    try:
+        return ast.parse(side, mode="eval")
+    except (SyntaxError, ValueError, RecursionError):
+        pass
+    if len(side) > _MAX_EQUATION_SIDE_CHARS:
+        # Advisory-only path: oversized sides skip normalization rather
+        # than burn CPU — absence of an advisory is always safe.
+        return None
+    norm = _normalize_implicit_mul(side)
+    if norm == side:
+        return None
+    try:
+        return ast.parse(norm, mode="eval")
+    except (SyntaxError, ValueError, RecursionError):
+        # Normalization failed or unparsable side; skip
+        return None
+
+
+def _parse_equation_trees(source: str) -> List[ast.AST]:
+    if "=" not in source:
+        return []
+    left, _, right = source.partition("=")
+    if "=" in left or "=" in right:
+        return []
+    left_tree = _parse_expression_side(left.strip())
+    right_tree = _parse_expression_side(right.strip())
+    if left_tree is None or right_tree is None:
+        return []
+    return [left_tree, right_tree]
+
+
+def _parse_source_trees(source: str, expression_mode: bool = True) -> List[ast.AST]:
+    try:
+        return [ast.parse(source, mode="eval" if expression_mode else "exec")]
+    except (SyntaxError, ValueError, RecursionError):
+        if expression_mode:
+            return _parse_equation_trees(source)
+        return []
+
+
+def _extract_float_constants(trees: List[ast.AST]) -> List[str]:
+    return sorted(
+        {
+            repr(node.value)
+            for tree in trees
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, (float, complex))
+        }
+    )
+
+
 @dataclass(frozen=True)
 class AdvisoryCheck:
-    """A non-proof-bearing analysis result attached as advisory metadata.
+    """A single non-verdict-affecting advisory check.
 
-    Advisory checks may carry useful information for developers or auditors,
-    but they MUST NOT influence the verification verdict. The constraint:
-
-        advisory_only = True
-
-    is structurally enforced: advisory checks populate
-    developer_fields.advisory_checks, never status or proof_ref.
+    Advisory checks flag operational, precision, or architectural
+    concerns (e.g. binary float math, deprecations, performance
+    suggestions). They are strictly informational: by contract, they
+    MUST NOT influence the verification verdict or proof_ref (Issue #347).
     """
+
     name: str
     advisory_only: bool = True
-    constraint_id: Optional[str] = None
+    constraint_id: str = ""
     details: Dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         if self.advisory_only is not True:
             raise ValueError(
                 "AdvisoryCheck.advisory_only must be True — "
@@ -121,6 +356,46 @@ class AdvisoryCheck:
             "constraint_id": self.constraint_id,
             "details": self.details,
         }
+
+    @classmethod
+    def float_precision(cls, source: str, expression_mode: bool = True) -> Optional["AdvisoryCheck"]:
+        """Advisory: *source* contains binary floating-point constants.
+
+        QWED_RULES.md: floating-point math is flagged and decimal.Decimal /
+        SymPy exact rationals are suggested. This is a PRECISION advisory,
+        never a rejection — execution-safety gates decide what may run,
+        not what is exact, and documented inputs like
+        `1000 * (1 + 0.05)**2` legitimately contain floats (#347).
+
+        Equality input (`0.1 + 0.2 = 0.3`, `0.0*x = 0.0*x`) is parsed
+        side-by-side to preserve lexical float literals even when symbolic
+        simplification would eagerly collapse them. Complex constants count
+        too: `1.0j` is binary-float-based arithmetic the same way `0.1` is.
+
+        Returns None when the source parses clean of float/complex
+        constants or cannot be parsed at all (parse failures are the
+        security gates' business, not this advisory's)."""
+        trees = _parse_source_trees(source, expression_mode=expression_mode)
+        if not trees:
+            return None
+        constants = _extract_float_constants(trees)
+        if not constants:
+            return None
+        return cls(
+            name="floating-point-constants",
+            constraint_id="precision.float-constants",
+            details={
+                "constants": constants,
+                "note": (
+                    "Binary floating-point values can be inexact; results "
+                    "may differ from exact decimal arithmetic."
+                ),
+                "suggestion": (
+                    "Use decimal.Decimal or SymPy exact rationals "
+                    "(sympy.Rational) where exact arithmetic matters."
+                ),
+            },
+        )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AdvisoryCheck":
@@ -137,7 +412,7 @@ class AdvisoryCheck:
         return cls(
             name=data.get("name", ""),
             advisory_only=advisory_only,
-            constraint_id=data.get("constraint_id"),
+            constraint_id=data.get("constraint_id") or "",
             details=data.get("details", {}),
         )
 
@@ -836,6 +1111,30 @@ DIAGNOSTIC_RESPONSE_KEYS = frozenset({
 })
 
 
+def admission_decision(result: DiagnosticResult) -> AdmissionDecision:
+    """Map a verification result to an admission decision for a SQL boundary.
+
+    The engine's ``DiagnosticResult`` is the truth and is never modified. This
+    deterministic gate turns it into a fail-closed admission outcome:
+
+    - fail-closed status (BLOCKED/UNVERIFIABLE)         -> BLOCKED
+    - ``developer_fields.is_valid is not True``          -> BLOCKED (missing/malformed)
+    - authoritative (VERIFIED) and valid                 -> ADMIT
+    - anything else (non-authoritative)                  -> BLOCKED
+
+    Returning ``BLOCKED`` for a VERIFIED-but-unsafe result is a policy decision
+    at the boundary (QWED #7), not a reinterpretation of the verdict (QWED #15):
+    the original DiagnosticResult is preserved unchanged alongside it.
+    """
+    if result.is_fail_closed:
+        return AdmissionDecision.BLOCKED
+    if result.developer_fields.get("is_valid") is not True:
+        return AdmissionDecision.BLOCKED
+    if result.is_authoritative:
+        return AdmissionDecision.ADMIT
+    return AdmissionDecision.BLOCKED
+
+
 def merge_diagnostic_result(dr: DiagnosticResult) -> Dict[str, Any]:
     """Merge DiagnosticResult with developer fields, ensuring diagnostic keys win.
 
@@ -847,11 +1146,149 @@ def merge_diagnostic_result(dr: DiagnosticResult) -> Dict[str, Any]:
     return serialized | safe
 
 
+def aggregate_batch_diagnostic(
+    items: List[Dict[str, Any]],
+    claims: List[str],
+    *,
+    engine: str,
+    constraints: Dict[str, str],
+    messages: Dict[str, str],
+    extra_evidence: Optional[Dict[str, Any]] = None,
+) -> DiagnosticResult:
+    """Aggregate per-item verdicts into a single fail-closed batch DiagnosticResult.
+
+    Shared by the fact/image batch verifiers (and any future batch engine) so the
+    security-critical aggregation cannot drift between copies. Per-item verdicts
+    live in ``developer_fields.results`` and counts in ``developer_fields.summary``.
+
+    Fail-closed contract:
+        - empty batch                      -> BLOCKED (``constraints["empty"]``)
+        - any item BLOCKED                 -> BLOCKED (``constraints["blocked"]``)
+        - all items VERIFIED               -> VERIFIED + ``proof_ref``
+        - otherwise (some UNVERIFIABLE)    -> UNVERIFIABLE
+
+    The batch ``proof_ref`` binds the full claim texts via SHA-256 digests (the
+    truncated ``results`` claim field is display-only and not proof-bearing) plus
+    any caller-supplied ``extra_evidence`` (e.g. a shared image or context digest).
+
+    Args:
+        items: Serialized per-item DiagnosticResults (each carries a ``claim`` key).
+        claims: Original claim texts, aligned with ``items`` (for digests/display).
+        engine: Engine name recorded in developer_fields/evidence.
+        constraints: Mapping with keys ``verified``/``blocked``/``unverifiable``/``empty``.
+        messages: Mapping with keys ``empty``/``blocked``/``unverifiable``/``verified``.
+        extra_evidence: Optional extra proof-bearing fields merged into evidence.
+
+    Returns:
+        A single DiagnosticResult for the whole batch.
+    """
+    total = len(claims)
+
+    # Fail loudly: verdict counts are taken from ``items`` while the proof binds
+    # ``claims``. A length mismatch would bind digests to claims that were not
+    # the ones evaluated, so reject it rather than produce a misaligned proof.
+    if len(items) != total:
+        raise ValueError(
+            f"aggregate_batch_diagnostic: items/claims length mismatch for "
+            f"{engine!r} — {len(items)} items vs {total} claims. "
+            "Per-item verdicts must be aligned with the claim texts they prove."
+        )
+
+    # Fail closed: an empty batch proves nothing and must not be admitted.
+    if total == 0:
+        return DiagnosticResult.blocked(
+            agent_message=messages["empty"],
+            developer_fields={
+                "constraint_id": constraints["empty"],
+                "is_valid": False,
+                "results": [],
+                "summary": {"total": 0, "verified": 0, "unverifiable": 0, "blocked": 0},
+                "engine": engine,
+            },
+        )
+
+    verified = sum(1 for item in items if item["status"] == "VERIFIED")
+    blocked = sum(1 for item in items if item["status"] == "BLOCKED")
+    unverifiable = total - verified - blocked
+    is_verified_all = verified == total
+
+    summary = {
+        "total": total,
+        "verified": verified,
+        "unverifiable": unverifiable,
+        "blocked": blocked,
+    }
+
+    if is_verified_all:
+        constraint_id = constraints["verified"]
+    elif blocked:
+        constraint_id = constraints["blocked"]
+    else:
+        constraint_id = constraints["unverifiable"]
+
+    batch_fields: Dict[str, Any] = {
+        "constraint_id": constraint_id,
+        "is_valid": is_verified_all,
+        "results": items,
+        "summary": summary,
+        "engine": engine,
+    }
+
+    if blocked > 0:
+        # Fail closed: any refuted/error claim makes the whole batch non-admissible.
+        return DiagnosticResult.blocked(
+            agent_message=messages["blocked"],
+            developer_fields=batch_fields,
+        )
+
+    if not is_verified_all:
+        return DiagnosticResult.unverifiable(
+            agent_message=messages["unverifiable"],
+            developer_fields=batch_fields,
+        )
+
+    # Fail closed: a batch is authoritative only when every claim has a proof.
+    claim_digests = [
+        hashlib.sha256(claim.encode("utf-8")).hexdigest() for claim in claims
+    ]
+    evidence: Dict[str, Any] = {
+        "engine": engine,
+        "count": total,
+        "claims": [
+            claim if len(claim) <= 100 else claim[:100] + "..." for claim in claims
+        ],
+        "claim_digests": claim_digests,
+        "verdicts": [
+            {"status": item["status"], "is_valid": item["developer_fields"].get("is_valid")}
+            for item in items
+        ],
+    }
+    if extra_evidence:
+        # Never let caller-supplied evidence overwrite the proof-bearing fields
+        # assembled above; a collision would silently weaken the proof binding.
+        collisions = set(extra_evidence) & set(evidence)
+        if collisions:
+            raise ValueError(
+                f"aggregate_batch_diagnostic: extra_evidence for {engine!r} would "
+                f"overwrite proof-bearing fields {sorted(collisions)}."
+            )
+        evidence.update(extra_evidence)
+
+    return DiagnosticResult.verified(
+        agent_message=messages["verified"],
+        developer_fields=batch_fields,
+        evidence=evidence,
+    )
+
+
 __all__ = [
     "DiagnosticStatus",
     "DiagnosticResult",
     "AdvisoryCheck",
+    "AdmissionDecision",
     "compute_proof_ref",
     "enforce_trust_decision",
+    "admission_decision",
     "merge_diagnostic_result",
+    "aggregate_batch_diagnostic",
 ]
