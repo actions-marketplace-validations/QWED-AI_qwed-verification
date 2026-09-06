@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from typing import Optional, Annotated
 from sqlmodel import Session, select
 from datetime import datetime, timezone
+import asyncio
 import os
 import logging
+import time
 from fractions import Fraction
 
 from qwed_new.core.security import redact_pii
@@ -57,6 +60,123 @@ CORS_ORIGINS = [origin.strip() for origin in raw_cors_origins.split(",") if orig
 if not CORS_ORIGINS:
     logger.critical("QWED_CORS_ORIGINS must be configured")
     raise RuntimeError("QWED_CORS_ORIGINS must be configured")
+class _BodySizeLimitMiddleware:
+    """#353 (CodeAnt + CodeRabbit on PR #354): the endpoint byte cap runs
+    AFTER FastAPI has received and spooled the whole multipart body, so by
+    itself it cannot stop disk exhaustion. Buffer the request stream here
+    and reply 413 before the app ever sees an oversized body — counting
+    received chunks, so Content-Length-less chunked uploads are bounded
+    too. The endpoint cap stays as the authoritative backstop.
+
+    Buffering happens BEFORE authentication, so concurrent unauthenticated
+    uploads could multiply the per-request memory cost (CodeRabbit on PR
+    #354: N x max_bytes against the pod limit). A process-wide in-flight
+    cap bounds the worst case to max_concurrent x max_bytes; ingress-level
+    connection caps stay an infrastructure concern."""
+
+    _max_concurrent = 8
+    _in_flight = 0
+
+    def __init__(self, app, max_bytes: int, path: str,
+                 read_deadline_seconds: float = 30.0):
+        self.app = app
+        self.max_bytes = max_bytes
+        self.path = path
+        # Greptile P1 on PR #354: the capacity slot is reserved before
+        # authentication, so slow-loris uploads must not hold it forever —
+        # the whole body read is bounded by one wall-clock deadline.
+        self.read_deadline_seconds = read_deadline_seconds
+
+    async def __call__(self, scope, receive, send):
+        # normalize the trailing slash: FastAPI redirects /verify/stats/
+        # but the server still receives and spools the WHOLE body before
+        # the redirect, so the guard must match both forms (Sentry on
+        # PR #354)
+        if scope["type"] != "http" or scope["path"].rstrip("/") != self.path:
+            await self.app(scope, receive, send)
+            return
+        # single-event-loop counter: increments happen synchronously between
+        # awaits, so no lock is needed
+        if _BodySizeLimitMiddleware._in_flight >= _BodySizeLimitMiddleware._max_concurrent:
+            response = JSONResponse(
+                status_code=503,
+                content={"detail": "Upload capacity reached — retry shortly."},
+            )
+            await response(scope, receive, send)
+            return
+        _BodySizeLimitMiddleware._in_flight += 1
+        try:
+            await self._buffer_and_forward(scope, receive, send)
+        finally:
+            _BodySizeLimitMiddleware._in_flight -= 1
+
+    async def _buffer_and_forward(self, scope, receive, send):
+        body = bytearray()
+        deadline = time.monotonic() + self.read_deadline_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                response = JSONResponse(
+                    status_code=408,
+                    content={"detail": "Request body not received in time."},
+                )
+                await response(scope, receive, send)
+                return
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except asyncio.TimeoutError:
+                response = JSONResponse(
+                    status_code=408,
+                    content={"detail": "Request body not received in time."},
+                )
+                await response(scope, receive, send)
+                return
+            if message["type"] == "http.disconnect":
+                return
+            body.extend(message.get("body", b""))
+            if len(body) > self.max_bytes:
+                response = JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Upload exceeds the {self.max_bytes} byte limit for statistical verification."},
+                )
+                await response(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        # ASGI receive contract (Sentry on PR #354): the replayed body is
+        # delivered ONCE; later calls report disconnect. The coroutine shape
+        # is required by the ASGI protocol — suppressed on the def line.
+        replayed = False
+
+        async def replay_receive():  # NOSONAR
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+
+# #353: hard byte cap on the /verify/stats upload. read_csv is CPU- and
+# memory-bound on input size, so the upload is read under this cap and the
+# excess rejected (413) before any parse work starts.
+_MAX_STATS_UPLOAD_BYTES = 10_000_000
+# #353 (CodeAnt on PR #354): the byte cap bounds transfer, not the expanded
+# in-memory frame — bound rows x columns after the parse as well.
+_MAX_STATS_CELL_COUNT = 1_000_000
+# #353 (Greptile P1 on PR #354): the body-limit middleware caps the whole
+# multipart envelope, so a documented-max 10MB CSV rides in a slightly
+# larger body — give the BODY cap envelope headroom; the endpoint's file
+# cap stays the authoritative file-size boundary.
+_STATS_BODY_LIMIT_BYTES = _MAX_STATS_UPLOAD_BYTES + 65_536
+
+# Registered BEFORE CORSMiddleware: add_middleware is LIFO, so CORS must be
+# added last to stay outermost and stamp its headers onto the 413s this
+# middleware short-circuits with (Sentry + Sonar on PR #354).
+app.add_middleware(_BodySizeLimitMiddleware, max_bytes=_STATS_BODY_LIMIT_BYTES, path="/verify/stats")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -64,6 +184,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+
 
 # Include routers
 app.include_router(auth_router)
@@ -230,6 +354,7 @@ _MAX_LOG_RESULT_STRING_CHARS = 1_000
 # qwed_new.core.json_bounding, shared with stats_verifier (Sonar: the two
 # copies had already diverged).
 _LOG_BOUND_BUDGET_CHARS = 2 * _MAX_LOG_RESULT_CHARS
+
 
 
 
@@ -448,11 +573,74 @@ async def verify_logic(
         _safe_commit_log(session, log)
         return _merge_response(dr)
 
+# #353 (CodeAnt + CodeRabbit on PR #354): the byte cap bounds TRANSFER,
+# not pandas memory — parse in chunks and abort the moment the accumulated
+# rows x columns cell count crosses the budget, so a compact-but-wide CSV
+# cannot allocate an oversized frame before the 413.
+def _read_bounded_csv(source):
+    # CodeRabbit on PR #354: chunksize bounds ROWS, not columns —
+    # preflight the column count from the header and derive the
+    # rows-per-chunk budget so no single chunk can exceed the cell
+    # budget when pandas materializes it.
+    import pandas as pd
+
+    if hasattr(source, "seek"):
+        source.seek(0)
+    # Greptile P2 on PR #354: empty and blank-only uploads raise
+    # EmptyDataError BEFORE any column exists — a 400 here, not the broad
+    # handler's generic BLOCKED 200, is what tells clients the input was
+    # malformed
+    try:
+        header = pd.read_csv(source, nrows=0)
+    except pd.errors.EmptyDataError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded CSV contains no data.",
+        ) from exc
+    n_columns = len(header.columns)
+    if n_columns == 0:
+        # Sentry LOW on PR #354: a malformed CSV parsed as zero columns
+        # would otherwise ZeroDivisionError into a generic 500
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded CSV has no columns to verify.",
+        )
+    if n_columns > _MAX_STATS_CELL_COUNT:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Uploaded dataset expands beyond the {_MAX_STATS_CELL_COUNT} cell limit for statistical verification.",
+        )
+    if hasattr(source, "seek"):
+        source.seek(0)
+    rows_per_chunk = max(1, _MAX_STATS_CELL_COUNT // n_columns)
+    reader = pd.read_csv(source, chunksize=rows_per_chunk)
+    chunks = []
+    total_cells = 0
+    try:
+        for chunk in reader:
+            total_cells += int(chunk.size)
+            if total_cells > _MAX_STATS_CELL_COUNT:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Uploaded dataset expands beyond the {_MAX_STATS_CELL_COUNT} cell limit for statistical verification.",
+                )
+            chunks.append(chunk)
+    finally:
+        close = getattr(reader, "close", None)
+        if close is not None:
+            close()
+    if not chunks:
+        return pd.DataFrame()
+    return pd.concat(chunks, ignore_index=True)
+
+
+
 @app.post(
     "/verify/stats",
     responses={
         403: {"description": "Verification blocked by security policy."},
         503: {"description": "Secure execution runtime unavailable."},
+        413: {"description": "Upload exceeds the byte or expanded-cell limit for statistical verification."},
     },
 )
 async def verify_stats(
@@ -469,15 +657,34 @@ async def verify_stats(
     - Query: "Did sales increase by 15% this quarter?"
     """
     check_rate_limit(tenant.api_key)
-    
+
     try:
+        import io
+
         import pandas as pd
-        df = pd.read_csv(file.file)
-        
+        # #353: read_csv on an uncapped upload is an unbounded CPU/memory
+        # wait inside the engine call path — read the upload under a hard
+        # byte cap and reject the excess before any parse work happens.
+        upload = await file.read(_MAX_STATS_UPLOAD_BYTES + 1)
+        if len(upload) > _MAX_STATS_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload exceeds the {_MAX_STATS_UPLOAD_BYTES} byte limit for statistical verification.",
+            )
+        # #341: the whole stats chain is synchronous — read_csv (CPU-bound,
+        # attacker-sized upload), the blocking LLM codegen round trip, and
+        # the Docker daemon calls must not run inline on the event loop.
+        # #353 (CodeAnt + CodeRabbit on PR #354): the byte cap bounds
+        # TRANSFER, not pandas memory — parse in chunks and abort the
+        # moment the accumulated rows x columns cell count crosses the
+        # budget, so a compact-but-wide CSV cannot allocate an oversized
+        # frame before the 413.
+        df = await asyncio.to_thread(_read_bounded_csv, io.BytesIO(upload))
+
         from qwed_new.core.stats_verifier import StatsVerifier
         verifier = StatsVerifier()
 
-        dr = verifier.verify_stats(query, df, provider=None)
+        dr = await asyncio.to_thread(verifier.verify_stats, query, df, None)
         dr = _enforce_trust(dr, query=query)
 
         # Fail-closed audit semantics (P1 #297): never log a BLOCKED / non-
@@ -1598,11 +1805,17 @@ async def verify_with_consensus(
             detail=f"Invalid verification_mode. Must be: single, high, or maximum"
         )
     
-    # Perform consensus verification
-    result = consensus_verifier.verify_with_consensus(
+    # Perform consensus verification.
+    # #340: the sync orchestrator runs engines inline on the event loop
+    # (a 'single'-mode request blocks the WHOLE service for the full
+    # synchronous LLM round trip + sympy evaluation). verify_async submits
+    # every engine to the executor and enforces a hard per-engine timeout
+    # via asyncio.wait_for; min_confidence is enforced below by this
+    # endpoint, as it was before.
+    result = await consensus_verifier.verify_async(
         query=request.query,
         mode=mode,
-        min_confidence=request.min_confidence
+        timeout_seconds=30.0,
     )
 
     if result.agreement_status == "blocked_secure_execution":
