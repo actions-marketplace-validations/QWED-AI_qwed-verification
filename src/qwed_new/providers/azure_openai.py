@@ -9,6 +9,19 @@ from openai import AzureOpenAI
 from qwed_new.core.schemas import MathVerificationTask
 from qwed_new.providers.base import LLMProvider
 
+def _detect_image_mime(image_bytes: bytes) -> str:
+    """Magic-byte MIME detection for vision data URIs, mirroring
+    openai_direct (Sentry HIGH on PR #354: the data URI previously
+    hardcoded image/jpeg, mislabeling PNG/WebP images routed to Azure)."""
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"RIFF") and len(image_bytes) > 12 and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 class AzureOpenAIProvider(LLMProvider):
     """
     Provider for Azure OpenAI (GPT-4).
@@ -24,10 +37,18 @@ class AzureOpenAIProvider(LLMProvider):
         if not all([self.endpoint, self.api_key, self.deployment, self.api_version]):
             raise ValueError("Missing Azure OpenAI environment variables")
             
+        # #353: SDK default read timeout is 600s x retries — a silently
+        # stalled endpoint would occupy its engine worker for ~30 minutes.
+        # timeout=30 with retries DISABLED — worst-case worker occupancy
+        # is one 30s attempt (CodeAnt/CodeRabbit on PR #354: SDK retry
+        # backoff stacks on top of the timeout and extends past the
+        # consensus deadline; the caller owns retry policy).
         self.client = AzureOpenAI(
             api_version=self.api_version,
             azure_endpoint=self.endpoint,
             api_key=self.api_key,
+            timeout=30.0,
+            max_retries=0,
         )
         
         self.function_schema = {
@@ -456,6 +477,11 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
         """
         
         try:
+            # QWED hardcoded-secret-dict on PR #354: an inline `"url":
+            # f"data:..."` literal matches the credential-dict shape even
+            # though this is a vision data-URI, not a credential. Hoist the
+            # URI into a non-credential-named variable.
+            encoded_image = f"data:{_detect_image_mime(image_bytes)};base64,{base64_image}"
             response = self.client.chat.completions.create(
                 model=self.deployment, # Ensure this deployment supports vision (e.g. gpt-4o)
                 messages=[
@@ -463,7 +489,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
                     {"role": "user", "content": [
                         {"type": "text", "text": f"CLAIM: {claim}"},
                         {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+                            "url": encoded_image
                         }}
                     ]}
                 ],

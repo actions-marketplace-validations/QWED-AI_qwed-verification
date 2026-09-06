@@ -24,6 +24,11 @@ Security boundary (structural, in order):
     5. __builtins__ removed from the eval global dict; allowlisted
        math symbols, constants, and functions only.
     6. Enforce basic input validation (type, length, empty check).
+    7. Computational-cost bounds (#353): integer-literal magnitude cap and
+       static exponent / exact-expansion-call argument bounds, so an
+       expression cannot demand unbounded exact-integer expansion at
+       evaluation time (SymPy expands Integer powers eagerly — see the
+       measured 9**9**9**9 hang).
 
 The denylist alone can never defend an eval sink — layers 2 and 4 are
 the structural guarantee; layer 3 catches residual non-expression
@@ -34,8 +39,12 @@ and issues #329/#330 for the bypasses this structure closes.
 """
 
 import ast
+import math
+import operator
 import re
 import unicodedata
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, Dict, Optional, Tuple
 
 import sympy
@@ -53,6 +62,22 @@ __all__ = ["safe_parse_expr", "validate_variable_name", "get_safe_symbol", "Safe
 
 MAX_EXPRESSION_LENGTH = 5_000
 _AST_MAX_DEPTH = 30
+
+# Computational-cost bounds (#353): the character/depth gates above bound
+# PARSING cost, but not EVALUATION cost. SymPy computes exact Integer
+# powers eagerly — ``9**9**9**9`` is 10 characters, shallow, charset-clean,
+# and its evalf() expands a ~370-million-digit integer (measured: hangs
+# past 20s). The gates below bound the magnitude of exact-integer
+# expansion instead of trusting depth or length.
+_MAX_INTEGER_LITERAL = 10**300
+_MAX_EXPONENT_MAGNITUDE = 10_000
+_MAX_EXPANSION_DIGITS = 100_000
+# factorial/binomial expand their exact-integer arguments the same way Pow
+# expands its exact-integer exponent. Integer/Float/Rational are cheap
+# constructors — an explosive ARGUMENT is itself a static Pow/factorial
+# subtree caught by its own node check (CodeAnt on PR #354: bounding them
+# rejected inexpensive inputs like Rational(10001, 3)).
+_EXACT_EXPANSION_CALLS = frozenset({"factorial", "binomial"})
 
 _DENYLIST_PATTERN = re.compile(
     r"(?:"
@@ -115,9 +140,143 @@ _ALLOWED_AST_NODES = frozenset(
 _SAFE_GLOBAL_DICT_TEMPLATE: Dict[str, Any] = {"__builtins__": {}}
 
 
+_BINOP_EVALUATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+
+
+def _check_node_shape(node: ast.AST) -> None:
+    """Node-allowlist + numeric-constant shape check (#329/#330)."""
+    if type(node) not in _ALLOWED_AST_NODES:
+        raise SafeParserError(
+            f"Expression contains disallowed syntax: {type(node).__name__}. "
+            "Only arithmetic expressions are supported."
+        )
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SafeParserError(
+                f"Expression contains disallowed constant of type "
+                f"{type(value).__name__}; only numeric literals are supported."
+            )
+
+
+def _check_constant_magnitude(node: ast.AST) -> None:
+    """A literal large enough to BE its own expansion cost is rejected."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and abs(node.value) > _MAX_INTEGER_LITERAL:
+        raise SafeParserError(
+            "Expression contains an integer literal exceeding "
+            f"{_MAX_INTEGER_LITERAL}; exact expansion is unbounded."
+        )
+
+
+def _check_pow_cost(node: ast.AST) -> None:
+    """Bound statically-known ** powers: sympy expands Integer**Integer
+    eagerly, so the exponent AND the base's own magnitude decide the cost."""
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow)):
+        return
+    base = _static_value(node.left)
+    exponent = _static_value(node.right)
+    if exponent is not None and abs(exponent) > _MAX_EXPONENT_MAGNITUDE:
+        raise SafeParserError(
+            f"Exponent exceeds the maximum magnitude of "
+            f"{_MAX_EXPONENT_MAGNITUDE}; exact-integer expansion "
+            "would be unbounded."
+        )
+    if base is None:
+        return
+    if base == _ASTRONOMICAL:
+        # the base subtree itself demands unbounded expansion
+        # (e.g. (9**9**9)**2 — the bomb lives in the base)
+        raise SafeParserError(
+            "Power base exceeds the expansion budget; exact-integer "
+            "expansion would be unbounded."
+        )
+    if exponent is None:
+        return  # symbolic exponent keeps the power lazy
+    # CodeRabbit on PR #354: sympy expands (Integer**Integer)**Integer
+    # STEPWISE, so nested powers multiply the base's magnitude into the
+    # cost — ((9**9)**9999)**9999 has every immediate exponent inside the
+    # bound yet still expands to a ~400M-digit integer. Estimate the
+    # result's digit count and hold it to the same budget the evaluator
+    # itself obeys.
+    base_digits = _magnitude_digits(base)
+    # exact arithmetic: an exponent may be a float — int x float would
+    # decide the admission bound in binary floating-point (CodeRabbit)
+    if base_digits * _exact_magnitude(abs(exponent)) > _MAX_EXPANSION_DIGITS:
+        raise SafeParserError(
+            f"Power expansion would exceed the {_MAX_EXPANSION_DIGITS} "
+            "digit budget; exact-integer expansion is too costly."
+        )
+
+
+def _check_caret_chain_cost(node: ast.AST) -> None:
+    """Bound caret chains: convert_xor maps ^ to ** in sympy-land, where **
+    is RIGHT-associative — but Python's ^ is LEFT-associative, so the
+    Python AST cannot know which operand ends up as an exponent: 9^9^9
+    parses as ((9^9)^9) here but evaluates as 9**(9**9) sympy-side.
+    Flatten the chain and bound every right-assoc suffix fold — each one
+    is an exponent after reassociation. A symbolic operand anywhere in the
+    chain keeps every enclosing power lazy on the sympy side, so
+    fully-static chains only."""
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor)):
+        return
+    values = [_static_value(operand) for operand in _flatten_caret_chain(node)]
+    if None in values:
+        return
+    exponent = _right_assoc_fold(values[1:])
+    if exponent is not None and abs(exponent) > _MAX_EXPONENT_MAGNITUDE:
+        raise SafeParserError(
+            f"Caret-chain exponent exceeds the maximum magnitude of "
+            f"{_MAX_EXPONENT_MAGNITUDE}; ^ is parsed as right-associative "
+            "exponentiation by sympy."
+        )
+    if exponent is None:
+        return
+    # Sentry CRITICAL on PR #354: the first operand's magnitude multiplies
+    # into the expansion cost exactly like a ** base — (9**9999)^9999 has a
+    # cheap inner power (9543 digits) and an in-bound exponent, yet sympy
+    # eagerly expands the ~95M-digit result. Same budget as **.
+    base = values[0]
+    if base == _ASTRONOMICAL:
+        raise SafeParserError(
+            "Caret-chain base exceeds the expansion budget; exact-integer "
+            "expansion would be unbounded."
+        )
+    if _magnitude_digits(base) * _exact_magnitude(abs(exponent)) > _MAX_EXPANSION_DIGITS:
+        raise SafeParserError(
+            f"Caret expansion would exceed the {_MAX_EXPANSION_DIGITS} "
+            "digit budget; exact-integer expansion is too costly."
+        )
+
+
+def _check_exact_expansion_call_cost(node: ast.AST) -> None:
+    """factorial/binomial expand their exact-integer arguments the same way
+    Pow expands its exact-integer exponent — bound those arguments even at
+    top level (the result there is not in an exponent position, but sympy
+    still materializes it exactly)."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in _EXACT_EXPANSION_CALLS):
+        return
+    for arg in node.args:
+        value = _static_value(arg)
+        if value is not None and abs(value) > _MAX_EXPONENT_MAGNITUDE:
+            raise SafeParserError(
+                f"{node.func.id}() argument exceeds the maximum magnitude "
+                f"of {_MAX_EXPONENT_MAGNITUDE}; exact expansion would be "
+                "unbounded."
+            )
+
+
 def _check_ast_safety(expression: str) -> None:
-    """Reject Python-parseable expressions that use non-arithmetic syntax
-    or exceed max AST depth (issues #329/#330).
+    """Reject Python-parseable expressions that use non-arithmetic syntax,
+    exceed max AST depth, or demand unbounded exact-integer expansion
+    (issues #329/#330/#353).
 
     Expressions using implicit multiplication (e.g. 2x, sin x) fail
     ast.parse and skip this check — they are caught by the charset gate
@@ -133,18 +292,192 @@ def _check_ast_safety(expression: str) -> None:
             f"Expression AST depth {depth} exceeds limit of {_AST_MAX_DEPTH}"
         )
     for node in ast.walk(tree):
-        if type(node) not in _ALLOWED_AST_NODES:
-            raise SafeParserError(
-                f"Expression contains disallowed syntax: {type(node).__name__}. "
-                "Only arithmetic expressions are supported."
-            )
-        if isinstance(node, ast.Constant):
-            value = node.value
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise SafeParserError(
-                    f"Expression contains disallowed constant of type "
-                    f"{type(value).__name__}; only numeric literals are supported."
-                )
+        _check_node_shape(node)
+        _check_constant_magnitude(node)
+        _check_pow_cost(node)
+        _check_caret_chain_cost(node)
+        _check_exact_expansion_call_cost(node)
+
+
+_ASTRONOMICAL = float("inf")
+
+
+def _exact_magnitude(value):
+    """Admission-comparison operand: floats convert via Decimal(str(...))
+    so the bound never runs in binary float (CodeRabbit on PR #354);
+    int/Decimal/Fraction pass through exactly (Fraction compares exactly
+    against ints — Decimal(str(Fraction)) would be ConversionSyntax)."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    return value
+
+
+def _magnitude_digits(value) -> int:
+    """Upper-bound digit count of |value| WITHOUT int->str conversion —
+    Python 3.11+ raises ValueError past 4300 digits, which would turn this
+    cost guard into the crash it exists to prevent. The bit-length estimate
+    may overshoot by a digit; that only makes the budget stricter."""
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return _MAX_EXPANSION_DIGITS * 2
+        return max(value.adjusted() + 1, 1)
+    if isinstance(value, Fraction):
+        bits = abs(value.numerator).bit_length()
+    elif isinstance(value, float):
+        if not math.isfinite(value) or value == 0:
+            return _MAX_EXPANSION_DIGITS * 2
+        return max(int(math.log10(abs(value))) + 1, 1)
+    else:
+        bits = value.bit_length()
+    return max((bits * 30103) // 100000 + 1, 1)
+
+
+def _flatten_caret_chain(node: ast.BinOp) -> list:
+    """Collect the operands of a caret chain into source order.
+
+    Python's ^ is left-assoc, so a chain nests on the left; explicit
+    parentheses are indistinguishable from chain nesting in the AST, so
+    flattening assumes the sympy-side worst case (right-assoc fold).
+    """
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor):
+        return _flatten_caret_chain(node.left) + _flatten_caret_chain(node.right)
+    return [node]
+
+
+def _static_pow(left, right):
+    """Exact-int pow behind an affordability gate — the evaluator must never
+    expand what it cannot afford (decide by digit estimate, not by trying).
+
+    Non-integer operands go through Decimal(str(...)), never binary float:
+    CodeRabbit on PR #354 — float(x) rounding let 10000.0000000000001 pass
+    the 10_000 admission bound as 10000.0. Decimal preserves the value the
+    user wrote; anything non-finite or unrepresentable fails closed.
+    """
+    if isinstance(left, int) and isinstance(right, int) \
+            and abs(right) <= _MAX_EXPONENT_MAGNITUDE \
+            and _magnitude_digits(left) * abs(right) <= _MAX_EXPANSION_DIGITS:
+        return left ** right
+    try:
+        result = Decimal(str(left)) ** Decimal(str(right))
+    except (ArithmeticError, TypeError, ValueError):
+        return _ASTRONOMICAL
+    if not result.is_finite():
+        return _ASTRONOMICAL
+    return result
+
+
+def _right_assoc_fold(values):
+    """Right-assoc static evaluation: v0 ** (v1 ** (...))."""
+    result = values[-1]
+    for value in reversed(values[:-1]):
+        result = _static_pow(value, result)
+    return result
+
+
+def _bounded_factorial(value):
+    if isinstance(value, float) or value < 0 or value > _MAX_EXPONENT_MAGNITUDE:
+        return _ASTRONOMICAL
+    return math.factorial(value)
+
+
+def _bounded_binomial(n, k):
+    if isinstance(n, float) or isinstance(k, float) \
+            or min(n, k) < 0 or max(n, k) > _MAX_EXPONENT_MAGNITUDE:
+        return _ASTRONOMICAL
+    return math.comb(n, k)
+
+
+def _rational(numerator, denominator=None):
+    if denominator is None:
+        return Fraction(numerator)
+    return Fraction(numerator, denominator)
+
+
+# Concrete-valued allowlisted calls: sympy evaluates these eagerly, so a
+# result in an exponent position is NOT symbolic and must be bounded
+# (Greptile P1 / CodeRabbit on PR #354: 2**abs(-100000) and
+# 2**factorial(10000) previously slipped through as 'symbolic').
+_STATIC_EVALUABLE_CALLS = {
+    "abs": abs,
+    "factorial": _bounded_factorial,
+    "binomial": _bounded_binomial,
+    "Integer": int,
+    "Float": float,
+    "Rational": _rational,
+}
+
+
+def _static_constant(node: ast.Constant):
+    if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+        return None
+    return node.value
+
+
+def _static_unary(node: ast.UnaryOp):
+    operand = _static_value(node.operand)
+    if operand is None:
+        return None
+    if isinstance(node.op, ast.USub):
+        return -operand
+    return operand  # UAdd — Invert never reaches here (node allowlist)
+
+
+def _static_binop(node: ast.BinOp):
+    left = _static_value(node.left)
+    right = _static_value(node.right)
+    if left is None or right is None:
+        return None
+    try:
+        if isinstance(node.op, (ast.Pow, ast.BitXor)):
+            # ^ counts as exponentiation on purpose: sympy's convert_xor
+            # turns it into **, so the sympy-side cost is the power cost.
+            return _static_pow(left, right)
+        evaluate = _BINOP_EVALUATORS.get(type(node.op))
+        if evaluate is None:
+            return None
+        return evaluate(left, right)
+    except (ArithmeticError, TypeError, ValueError):
+        # div-by-zero, Decimal/float mix, overflow — magnitude unknowable,
+        # fail closed
+        return _ASTRONOMICAL
+
+
+def _static_call(node: ast.Call):
+    """Evaluate allowlisted concrete-valued calls; symbolic-argument calls
+    (sin(x)...) and non-allowlisted names stay exempt (None = symbolic)."""
+    if not isinstance(node.func, ast.Name) or node.func.id not in _STATIC_EVALUABLE_CALLS:
+        return None
+    args = [_static_value(arg) for arg in node.args]
+    if any(value is None for value in args):
+        return None
+    try:
+        return _STATIC_EVALUABLE_CALLS[node.func.id](*args)
+    except (ArithmeticError, TypeError, ValueError):
+        return _ASTRONOMICAL
+
+
+def _static_value(node: ast.AST):
+    """Statically evaluate a subtree of numeric constants, arithmetic
+    operators, and concrete-valued allowlisted calls, for the #353
+    computational-cost bounds.
+
+    Returns an int/float/Decimal/Fraction when the subtree is fully static,
+    _ASTRONOMICAL when it is static but its exact value is intentionally
+    NOT expanded (magnitude beyond the evaluator's own expansion budget),
+    and None when anything symbolic (a name, or a call with symbolic
+    arguments) is present — the caller fails closed on a static oversized
+    value and lets symbolic expressions through (sympy handles symbolic
+    magnitudes lazily).
+    """
+    if isinstance(node, ast.Constant):
+        return _static_constant(node)
+    if isinstance(node, ast.UnaryOp):
+        return _static_unary(node)
+    if isinstance(node, ast.BinOp):
+        return _static_binop(node)
+    if isinstance(node, ast.Call):
+        return _static_call(node)
+    return None
 
 
 def _ast_node_depth(node: ast.AST, current: int = 0) -> int:
