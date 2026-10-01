@@ -20,7 +20,7 @@ jobs:
     name: Snyk Dependency Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -51,7 +51,7 @@ jobs:
     name: Snyk Code Analysis (SAST)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Install Snyk CLI
         run: npm install -g snyk
