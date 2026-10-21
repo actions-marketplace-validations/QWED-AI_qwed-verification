@@ -11,6 +11,7 @@ from dataclasses import dataclass
 try:
     from z3 import (
         Int, Bool, Real, And, Or, Not, Implies, Xor,
+        BoolVal, ForAll, Exists, is_bool,
     )
     Z3_AVAILABLE = True
 except ImportError:
@@ -22,6 +23,96 @@ try:
     SYMPY_AVAILABLE = True
 except ImportError:
     SYMPY_AVAILABLE = False
+
+
+# Cost bounds for statically-known integer exponentiation. z3/Python compute
+# ``int ** int`` in full before the solver runs, so an unbounded POW in the DSL
+# (e.g. (EQ x (POW 9 (POW 9 9)))) expands a huge integer on the request thread.
+_MAX_POW_EXPONENT = 10_000
+_MAX_POW_EXPANSION_DIGITS = 100_000
+
+
+def _check_pow_cost(base: Any, exponent: Any) -> None:
+    """Reject a statically-known integer power beyond the expansion bounds."""
+    if not isinstance(exponent, int) or isinstance(exponent, bool):
+        return
+    if abs(exponent) > _MAX_POW_EXPONENT:
+        raise ValueError(
+            f"POW exponent exceeds the maximum magnitude of {_MAX_POW_EXPONENT}"
+        )
+    if isinstance(base, int) and not isinstance(base, bool) and base != 0:
+        if len(str(abs(base))) * abs(exponent) > _MAX_POW_EXPANSION_DIGITS:
+            raise ValueError("POW demands unbounded exact-integer expansion")
+
+
+def _is_quoted_literal(token: str) -> bool:
+    """True if a token is a quoted string literal (parser keeps the quotes)."""
+    return len(token) >= 2 and token[0] in ("'", '"') and token[-1] == token[0]
+
+
+def _as_bool(value: Any, role: str) -> Any:
+    """``value`` as a Z3 Bool, or ValueError when it is not Boolean.
+
+    ``IFF`` is a biconditional, not equality: ``(IFF x y)`` on two Int
+    variables must fail rather than silently compile to ``x == y``.
+    """
+    if isinstance(value, bool):
+        return BoolVal(value)
+    if is_bool(value):
+        return value
+    raise ValueError(f"{role} must be Boolean, got: {value}")
+
+
+def _is_boolean(value: Any) -> bool:
+    """True for a Python bool or a Z3 Boolean expression."""
+    return isinstance(value, bool) or is_bool(value)
+
+
+def _check_comparison_sorts(operator: str, left: Any, right: Any) -> tuple:
+    """Reject comparisons that mix Boolean and non-Boolean operands.
+
+    Python ``True``/``False`` are ints, and an undeclared name is auto-created
+    as an Int, so ``(EQ flag True)`` used to compile to ``flag == 1`` and come
+    back SAT with ``flag = 1``. z3 likewise coerces an Int compared with a Bool
+    variable to ``x == If(b, 1, 0)``. Neither means what the constraint says,
+    so fail closed instead of guessing the intended sort. Booleans have no
+    ordering, so GT/LT/GTE/LTE reject any Boolean operand.
+
+    Returns the operands, with Python bools lifted to Z3 for EQ/NEQ.
+    """
+    left_bool, right_bool = _is_boolean(left), _is_boolean(right)
+    if operator in ('EQ', 'NEQ'):
+        if left_bool and right_bool:
+            return _as_bool(left, operator), _as_bool(right, operator)
+        if left_bool or right_bool:
+            literal = isinstance(left, bool) or isinstance(right, bool)
+            kind = "a Boolean literal" if literal else "a Boolean value"
+            raise ValueError(
+                f"{operator} compares {kind} with a non-Boolean value: "
+                f"{left} vs {right}. Declare Boolean variables with (VAR name Bool)."
+            )
+    elif left_bool or right_bool:
+        raise ValueError(
+            f"{operator} compares a Boolean value, which has no ordering: {left} vs {right}"
+        )
+    return left, right
+
+
+_ARITHMETIC_OPERATORS = ('PLUS', 'MINUS', 'MULT', 'DIV', 'POW', 'MOD')
+
+
+def _check_arithmetic_sorts(operator: str, operands: list) -> None:
+    """Reject Boolean operands in arithmetic.
+
+    ``True + 0`` is 1 in Python and z3 turns ``b + 0`` into ``If(b, 1, 0) + 0``,
+    so without this check ``(EQ x (PLUS True 0))`` compiled to ``x == 1`` and
+    slipped past the comparison check as a plain numeric equality.
+    """
+    for operand in operands:
+        if _is_boolean(operand):
+            raise ValueError(
+                f"{operator} applies arithmetic to a Boolean value: {operand}"
+            )
 
 
 @dataclass
@@ -127,7 +218,17 @@ class Z3Compiler:
         if isinstance(node, (int, float)):
             return node
         if isinstance(node, str):
-            # Variable reference - create if not exists
+            # A quoted string literal is not a variable name. The parser keeps
+            # the surrounding quotes on such tokens, so ``"red"`` arrives here as
+            # the 4-char string '"red"'. Auto-creating an Int for it invented a
+            # fresh variable and made contradictory string constraints look SAT
+            # (e.g. (AND (EQ color "red") (EQ color "blue")) → SAT)
+            # (GHSA-mfh5-3c8f-975p). String literals are not a supported Z3 sort.
+            if _is_quoted_literal(node):
+                raise ValueError(
+                    f"String literals are not supported in logic constraints: {node}"
+                )
+            # Bare identifier: variable reference - create if not exists
             if node not in z3_vars:
                 # Auto-create as Int (fallback)
                 z3_vars[node] = Int(node)
@@ -139,7 +240,12 @@ class Z3Compiler:
         
         operator = node[0].upper() if isinstance(node[0], str) else node[0]
         args = node[1:]
-        
+
+        # A quantifier's first argument names the variable it binds; it must
+        # not be compiled as a free variable reference.
+        if operator in ('FORALL', 'EXISTS'):
+            return self._compile_quantifier(operator, args, z3_vars)
+
         # Compile arguments recursively
         compiled_args = [self._compile_expr(arg, z3_vars) for arg in args]
         
@@ -154,7 +260,17 @@ class Z3Compiler:
             return Implies(compiled_args[0], compiled_args[1])
         elif operator == 'XOR':
             return Xor(compiled_args[0], compiled_args[1])
-        elif operator == 'EQ':
+        elif operator == 'IFF':
+            return _as_bool(compiled_args[0], 'IFF operand') == _as_bool(compiled_args[1], 'IFF operand')
+
+        if operator in ('EQ', 'NEQ', 'GT', 'LT', 'GTE', 'LTE'):
+            if len(compiled_args) != 2:
+                raise ValueError(f"{operator} requires exactly 2 operands")
+            compiled_args = list(_check_comparison_sorts(operator, *compiled_args))
+        elif operator in _ARITHMETIC_OPERATORS:
+            _check_arithmetic_sorts(operator, compiled_args)
+
+        if operator == 'EQ':
             return compiled_args[0] == compiled_args[1]
         elif operator == 'NEQ':
             return compiled_args[0] != compiled_args[1]
@@ -181,6 +297,7 @@ class Z3Compiler:
         elif operator == 'DIV':
             return compiled_args[0] / compiled_args[1]
         elif operator == 'POW':
+            _check_pow_cost(compiled_args[0], compiled_args[1])
             return compiled_args[0] ** compiled_args[1]
         elif operator == 'MOD':
             return compiled_args[0] % compiled_args[1]
@@ -192,6 +309,31 @@ class Z3Compiler:
             return None  # VAR doesn't produce a constraint
         else:
             raise ValueError(f"Unknown operator: {operator}")
+
+    def _compile_quantifier(self, operator: str, args: list, z3_vars: Dict[str, Any]) -> Any:
+        """Compile ``(FORALL x body)`` / ``(EXISTS x body)``.
+
+        The bound variable takes the sort of a ``VAR`` declaration or a
+        declared variable of the same name, and is Int otherwise (the same
+        default as a free variable). Inside the body the name refers to the
+        bound variable; outside it, a free variable of the same name is
+        unaffected. The body must be Boolean.
+        """
+        name, body = args
+        if not isinstance(name, str) or _is_quoted_literal(name):
+            raise ValueError(f"{operator} must bind a variable name, got: {name}")
+        bound = z3_vars[name] if name in z3_vars else Int(name)
+        had_free, previous = name in z3_vars, z3_vars.get(name)
+        z3_vars[name] = bound
+        try:
+            compiled_body = _as_bool(self._compile_expr(body, z3_vars), f"{operator} body")
+        finally:
+            if had_free:
+                z3_vars[name] = previous
+            else:
+                del z3_vars[name]
+        quantifier = ForAll if operator == 'FORALL' else Exists
+        return quantifier([bound], compiled_body)
 
 
 class SymPyCompiler:

@@ -2,10 +2,12 @@ from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, F
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from typing import Optional, Annotated
+from typing import Any, Optional, Annotated
 from sqlmodel import Session, select
 from datetime import datetime, timezone
 import asyncio
+import hashlib
+import hmac
 import os
 import logging
 import time
@@ -13,11 +15,18 @@ from fractions import Fraction
 
 from qwed_new.core.security import redact_pii
 from qwed_new.core.diagnostics import (
+    AdmissionDecision,
     AdvisoryCheck,
     DiagnosticResult,
     admission_decision,
     enforce_trust_decision,
     merge_diagnostic_result,
+)
+from qwed_new.core.verifier import (
+    DISPROVEN_STATUS,
+    DOMAIN_RESTRICTED_IDENTITY,
+    identity_domains_match,
+    symbolic_difference_status,
 )
 from qwed_new.api.verification_context_routes import router as verification_context_router
 
@@ -27,10 +36,11 @@ logger = logging.getLogger(__name__)
 INTERNAL_VERIFICATION_ERROR = "Internal verification error"
 INTERNAL_PROCESSING_ERROR = "Internal processing error"
 
-from qwed_new.core.control_plane import ControlPlane
+from qwed_new.core.control_plane import ControlPlane, natural_language_admission
 from qwed_new.core.tenant_context import get_current_tenant, TenantContext
 from qwed_new.core.database import create_db_and_tables, get_session
-from qwed_new.core.models import VerificationLog, ApiKey, User
+from qwed_new.core.audit_logger import get_audit_logger
+from qwed_new.core.models import VerificationLog, ApiKey, User, Organization
 from qwed_new.core.rate_limiter import check_rate_limit
 from qwed_new.core.json_bounding import bound_json_value
 
@@ -39,13 +49,14 @@ from qwed_new.auth import auth_router
 from qwed_new.auth.audit_routes import router as audit_router
 from qwed_new.auth.middleware import get_api_key
 from qwed_new.auth.routes import get_current_user_token
-from qwed_new.auth.security import hash_api_key
+from qwed_new.auth.security import hash_api_key, is_api_key_live, validate_api_key_format
+from qwed_new.api.secret_scanning_routes import router as secret_scanning_router
 
 TenantDependency = Annotated[TenantContext, Depends(get_current_tenant)]
 SessionDependency = Annotated[Session, Depends(get_session)]
 AgentTokenHeader = Annotated[str, Header(...)]
 
-APP_VERSION = "7.2.0"
+APP_VERSION = "7.3.0"
 
 app = FastAPI(
     title="QWED API",
@@ -76,12 +87,32 @@ class _BodySizeLimitMiddleware:
 
     _max_concurrent = 8
     _in_flight = 0
+    # A separate, larger budget for the JSON routes: their bodies are capped
+    # small, but they are still buffered before authentication, so concurrent
+    # requests must not multiply memory without bound (CodeAnt on PR #447).
+    # Worst case stays ~ _json_max_concurrent x _JSON_BODY_LIMIT_BYTES.
+    _json_max_concurrent = 64
+    _json_in_flight = 0
+    # JSON bodies are small and capped, so they get a much tighter read deadline
+    # than the large multipart uploads: a stalled JSON request frees its slot in
+    # seconds, which shrinks the window a slow client could hold slots pre-auth
+    # (Sentry on PR #447). Connection-level slow-loris remains an ingress concern.
+    _json_read_deadline_seconds = 10.0
 
-    def __init__(self, app, max_bytes: int, path: str,
+    def __init__(self, app, max_bytes: int = None, path: str = None,
+                 limits: dict = None, concurrency_paths=None,
                  read_deadline_seconds: float = 30.0):
         self.app = app
-        self.max_bytes = max_bytes
-        self.path = path
+        # Back-compat single-path mode: one capped, concurrency-gated path.
+        # Multi-path mode (#392): a per-path byte cap for every /verify route,
+        # with the global concurrency slot reserved only for the large
+        # multipart uploads (stats, image), since small JSON bodies cost little
+        # to buffer and should not be throttled to the upload slot count.
+        if limits is None:
+            limits = {path: max_bytes}
+            concurrency_paths = {path}
+        self.limits = {p.rstrip("/"): b for p, b in limits.items()}
+        self.concurrency_paths = {p.rstrip("/") for p in (concurrency_paths or ())}
         # Greptile P1 on PR #354: the capacity slot is reserved before
         # authentication, so slow-loris uploads must not hold it forever —
         # the whole body read is bounded by one wall-clock deadline.
@@ -92,61 +123,62 @@ class _BodySizeLimitMiddleware:
         # but the server still receives and spools the WHOLE body before
         # the redirect, so the guard must match both forms (Sentry on
         # PR #354)
-        if scope["type"] != "http" or scope["path"].rstrip("/") != self.path:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        # single-event-loop counter: increments happen synchronously between
-        # awaits, so no lock is needed
-        if _BodySizeLimitMiddleware._in_flight >= _BodySizeLimitMiddleware._max_concurrent:
-            response = JSONResponse(
+        norm = scope["path"].rstrip("/")
+        max_bytes = self.limits.get(norm)
+        if max_bytes is None:
+            await self.app(scope, receive, send)
+            return
+        cls = _BodySizeLimitMiddleware
+        if norm not in self.concurrency_paths:
+            # JSON route: small body, but the replay closure retains it until the
+            # handler reads it, so the slot is held for the whole request to keep
+            # _json_max_concurrent x cap a real memory bound (CodeRabbit/Greptile
+            # on PR #447). The large JSON budget and the short read deadline keep
+            # the saturation risk low; connection-level slow-loris is ingress's
+            # concern, as the upload path documents.
+            if cls._json_in_flight >= cls._json_max_concurrent:
+                await JSONResponse(
+                    status_code=503,
+                    content={"detail": "Server busy — retry shortly."},
+                )(scope, receive, send)
+                return
+            cls._json_in_flight += 1
+            try:
+                body = await self._read_body(
+                    scope, receive, send, max_bytes,
+                    deadline_seconds=self._json_read_deadline_seconds,
+                )
+                if body is not None:
+                    await self.app(scope, self._replay(body), send)
+            finally:
+                cls._json_in_flight -= 1
+            return
+
+        # Multipart upload: the body is large and is retained (by the replay
+        # closure) until the handler consumes it, so the slot is held for the
+        # whole request to keep max_concurrent x max_bytes a real memory bound
+        # (Greptile on PR #447).
+        if cls._in_flight >= cls._max_concurrent:
+            await JSONResponse(
                 status_code=503,
                 content={"detail": "Upload capacity reached — retry shortly."},
-            )
-            await response(scope, receive, send)
+            )(scope, receive, send)
             return
-        _BodySizeLimitMiddleware._in_flight += 1
+        cls._in_flight += 1
         try:
-            await self._buffer_and_forward(scope, receive, send)
+            body = await self._read_body(scope, receive, send, max_bytes)
+            if body is not None:
+                await self.app(scope, self._replay(body), send)
         finally:
-            _BodySizeLimitMiddleware._in_flight -= 1
+            cls._in_flight -= 1
 
-    async def _buffer_and_forward(self, scope, receive, send):
-        body = bytearray()
-        deadline = time.monotonic() + self.read_deadline_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                response = JSONResponse(
-                    status_code=408,
-                    content={"detail": "Request body not received in time."},
-                )
-                await response(scope, receive, send)
-                return
-            try:
-                message = await asyncio.wait_for(receive(), timeout=remaining)
-            except asyncio.TimeoutError:
-                response = JSONResponse(
-                    status_code=408,
-                    content={"detail": "Request body not received in time."},
-                )
-                await response(scope, receive, send)
-                return
-            if message["type"] == "http.disconnect":
-                return
-            body.extend(message.get("body", b""))
-            if len(body) > self.max_bytes:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"detail": f"Upload exceeds the {self.max_bytes} byte limit for statistical verification."},
-                )
-                await response(scope, receive, send)
-                return
-            if not message.get("more_body", False):
-                break
-
+    @staticmethod
+    def _replay(body: bytes):
         # ASGI receive contract (Sentry on PR #354): the replayed body is
-        # delivered ONCE; later calls report disconnect. The coroutine shape
-        # is required by the ASGI protocol — suppressed on the def line.
+        # delivered ONCE; later calls report disconnect.
         replayed = False
 
         async def replay_receive():  # NOSONAR
@@ -154,7 +186,43 @@ class _BodySizeLimitMiddleware:
             if replayed:
                 return {"type": "http.disconnect"}
             replayed = True
-            return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return replay_receive
+
+    async def _read_body(self, scope, receive, send, max_bytes, deadline_seconds=None):
+        """Read the whole body under the cap and deadline. Returns the bytes, or
+        None after sending a 413/408 or on client disconnect."""
+        body = bytearray()
+        deadline = time.monotonic() + (self.read_deadline_seconds if deadline_seconds is None else deadline_seconds)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await JSONResponse(
+                    status_code=408,
+                    content={"detail": "Request body not received in time."},
+                )(scope, receive, send)
+                return None
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except asyncio.TimeoutError:
+                await JSONResponse(
+                    status_code=408,
+                    content={"detail": "Request body not received in time."},
+                )(scope, receive, send)
+                return None
+            if message["type"] == "http.disconnect":
+                return None
+            body.extend(message.get("body", b""))
+            if len(body) > max_bytes:
+                await JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Request body exceeds the {max_bytes} byte limit for this endpoint."},
+                )(scope, receive, send)
+                return None
+            if not message.get("more_body", False):
+                break
+        return bytes(body)
 
         await self.app(scope, replay_receive, send)
 
@@ -162,6 +230,10 @@ class _BodySizeLimitMiddleware:
 # #353: hard byte cap on the /verify/stats upload. read_csv is CPU- and
 # memory-bound on input size, so the upload is read under this cap and the
 # excess rejected (413) before any parse work starts.
+# Wall-clock bound for a single code verification run on the event loop (#445).
+_CODE_VERIFY_TIMEOUT_SECONDS = float(os.environ.get("QWED_CODE_VERIFY_TIMEOUT", "10"))
+# Wall-clock bound for a blocking provider (LLM) call run off the loop (#390).
+_PROVIDER_CALL_TIMEOUT_SECONDS = float(os.environ.get("QWED_PROVIDER_TIMEOUT", "30"))
 _MAX_STATS_UPLOAD_BYTES = 10_000_000
 # #353 (CodeAnt on PR #354): the byte cap bounds transfer, not the expanded
 # in-memory frame — bound rows x columns after the parse as well.
@@ -172,10 +244,35 @@ _MAX_STATS_CELL_COUNT = 1_000_000
 # cap stays the authoritative file-size boundary.
 _STATS_BODY_LIMIT_BYTES = _MAX_STATS_UPLOAD_BYTES + 65_536
 
+# #392: a transport-level body cap on EVERY /verify route, not only
+# /verify/stats. Oversized bodies are rejected (413) before the handler reads
+# them, so a large JSON or image payload cannot be spooled into memory first.
+# JSON routes get a small cap; the two multipart uploads keep their larger caps
+# and the global concurrency slot (buffering a big body is what that slot
+# bounds). _JSON_BODY_LIMIT_BYTES is generous for verification requests, whose
+# bodies are a query plus a small schema or snippet.
+_JSON_BODY_LIMIT_BYTES = 1_000_000
+# The image handler accepts files up to 10 MiB (10 * 1024 * 1024); the multipart
+# envelope is larger, so the body cap is that file limit plus field headroom,
+# or a within-limit upload would be rejected before the handler ran.
+_IMAGE_BODY_LIMIT_BYTES = 10 * 1024 * 1024 + 65_536
+_VERIFY_JSON_PATHS = (
+    "/verify/natural_language", "/verify/logic", "/verify/fact", "/verify/code",
+    "/verify/math", "/verify/sql", "/verify/rag", "/verify/process",
+    "/verify/consensus", "/verify/batch",
+)
+_BODY_LIMITS = dict.fromkeys(_VERIFY_JSON_PATHS, _JSON_BODY_LIMIT_BYTES)
+_BODY_LIMITS["/verify/stats"] = _STATS_BODY_LIMIT_BYTES
+_BODY_LIMITS["/verify/image"] = _IMAGE_BODY_LIMIT_BYTES
+
 # Registered BEFORE CORSMiddleware: add_middleware is LIFO, so CORS must be
 # added last to stay outermost and stamp its headers onto the 413s this
 # middleware short-circuits with (Sentry + Sonar on PR #354).
-app.add_middleware(_BodySizeLimitMiddleware, max_bytes=_STATS_BODY_LIMIT_BYTES, path="/verify/stats")
+app.add_middleware(
+    _BodySizeLimitMiddleware,
+    limits=_BODY_LIMITS,
+    concurrency_paths={"/verify/stats", "/verify/image"},
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -193,6 +290,15 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(audit_router)
 app.include_router(verification_context_router)
+app.include_router(secret_scanning_router)
+
+# Verified leak reports -> auto-revoke + owner notify (#368). Assigned here
+# (not import-time in the routes module) so the production wiring is explicit
+# and tests can substitute the sink without touching the router.
+from qwed_new.api import secret_scanning_routes as _secret_scanning_routes
+from qwed_new.api.secret_revocation import revoke_leaked_keys as _revoke_leaked_keys
+
+_secret_scanning_routes.on_verified_matches = _revoke_leaked_keys
 
 STARTUP_ALLOWED_PTH_FILES = {
     "__editable__.qwed_a2a-0.1.0.pth",
@@ -235,10 +341,27 @@ def _enforce_environment_integrity() -> None:
         raise RuntimeError(f"Environment integrity verification failed: {result.get('risk')}")
 
 
+def _migrate_agent_tokens() -> None:
+    """Hash agent tokens still stored in plaintext; a no-op once done (#478)."""
+    from qwed_new.core.agent_registry import agent_registry as _registry
+    from qwed_new.core.database import engine
+
+    with Session(engine) as session:
+        migrated = _registry.migrate_plaintext_agent_tokens(session)
+    if migrated:
+        logger.info("Hashed %d agent token(s) stored in plaintext (#478)", migrated)
+
+
 @app.on_event("startup")
 def on_startup():
     _enforce_environment_integrity()
     create_db_and_tables()
+    # Fail closed at boot: every verify endpoint appends to the signed audit
+    # chain, so the server does not start without QWED_AUDIT_SECRET_KEY.
+    get_audit_logger()
+    # After the fail-closed checks: a server that refuses to start does not
+    # touch stored data.
+    _migrate_agent_tokens()
 
 # Initialize Kernel (Control Plane)
 control_plane = ControlPlane()
@@ -258,16 +381,45 @@ def _enforce_trust(
 
 _merge_response = merge_diagnostic_result  # shared merge helper (#271)
 
-def _safe_commit_log(session, log):
-    """Write a VerificationLog safely, rolling back on failure."""
+
+class AuditPersistenceError(HTTPException):
+    """An audit row could not be appended to its organisation's chain.
+
+    An HTTPException on purpose: every verify endpoint re-raises
+    HTTPException ahead of its generic ``except Exception`` handler, so an
+    audit failure ends the request as a 500. As a plain exception, the
+    generic handler would replace the real result with a BLOCKED one and
+    try the append again, and a retry that succeeded would return 200 with
+    a record of the replacement instead of the result.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(status_code=500, detail="audit persistence failed")
+
+
+def _safe_commit_log(log):
+    """Append a VerificationLog row to its organisation's audit chain, or fail closed.
+
+    The row is written by the process-wide AuditLogger (hash-chained and
+    HMAC-signed), not through the request session, so /admin/compliance/verify
+    and verify_audit_trail can check it. Any failure (QWED_AUDIT_SECRET_KEY
+    unset, a persisted chain head that fails verification, a continuity
+    mismatch, a database error) raises a 500: a verification result is never
+    returned without its audit record.
+    """
     try:
-        session.add(log)
-        session.commit()
-    except Exception:
-        try:
-            session.rollback()
-        except Exception:
-            logger.exception("Rollback failed while handling commit/log failure")
+        get_audit_logger().log_verification(
+            organization_id=log.organization_id,
+            user_id=log.user_id,
+            query=log.query,
+            result=log.result,
+            is_verified=log.is_verified,
+            domain=log.domain,
+            raw_llm_output=log.raw_llm_output,
+        )
+    except Exception as exc:
+        logger.error("Audit persistence failed: %s", type(exc).__name__)
+        raise AuditPersistenceError() from None
 
 
 class VerifyRequest(BaseModel):
@@ -313,30 +465,27 @@ def get_optional_api_key_record(
     if not x_api_key:
         return None
 
+    # Offline format pre-filter (issue #366): a malformed key resolves to no
+    # credential (None) before an HMAC + DB lookup, so a request that also
+    # carries a valid operator JWT is not preempted by garbage in the
+    # x-api-key header. Both v1 and v2 shapes pass through to the lookup.
+    if validate_api_key_format(x_api_key) == "invalid":
+        return None
+
     hashed_key = hash_api_key(x_api_key)
     statement = select(ApiKey).where(ApiKey.key_hash == hashed_key, ApiKey.is_active)
     api_key = session.execute(statement).scalars().first()
 
-    if not api_key:
-        raise HTTPException(status_code=403, detail="Invalid or revoked API Key")
-
-    # is_active alone is not a liveness check: an expired key linked to an
-    # allowlisted operator kept reading all-tenant metrics indefinitely
-    # (CodeAnt on PR #349). An expired or revoked key is not a usable
-    # credential — resolve to None instead of raising so a request that also
-    # carries a valid operator JWT is not preempted at the dependency layer
-    # (Sentry on PR #349); require_metrics_access re-decides on the remaining
-    # credentials and still denies key-only callers. expires_at is written
-    # naive-UTC (key_rotation's convention), so interpret naive values as UTC
-    # for the timezone-aware comparison (Sonar: no naive utcnow()).
-    if api_key.revoked_at is not None:
+    # Any x-api-key that is not a usable credential resolves to None, never a
+    # raise, so a request that also carries a valid operator JWT is not
+    # preempted at the dependency layer (Sentry on PR #349). That covers an
+    # unknown or revoked key (is_active=False, filtered out by the query above
+    # — CodeAnt on PR #454) as well as an expired/revoked row that reaches the
+    # liveness check: is_active alone is not liveness, since an expired key
+    # keeps is_active=True (CodeAnt on PR #349). require_metrics_access
+    # re-decides on the remaining credentials and still denies key-only callers.
+    if not api_key or not is_api_key_live(api_key):
         return None
-    if api_key.expires_at is not None:
-        expires_at = api_key.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at <= datetime.now(timezone.utc):
-            return None
 
     return api_key
 
@@ -476,27 +625,55 @@ async def verify_natural_language(
         )
 
     if dr is None:
-        verification_result = result.get("verification", {}) if isinstance(result, dict) else {}
-        try:
-            dr = DiagnosticResult.from_legacy_dict(verification_result, engine="math")
-        except ValueError:
-            dr = DiagnosticResult.unverifiable(
-                "Verification result unavailable — legacy engine did not retain proof artifacts",
-                {"constraint_id": "api.natural_language.legacy_conversion_failed", "legacy_status": verification_result.get("status")},
-            )
+        dr = _natural_language_diagnostic(result)
     dr = _enforce_trust(dr, query=request.query)
+    # The verdict covers the LLM's translated expression, not the user's
+    # question, so it is never admitted for the question while the
+    # translation itself is unverified. The verdict stays as produced
+    # (QWED #15); only admission is withheld.
+    admission = natural_language_admission(dr)
 
     log = VerificationLog(
         organization_id=tenant.organization_id,
         user_id=tenant.user_id if hasattr(tenant, 'user_id') else None,
         query=request.query,
         result=_cap_log_result(dr.to_dict()),
-        is_verified=dr.is_authoritative,
+        # The log row is keyed by the user's question, which is only
+        # verified when it is admitted.
+        is_verified=admission is AdmissionDecision.ADMIT,
         domain="MATH"
     )
-    _safe_commit_log(session, log)
+    _safe_commit_log(log)
 
-    return _merge_response(dr)
+    response = _merge_response(dr)
+    response["admission"] = admission.value
+    return response
+
+
+def _natural_language_diagnostic(result: Any) -> DiagnosticResult:
+    """The verdict for a control-plane result.
+
+    The control plane attaches the DiagnosticResult it enforced (signed and
+    attested for decided verdicts, #437), so it is used as produced. Results
+    without one (security or policy blocks, non-math queries, errors) fall back
+    to the fail-closed legacy mapping, which can never yield VERIFIED.
+    """
+    if isinstance(result, dict) and "diagnostic" in result:
+        try:
+            return DiagnosticResult.from_dict(result["diagnostic"])
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return DiagnosticResult.blocked(
+                "Verification blocked — control plane returned a malformed diagnostic",
+                {"constraint_id": "api.natural_language.malformed_diagnostic"},
+            )
+    verification_result = result.get("verification", {}) if isinstance(result, dict) else {}
+    try:
+        return DiagnosticResult.from_legacy_dict(verification_result, engine="math")
+    except ValueError:
+        return DiagnosticResult.unverifiable(
+            "Verification result unavailable — legacy engine did not retain proof artifacts",
+            {"constraint_id": "api.natural_language.legacy_conversion_failed", "legacy_status": verification_result.get("status")},
+        )
 
 @app.post(
     "/verify/logic",
@@ -544,7 +721,7 @@ async def verify_logic(
             is_verified=dr.is_authoritative,
             domain="LOGIC"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
         return _merge_response(dr)
 
@@ -570,7 +747,7 @@ async def verify_logic(
             is_verified=False,
             domain="LOGIC"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
 # #353 (CodeAnt + CodeRabbit on PR #354): the byte cap bounds TRANSFER,
@@ -701,7 +878,7 @@ async def verify_stats(
             and dr.developer_fields.get("is_valid") is True,
             domain="STATS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
         return _merge_response(dr)
     except HTTPException:
@@ -721,11 +898,11 @@ async def verify_stats(
             is_verified=False,
             domain="STATS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
 
-@app.post("/verify/fact")
+@app.post("/verify/fact", responses={503: {"description": "Fact verification timed out"}})
 async def verify_fact(
     request: dict,
     tenant: TenantContext = Depends(get_current_tenant),
@@ -752,8 +929,18 @@ async def verify_fact(
         verifier = FactVerifier()
         
         provider = request.get("provider")
-        
-        result = verifier.verify_fact(claim, context, provider=provider)
+
+        # The fact verifier makes a blocking provider (LLM) call; run it off the
+        # event loop under a wall-clock bound so a slow upstream cannot stall the
+        # worker for every co-tenant (#390). A timeout fails closed with 503,
+        # like /verify/code.
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(verifier.verify_fact, claim, context, provider=provider),
+                timeout=_PROVIDER_CALL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="Fact verification timed out.") from None
 
         if isinstance(result, DiagnosticResult):
             dr = result
@@ -781,7 +968,7 @@ async def verify_fact(
             is_verified=dr.is_authoritative,
             domain="FACT"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
         return _merge_response(dr)
 
@@ -801,11 +988,11 @@ async def verify_fact(
             is_verified=False,
             domain="FACT"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
 
-@app.post("/verify/code")
+@app.post("/verify/code", responses={503: {"description": "Code verification timed out"}})
 async def verify_code(
     request: dict,
     tenant: TenantContext = Depends(get_current_tenant),
@@ -823,7 +1010,17 @@ async def verify_code(
         if not code:
             raise HTTPException(status_code=400, detail="Missing 'code'")
 
-        result = verifier.verify_code(code, language=language)
+        # Static analysis is CPU-bound and its cost grows with the snippet, so
+        # it runs in a worker thread under a wall-clock bound rather than inline
+        # on the shared event loop (#445). A timeout fails closed: a snippet the
+        # verifier could not finish is not admitted.
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(verifier.verify_code, code, language=language),
+                timeout=_CODE_VERIFY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="Code verification timed out.")
 
         # Verification truth is preserved unchanged: a proven-unsafe snippet is
         # VERIFIED-as-unsafe (developer_fields.is_valid False, proof_ref bound).
@@ -842,7 +1039,7 @@ async def verify_code(
             is_verified=dr.developer_fields.get("is_valid") is True,
             domain="CODE"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
         response = _merge_response(dr)
         response["admission"] = admission.value
@@ -864,7 +1061,7 @@ async def verify_code(
             is_verified=False,
             domain="CODE"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         response = _merge_response(dr)
         response["admission"] = admission_decision(dr).value
         return response
@@ -893,23 +1090,44 @@ async def verify_math(
             left = safe_parse_expr(left_str)
             right = safe_parse_expr(right_str)
             difference = simplify(left - right)
-            is_valid = difference == 0
+            identity_status = symbolic_difference_status(difference)
 
             fields = {
                 "left_side": str(left),
                 "right_side": str(right),
                 "simplified_difference": str(difference),
             }
-            if is_valid:
+            if identity_status == "VERIFIED" and not identity_domains_match(left_str, right_str):
+                # simplify cancelled a removable singularity (x/x = 1 is
+                # false at x = 0): the identity holds only on a restricted
+                # domain, so it is not proven unconditionally (#429).
+                dr = DiagnosticResult.unverifiable(
+                    "Identity holds only where both sides are defined",
+                    developer_fields={
+                        "is_valid": False,
+                        "result": None,
+                        "constraint_id": DOMAIN_RESTRICTED_IDENTITY,
+                        **fields,
+                    },
+                )
+            elif identity_status == "VERIFIED":
                 dr = DiagnosticResult.verified(
                     "Identity is true",
                     developer_fields={"is_valid": True, "result": True, **fields},
                     evidence=fields,
                 )
+            elif identity_status == DISPROVEN_STATUS:
+                # Proven false is a decided verdict: VERIFIED with is_valid
+                # False, admission DENY — never "inconclusive" (#437).
+                dr = DiagnosticResult.disproven(
+                    "Identity is false",
+                    developer_fields={"result": False, **fields},
+                    evidence={**fields, "verdict": "disproven"},
+                )
             else:
                 dr = DiagnosticResult.unverifiable(
-                    "Identity is false",
-                    developer_fields={"is_valid": False, "result": False, **fields},
+                    "Identity could not be proven or disproven",
+                    developer_fields={"is_valid": False, "result": None, **fields},
                 )
         else:
             import re
@@ -976,17 +1194,22 @@ async def verify_math(
             dr.developer_fields.setdefault("advisory_checks", []).append(float_advisory)
 
         dr = _enforce_trust(dr, query=expression)
+        # A proven-false identity is VERIFIED too, so the verdict alone is
+        # not "safe to use": expose admission separately (QWED #15).
+        admission = admission_decision(dr)
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=expression,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=dr.developer_fields.get("is_valid") is True,
             domain="MATH"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
-        return _merge_response(dr)
+        response = _merge_response(dr)
+        response["admission"] = admission.value
+        return response
 
     except HTTPException:
         raise
@@ -1004,8 +1227,10 @@ async def verify_math(
             is_verified=False,
             domain="MATH"
         )
-        _safe_commit_log(session, log)
-        return _merge_response(dr)
+        _safe_commit_log(log)
+        response = _merge_response(dr)
+        response["admission"] = admission_decision(dr).value
+        return response
 
 
 @app.post(
@@ -1049,7 +1274,7 @@ async def verify_sql(
             is_verified=dr.is_authoritative,
             domain="SQL"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
         response = _merge_response(dr)
         response["admission"] = admission.value
@@ -1071,7 +1296,7 @@ async def verify_sql(
             is_verified=False,
             domain="SQL"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         response = _merge_response(dr)
         response["admission"] = admission_decision(dr).value
         return response
@@ -1125,7 +1350,7 @@ async def verify_image(
             is_verified=dr.is_authoritative,
             domain="IMAGE"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
 
         return _merge_response(dr)
 
@@ -1145,7 +1370,7 @@ async def verify_image(
             is_verified=False,
             domain="IMAGE"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
 class RAGVerifyRequest(BaseModel):
@@ -1221,7 +1446,7 @@ async def verify_rag(
                 is_verified=False,
                 domain="RAG"
             )
-            _safe_commit_log(session, log)
+            _safe_commit_log(log)
             return _merge_response(dr)
         
         is_verified = result.get("verified", False)
@@ -1245,7 +1470,7 @@ async def verify_rag(
             is_verified=dr.is_authoritative,
             domain="RAG"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         
         return _merge_response(dr)
         
@@ -1266,7 +1491,7 @@ async def verify_rag(
             is_verified=False,
             domain="RAG"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
 class ProcessVerifyRequest(BaseModel):
@@ -1330,7 +1555,7 @@ async def verify_process(
             is_verified=dr.is_authoritative,
             domain="PROCESS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         
         return _merge_response(dr)
         
@@ -1350,7 +1575,7 @@ async def verify_process(
             is_verified=False,
             domain="PROCESS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
 
@@ -1363,7 +1588,6 @@ from qwed_new.core.observability import (
     get_prometheus_metrics,
     metrics_collector,
 )
-from datetime import datetime, timezone
 from sqlmodel import select
 
 @app.get("/health")
@@ -1377,6 +1601,54 @@ async def health_check():
         "service": "QWED Platform",
         "version": APP_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get(
+    "/health/identity",
+    responses={
+        400: {"description": "Missing nonce or nonce longer than 128 characters"},
+        503: {"description": "Server secrets not configured"},
+    },
+)
+async def server_identity(nonce: str = ""):
+    """
+    Challenge-response proof of the active server secret set (issue #376).
+
+    Lets `qwed init` prove the healthy localhost server it found actually
+    holds its secrets before bootstrapping an API key against it — a foreign
+    process on the same port (or a stale server on older values) fails the
+    comparison and init refuses to continue.
+
+    The caller supplies a fresh ``nonce``; the server returns domain-separated
+    HMAC-SHA256 tags over it under each secret. Deterministic fingerprints
+    would be replayable by any same-host process that once observed them
+    (CodeRabbit CWE-294 + Greptile P1 on #388); binding the response to a
+    caller nonce makes a captured response useless for any later handshake.
+    Preimages stay server-side in all cases. Unauthenticated like /health
+    (init has no credentials yet); loopback-scoped by deployment. Missing
+    server secrets fail closed with 503 rather than proving anything.
+    """
+    if not nonce or len(nonce) > 128:
+        raise HTTPException(status_code=400, detail="nonce is required (max 128 characters)")
+    jwt_secret = os.getenv("QWED_JWT_SECRET_KEY", "")
+    lookup_secret = os.getenv("QWED_API_KEY_LOOKUP_SECRET", "")
+    audit_secret = os.getenv("QWED_AUDIT_SECRET_KEY", "")
+    if not jwt_secret or not lookup_secret or not audit_secret:
+        raise HTTPException(status_code=503, detail="server secrets not configured")
+
+    def _prove(secret: str, domain: str) -> str:
+        return hmac.new(
+            secret.encode(),
+            f"qwed-server-identity-v1:{domain}:{nonce}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    return {
+        "identity": {
+            "jwt_hmac": _prove(jwt_secret, "jwt"),
+            "lookup_hmac": _prove(lookup_secret, "lookup"),
+            "audit_hmac": _prove(audit_secret, "audit"),
+        }
     }
 
 @app.get("/metrics")
@@ -1827,11 +2099,11 @@ async def verify_with_consensus(
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=request.query,
-            result=f"Consensus: {result.agreement_status}",
+            result=_cap_log_result(dr.to_dict()),
             is_verified=dr.is_authoritative,
             domain="CONSENSUS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
     # All engines blocked — preserve BLOCKED status (fail-closed)
@@ -1844,11 +2116,11 @@ async def verify_with_consensus(
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=request.query,
-            result=f"Consensus: {result.agreement_status}",
+            result=_cap_log_result(dr.to_dict()),
             is_verified=dr.is_authoritative,
             domain="CONSENSUS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
     if result.confidence < request.min_confidence:
@@ -1860,11 +2132,11 @@ async def verify_with_consensus(
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=request.query,
-            result=f"Consensus: {result.agreement_status}, Confidence: {result.confidence:.1%}",
+            result=_cap_log_result(dr.to_dict()),
             is_verified=dr.is_authoritative,
             domain="CONSENSUS"
         )
-        _safe_commit_log(session, log)
+        _safe_commit_log(log)
         return _merge_response(dr)
 
     # Convert consensus result via its own to_diagnostic_result() method —
@@ -1875,11 +2147,11 @@ async def verify_with_consensus(
     log = VerificationLog(
         organization_id=tenant.organization_id,
         query=request.query,
-        result=f"Consensus: {result.agreement_status}, Confidence: {result.confidence:.1%}",
+        result=_cap_log_result(dr.to_dict()),
         is_verified=dr.is_authoritative,
         domain="CONSENSUS"
     )
-    _safe_commit_log(session, log)
+    _safe_commit_log(log)
 
     # Format response
     response = {
@@ -1910,75 +2182,198 @@ async def verify_with_consensus(
 from qwed_new.core.compliance_exporter import ComplianceExporter
 from qwed_new.core.threat_detector import threat_detector
 from qwed_new.core.key_rotation import key_manager
-from qwed_new.core.rbac import require_role
+from qwed_new.auth.roles import ROLE_RANK
 
 compliance_exporter = ComplianceExporter()
 
-@app.get("/admin/compliance/export/csv", tags=["Compliance"])
-@require_role(["admin"])
+
+# Shared across the admin handlers so the message lives in one place.
+_FOREIGN_ORG_DETAIL = "Cannot access another organization's data"
+# Role hierarchy for admin operations (higher number = more privilege); one
+# ranking shared with the user-session routes (#478).
+_ROLE_RANK = ROLE_RANK
+
+
+# Liveness for admin endpoints is the same rule the tenant boundary enforces;
+# import the one shared implementation (qwed_new.auth.security.is_api_key_live)
+# rather than keeping a second copy here (#389).
+_api_key_is_live = is_api_key_live
+
+
+class AdminContext:
+    """The authenticated principal for an admin endpoint: the API key, its owning
+    user (which carries the role) and the organization both are scoped to."""
+
+    def __init__(self, api_key: ApiKey, user: User):
+        self.api_key = api_key
+        self.user = user
+        self.organization_id = api_key.organization_id
+        self.role = user.role
+
+
+def require_admin_role(allowed_roles: list[str]):
+    """Dependency for admin endpoints (#222). get_api_key authenticates the key;
+    this authorizes it by the owning user's role. It replaces the old
+    @require_role decorator, which read request.state.user — never populated, so
+    every admin endpoint returned 401 (dead code). The returned AdminContext
+    carries organization_id so the handler can scope the action to the caller's
+    own org and never act on a caller-supplied id for another tenant (IDOR).
+
+    Fails closed before granting admin access: the key must be live (not expired
+    or revoked), the owning user must be active and in the key's own organization
+    (so a key cannot borrow a role from another tenant), the organization must be
+    active, and the role must be allowed."""
+
+    def dependency(
+        api_key: ApiKey = Depends(get_api_key),
+        session: Session = Depends(get_session),
+    ) -> AdminContext:
+        if not _api_key_is_live(api_key):
+            raise HTTPException(status_code=403, detail="API key is expired or revoked")
+        user = session.get(User, api_key.user_id) if api_key.user_id else None
+        if user is None or not user.is_active or user.organization_id != api_key.organization_id:
+            raise HTTPException(status_code=403, detail="API key is not authorized for admin operations")
+        org = session.get(Organization, api_key.organization_id)
+        if org is None or not org.is_active:
+            raise HTTPException(status_code=403, detail="Organization is not active")
+        if user.role not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions for this operation")
+        return AdminContext(api_key, user)
+
+    return dependency
+
+
+# Module-level dependency singletons (avoids calling require_admin_role in
+# argument defaults — Ruff B008 — and builds each dependency once).
+_REQUIRE_ADMIN = Depends(require_admin_role(["owner", "admin"]))
+_REQUIRE_ADMIN_OR_MEMBER = Depends(require_admin_role(["owner", "admin", "member"]))
+_FOREIGN_ORG_RESPONSE = {403: {"description": _FOREIGN_ORG_DETAIL}}
+
+
+@app.get("/admin/compliance/export/csv", tags=["Compliance"], responses=_FOREIGN_ORG_RESPONSE)
 async def export_audit_csv(
     organization_id: int,
-    request: Request,  # Required for RBAC
-    api_key: ApiKey = Depends(get_api_key)
+    ctx: AdminContext = _REQUIRE_ADMIN,
 ):
-    """Export audit trail as CSV (Admin only)."""
+    """Export audit trail as CSV (admin, own organization only)."""
+    if organization_id != ctx.organization_id:
+        raise HTTPException(status_code=403, detail=_FOREIGN_ORG_DETAIL)
     csv_data = compliance_exporter.export_audit_trail_csv(organization_id)
     return Response(content=csv_data, media_type="text/csv")
 
-@app.get("/admin/compliance/verify/{log_id}", tags=["Compliance"])
-@require_role(["admin"])
+@app.get("/admin/compliance/verify/{log_id}", tags=["Compliance"],
+         responses={404: {"description": "Audit log entry not found"}})
 async def verify_audit_log_entry(
     log_id: int,
-    request: Request,
-    api_key: ApiKey = Depends(get_api_key),
+    ctx: AdminContext = _REQUIRE_ADMIN,
     session: Session = Depends(get_session)
 ):
     """
-    Cryptographically verify a specific audit log entry.
+    Cryptographically verify a specific audit log entry (own organization only).
     Checks HMAC signature and hash chain integrity.
     """
+    log = session.get(VerificationLog, log_id)
+    if log is None or log.organization_id != ctx.organization_id:
+        # Do not reveal whether a log in another org exists.
+        raise HTTPException(status_code=404, detail="Audit log entry not found")
     from qwed_new.core.audit_logger import AuditLogger
     verifier = AuditLogger()
     return verifier.verify_log_entry(log_id, session)
 
-@app.get("/admin/compliance/report/soc2/{org_id}", tags=["Compliance"])
-@require_role(["admin"])
+@app.get("/admin/compliance/report/soc2/{org_id}", tags=["Compliance"], responses=_FOREIGN_ORG_RESPONSE)
 async def generate_soc2_report(
     org_id: int,
-    request: Request,
-    api_key: ApiKey = Depends(get_api_key)
+    ctx: AdminContext = _REQUIRE_ADMIN,
 ):
-    """Generate SOC 2 Type II compliance report."""
+    """Generate SOC 2 Type II compliance report (own organization only)."""
+    if org_id != ctx.organization_id:
+        raise HTTPException(status_code=403, detail=_FOREIGN_ORG_DETAIL)
     return compliance_exporter.generate_soc2_report(org_id)
 
-@app.get("/admin/security/threats/{org_id}", tags=["Security"])
-@require_role(["admin"])
+@app.get("/admin/security/threats/{org_id}", tags=["Security"], responses=_FOREIGN_ORG_RESPONSE)
 async def get_threat_summary(
     org_id: int,
-    request: Request,
-    api_key: ApiKey = Depends(get_api_key)
+    ctx: AdminContext = _REQUIRE_ADMIN,
 ):
-    """Get real-time threat summary."""
+    """Get real-time threat summary (own organization only)."""
+    if org_id != ctx.organization_id:
+        raise HTTPException(status_code=403, detail=_FOREIGN_ORG_DETAIL)
     return threat_detector.get_threat_summary(org_id)
 
-@app.post("/admin/keys/rotate", tags=["Security"])
-@require_role(["admin", "member"])
+@app.post("/admin/keys/rotate", tags=["Security"],
+          responses={403: {"description": "Not permitted to rotate this key"},
+                     404: {"description": "Key not found"}})
 async def rotate_api_key(
     key_id: int,
-    request: Request,
-    api_key: ApiKey = Depends(get_api_key)
+    ctx: AdminContext = _REQUIRE_ADMIN_OR_MEMBER,
+    session: Session = Depends(get_session)
 ):
-    """Rotate an API key (invalidate old, create new)."""
+    """Rotate an API key and return the new secret once.
+
+    Scoped to the caller's own organization, and to a key the caller is allowed
+    to rotate: anyone may rotate their own key; otherwise only an admin/owner
+    may rotate another user's key, and never a key owned by a higher-privileged
+    user — so a member cannot rotate an admin's or owner's key and inherit its
+    privileges, and an admin cannot take over an owner's key (Sentry on #450).
+    A revoked or inactive key is not rotated (it would mint a fresh live secret
+    from a dead credential)."""
+    target = session.get(ApiKey, key_id)
+    if (target is None or target.organization_id != ctx.organization_id
+            or not target.is_active or target.revoked_at is not None):
+        # 404, not 403: do not confirm that a key id in another org exists, and
+        # treat a revoked/inactive key as absent.
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    is_own_key = target.user_id is not None and target.user_id == ctx.user.id
+    if not is_own_key:
+        if ctx.role not in ("owner", "admin"):
+            raise HTTPException(status_code=403, detail="Not permitted to rotate another user's key")
+        target_owner = session.get(User, target.user_id) if target.user_id else None
+        if target_owner and _ROLE_RANK.get(target_owner.role, 0) > _ROLE_RANK.get(ctx.role, 0):
+            raise HTTPException(status_code=403, detail="Cannot rotate a key owned by a higher-privileged user")
+
     new_key, raw_key = key_manager.rotate_key(key_id)
     if not new_key:
         raise HTTPException(status_code=404, detail="Key not found")
-    
+
     return {
         "status": "rotated",
         "old_key_id": key_id,
         "new_key_id": new_key.id,
         "new_key_preview": new_key.key_preview,
         "new_key_secret": raw_key  # Show once
+    }
+
+
+@app.post(
+    "/agents/{agent_id}/token/reissue",
+    tags=["Agents"],
+    responses={
+        403: {"description": "API key not live, or role below member"},
+        404: {"description": "No such agent in the caller's organisation"},
+    },
+)
+async def reissue_agent_token(
+    agent_id: int,
+    ctx: AdminContext = _REQUIRE_ADMIN_OR_MEMBER,
+    session: Session = Depends(get_session),
+):
+    """Give an agent a new token, shown once; the old token stops working (#478).
+
+    Optional: the #478 migration hashes stored tokens in place, so existing
+    tokens keep working. Re-issue one whose plaintext may still sit in a
+    database backup from before the migration. Members and above, for agents
+    in their own organisation only.
+    """
+    agent = session.get(Agent, agent_id)
+    if agent is None or agent.organization_id != ctx.organization_id:
+        # 404, not 403: do not confirm that an agent id in another org exists.
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent_token = agent_registry.reissue_agent_token(session, agent)
+    return {
+        "agent_id": agent.id,
+        "agent_token": agent_token,  # Show once
+        "message": "Agent token re-issued. Store it securely; the previous token no longer works.",
     }
 
 @app.on_event("startup")
@@ -1996,7 +2391,7 @@ async def startup_security_tasks():
 # BATCH VERIFICATION ENDPOINTS (Phase 4)
 # ============================================================
 
-from qwed_new.core.batch import batch_service
+from qwed_new.core.batch import batch_service, BatchCapacityError
 from typing import List
 
 class BatchVerifyRequest(BaseModel):
@@ -2009,7 +2404,7 @@ class BatchVerifyItem(BaseModel):
     type: str = "natural_language"
     params: Optional[dict] = None
 
-@app.post("/verify/batch", tags=["Batch"])
+@app.post("/verify/batch", tags=["Batch"], responses={503: {"description": "Batch capacity reached"}})
 async def batch_verify(
     request: BatchVerifyRequest,
     tenant: TenantContext = Depends(get_current_tenant)
@@ -2046,10 +2441,13 @@ async def batch_verify(
         )
     
     # Create and process job
-    job = batch_service.create_job(
-        organization_id=tenant.organization_id,
-        items=request.items
-    )
+    try:
+        job = batch_service.create_job(
+            organization_id=tenant.organization_id,
+            items=request.items
+        )
+    except BatchCapacityError:
+        raise HTTPException(status_code=503, detail="Batch capacity reached — retry shortly.") from None
     
     # Process synchronously (for simplicity)
     # For very large batches, return job_id and process async

@@ -26,6 +26,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+#: Bound for every SMTP phase (connect, TLS, auth, delivery). The leak sink
+#: notifies inline per match — an unbounded stall would hold later
+#: revocations behind one wedged delivery (Greptile P1 on #380).
+_SMTP_TIMEOUT_SECONDS = 10
+
+
 class AlertManager:
     """
     Manages security alerts and notifications.
@@ -34,11 +40,22 @@ class AlertManager:
     def __init__(self):
         # Configuration (should be in environment variables)
         self.slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+        # SSRF guard (#423): fail the misconfiguration at construction so
+        # a metadata/loopback webhook can never be posted to. Soft-fail
+        # (warn + disable) matches this class's existing style for missing
+        # credentials — see _send_email below.
+        if self.slack_webhook_url is not None:
+            try:
+                from qwed_new.core.url_guard import validate_fetch_url
+                validate_fetch_url(self.slack_webhook_url)
+            except ValueError as e:
+                logger.warning("Ignoring unsafe SLACK_WEBHOOK_URL: %s", e)
+                self.slack_webhook_url = None
         self.smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
         self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
         self.smtp_user = os.getenv("SMTP_USER")
         self.smtp_password = os.getenv("SMTP_PASSWORD")
-        self.alert_email_to = os.getenv("ALERT_EMAIL_TO", "rahul@qwedai.com")
+        self.alert_email_to = os.getenv("ALERT_EMAIL_TO", "rahul@qwedai.tech")
         
         # Alert throttling (prevent spam)
         self.recent_alerts = defaultdict(list)  # alert_key -> [timestamps]
@@ -89,6 +106,33 @@ class AlertManager:
         self.recent_alerts[alert_key].append(datetime.utcnow())
         logger.info(f"Alert sent: {title} (severity: {severity})")
     
+    def send_owner_email(self, recipient: str, subject: str, body: str) -> None:
+        """Send a one-off email to an explicit recipient. Raises on failure.
+
+        Unlike send_alert this is never throttled: each call is a distinct,
+        already-verified event (e.g. a key auto-revocation). Callers decide
+        failure policy — revocation must never depend on delivery.
+        """
+        if not recipient or "@" not in recipient:
+            raise ValueError("owner notification requires a valid recipient email")
+        if not self.smtp_user or not self.smtp_password:
+            raise RuntimeError("Email not configured (SMTP credentials missing)")
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"[QWED Security] {subject}"
+        msg['From'] = self.smtp_user
+        msg['To'] = recipient
+        msg.attach(MIMEText(
+            body + "\n\n--\nThis is an automated security alert from QWED.\nDo not reply to this email.\n",
+            'plain',
+        ))
+
+        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=_SMTP_TIMEOUT_SECONDS) as server:
+            server.starttls()
+            server.login(self.smtp_user, self.smtp_password)
+            server.send_message(msg)
+        logger.info("Owner notification sent to %s", recipient)
+
     def _is_throttled(self, alert_key: str) -> bool:
         """Check if alert should be throttled."""
         cutoff = datetime.utcnow() - timedelta(minutes=self.throttle_minutes)
@@ -161,11 +205,19 @@ class AlertManager:
             })
         
         try:
+            # No redirects, ever: the validated webhook URL is the only
+            # permitted destination. A 3xx is a failure, not a forwarding
+            # instruction — following it would resend the alert body to an
+            # unvalidated target (redirects are how metadata/loopback
+            # targets would be reached despite __init__ validation).
             response = requests.post(
                 self.slack_webhook_url,
                 json=slack_message,
-                timeout=5
+                timeout=5,
+                allow_redirects=False,
             )
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("Slack webhook redirect refused")
             response.raise_for_status()
             logger.info("Slack alert sent successfully")
         except Exception as e:

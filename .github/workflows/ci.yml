@@ -37,10 +37,12 @@ jobs:
           --health-retries 5
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      with:
+        persist-credentials: false
     - name: Set up Python
-      uses: actions/setup-python@v7
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
       with:
         python-version: "3.11"
 
@@ -68,9 +70,11 @@ jobs:
         DUMMY_API=$(python -c "import secrets; print(secrets.token_hex(32))")
         DUMMY_JWT=$(python -c "import secrets; print(secrets.token_hex(32))")
         DUMMY_LOOKUP=$(python -c "import secrets; print(secrets.token_hex(32))")
+        DUMMY_AUDIT=$(python -c "import secrets; print(secrets.token_hex(32))")
         echo "API_KEY_SECRET=${DUMMY_API}" >> $GITHUB_ENV
         echo "QWED_JWT_SECRET_KEY=${DUMMY_JWT}" >> $GITHUB_ENV
         echo "DUMMY_LOOKUP=${DUMMY_LOOKUP}" >> $GITHUB_ENV
+        echo "DUMMY_AUDIT=${DUMMY_AUDIT}" >> $GITHUB_ENV
         echo "API_KEY_SECRET=${DUMMY_API}" >> .env
         echo "QWED_JWT_SECRET_KEY=${DUMMY_JWT}" >> .env
         # Write the lookup secret to .env without a static "SECRET=" literal
@@ -88,6 +92,8 @@ jobs:
         API_KEY_SECRET: ${{ env.API_KEY_SECRET }}
         QWED_JWT_SECRET_KEY: ${{ env.QWED_JWT_SECRET_KEY }}
         QWED_API_KEY_LOOKUP_SECRET: ${{ env.DUMMY_LOOKUP }}
+        # The server refuses to boot without the audit-chain signing key.
+        QWED_AUDIT_SECRET_KEY: ${{ env.DUMMY_AUDIT }}
         QWED_SKIP_ENV_INTEGRITY_CHECK: "true"
       run: |
         # Start API server in background
@@ -120,7 +126,7 @@ jobs:
         pytest tests/ -v --cov=qwed_sdk --cov=src/qwed_new --cov-report=xml --cov-report=term
 
     - name: Upload Coverage to Codecov
-      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v5
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: ./coverage.xml

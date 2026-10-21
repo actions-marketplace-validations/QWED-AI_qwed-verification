@@ -10,6 +10,7 @@ Provides AST-based SQL analysis to prevent:
 """
 
 import hashlib
+import re
 
 import sqlglot
 from sqlglot import exp, parse_one
@@ -28,7 +29,20 @@ CONSTRAINT_SQL_VALID = "sql_verifier.sql_valid"
 CONSTRAINT_MALICIOUS = "sql_verifier.malicious"
 CONSTRAINT_COMPLEXITY_LIMIT_EXCEEDED = "sql_verifier.complexity_limit_exceeded"
 CONSTRAINT_SCHEMA_PARSE_ERROR = "sql_verifier.schema_parse_error"
+CONSTRAINT_SCHEMA_VIOLATION = "sql_verifier.schema_violation"
 CONSTRAINT_EMPTY_BATCH = "sql_verifier.empty_batch"
+
+# MySQL and MariaDB run the body of /*! ... */, /*!NNNNN ... */ and MariaDB's
+# /*M! ... */ comments; other engines, and SQLGlot, treat them as comments, so
+# SQL inside one escaped analysis (GHSA-q5g6-6cw2-cjm3). They are expanded
+# before analysis whatever the declared dialect: if the query reaches MySQL,
+# that body is what runs.
+_EXECUTABLE_COMMENT = re.compile(r"/\*M?!(?:\d{5,6})?(.*?)\*/", re.DOTALL)
+
+
+def expand_executable_comments(query: str) -> str:
+    """Replace each MySQL/MariaDB executable comment with the SQL inside it."""
+    return _EXECUTABLE_COMMENT.sub(lambda m: f" {m.group(1)} ", query)
 CONSTRAINT_BATCH_BLOCKED = "sql_verifier.batch_blocked"
 
 # Issue types that prove malice. Resource-limit violations (complexity_*) are CRITICAL
@@ -51,6 +65,77 @@ def _available_expression_types(*names: str) -> Set[type]:
         for name in names
         if (expression := getattr(exp, name, None)) is not None
     }
+
+
+class _NotConstant(Exception):
+    """A node could not be folded to a column-free constant value."""
+
+
+def _const_eval(node: exp.Expression):
+    """Fold a column-free boolean/numeric/string expression to a Python value.
+
+    Raises :class:`_NotConstant` for anything that references a column or that is
+    not a fold-able literal/operator. Used to detect always-true predicates by
+    VALUE rather than by matching a fixed list of AST shapes (GHSA-6cpx): ``OR 1``,
+    ``OR NOT FALSE``, ``1 = 1.0`` and ``2 > 1`` all fold to a truthy constant.
+    """
+    if isinstance(node, exp.Paren):
+        return _const_eval(node.this)
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Null):
+        return None
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return node.this
+        try:
+            return int(node.this)
+        except (TypeError, ValueError):
+            return float(node.this)
+    if isinstance(node, exp.Neg):
+        return -_const_eval(node.this)
+    if isinstance(node, exp.Not):
+        return not _const_eval(node.this)
+    if isinstance(node, exp.And):
+        return bool(_const_eval(node.left) and _const_eval(node.right))
+    if isinstance(node, exp.Or):
+        return bool(_const_eval(node.left) or _const_eval(node.right))
+    comparisons = {
+        exp.EQ: lambda a, b: a == b,
+        exp.NEQ: lambda a, b: a != b,
+        exp.GT: lambda a, b: a > b,
+        exp.GTE: lambda a, b: a >= b,
+        exp.LT: lambda a, b: a < b,
+        exp.LTE: lambda a, b: a <= b,
+    }
+    arithmetic = {
+        exp.Add: lambda a, b: a + b,
+        exp.Sub: lambda a, b: a - b,
+        exp.Mul: lambda a, b: a * b,
+    }
+    for cls, op in {**comparisons, **arithmetic}.items():
+        if cls is not None and isinstance(node, cls):
+            return op(_const_eval(node.left), _const_eval(node.right))
+    raise _NotConstant()
+
+
+def _is_always_true(node: Optional[exp.Expression]) -> bool:
+    """True iff *node* is a column-free predicate that evaluates to a truthy
+    constant (a tautology), False for anything referencing data or not fold-able."""
+    if node is None:
+        return False
+    try:
+        return bool(_const_eval(node))
+    except (_NotConstant, TypeError, ValueError, ZeroDivisionError, ArithmeticError):
+        return False
+
+
+def _enclosing_select(node: exp.Expression) -> Optional[exp.Expression]:
+    """The nearest ancestor Select of *node*, or None."""
+    parent = node.parent
+    while parent is not None and not isinstance(parent, exp.Select):
+        parent = parent.parent
+    return parent
 
 
 @dataclass
@@ -112,13 +197,47 @@ class SQLVerifier:
         "Merge",
     )
 
-    # Administrative / Permission commands
+    # Administrative / permission / side-effecting statement families. Blocked
+    # anywhere in the parse tree (not just at the root). Beyond GRANT/SET/etc.
+    # this covers COPY ... FROM PROGRAM / COPY ... FROM|TO <file>, ATTACH/DETACH,
+    # PRAGMA, LOAD DATA and friends, plus the generic ``Command`` node sqlglot
+    # emits for statements it does not model (GHSA-6p94).
     ADMIN_COMMANDS = _available_expression_types(
         "Grant",
         "Revoke",
         "Set",
         "Transaction",
         "Command",
+        "Use",
+        "Copy",
+        "Attach",
+        "Detach",
+        "Pragma",
+        "Load",
+        "LoadData",
+        "Analyze",
+        "Cache",
+        "Uncache",
+        "Vacuum",
+        "Export",
+        "Import",
+        "Call",
+        "Execute",
+    )
+
+    # Read-only statement types permitted as the top-level query. Anything else
+    # is blocked (fail closed) when destructive ops are not allowed: a statement
+    # type not recognized as a read-only query is treated as unsafe rather than
+    # waved through. sqlglot parses ``WITH ... SELECT`` with a ``Select`` root,
+    # so the With/CTE wrapper is a descendant and need not be a root type here.
+    READ_ONLY_ROOT_TYPES = _available_expression_types(
+        "Select",
+        "Union",
+        "Intersect",
+        "Except",
+        "Subquery",
+        "With",
+        "Paren",
     )
 
     # Sensitive columns (Forbidden in SELECT/WHERE by default)
@@ -179,6 +298,7 @@ class SQLVerifier:
                           Malicious is the only unsafe case that retains a proof_ref — unless
                           the DDL schema also fails to parse, in which case the incomplete
                           analysis is BLOCKED (schema_parse_error takes precedence).
+        - Table outside the declared ``schema_ddl`` → BLOCKED (``sql_verifier.schema_violation``)
         - Complexity-limit violation → BLOCKED (``sql_verifier.complexity_limit_exceeded``)
         - DDL schema parse failure → BLOCKED (``sql_verifier.schema_parse_error``)
         - Parse error     → BLOCKED (``sql_verifier.parse_error``)
@@ -201,9 +321,11 @@ class SQLVerifier:
             >>> print(result.developer_fields.get("is_valid"))
             True
         """
-        # 1. Parse Query
+        # 1. Parse Query, with MySQL/MariaDB executable comments expanded.
+        executable_comments = bool(_EXECUTABLE_COMMENT.search(query))
+        analysed = expand_executable_comments(query) if executable_comments else query
         try:
-            parsed_query = parse_one(query, read=dialect)
+            parsed_query = parse_one(analysed, read=dialect)
         except Exception as exc:  # noqa: BLE001 — fail-closed by design
             return DiagnosticResult.blocked(
                 agent_message=(
@@ -225,7 +347,7 @@ class SQLVerifier:
 
             issues.extend(self._check_command_type(parsed_query))
             issues.extend(self._check_column_access(parsed_query))
-            issues.extend(self._check_injection_patterns(parsed_query, query))
+            issues.extend(self._check_injection_patterns(parsed_query, analysed))
 
             complexity = self._analyze_complexity(parsed_query)
 
@@ -259,6 +381,7 @@ class SQLVerifier:
             for i in issues
         )
         schema_parse_failed = any(i.issue_type == "schema_parse_error" for i in issues)
+        schema_violated = any(i.issue_type == "schema_table_missing" for i in issues)
 
         # A DDL schema parse failure means the analysis is incomplete: an authoritative
         # proof must never be generated from an incomplete analysis (fail-closed), so it
@@ -267,6 +390,8 @@ class SQLVerifier:
             constraint_id = CONSTRAINT_SCHEMA_PARSE_ERROR
         elif malicious:
             constraint_id = CONSTRAINT_MALICIOUS
+        elif schema_violated:
+            constraint_id = CONSTRAINT_SCHEMA_VIOLATION
         elif not is_valid:
             constraint_id = CONSTRAINT_COMPLEXITY_LIMIT_EXCEEDED
         else:
@@ -296,6 +421,7 @@ class SQLVerifier:
             },
             "critical_count": critical_count,
             "warning_count": warning_count,
+            "executable_comments_expanded": executable_comments,
             "engine": "SQLGlot-AST-Scanner",
         }
 
@@ -369,27 +495,57 @@ class SQLVerifier:
     # =========================================================================
     
     def _check_command_type(self, parsed_query: exp.Expression) -> List[SQLIssue]:
-        """Check for blocked command types."""
+        """Check for blocked command types across the WHOLE parse tree.
+
+        Classifying by the root node alone let a data-modifying or administrative
+        statement hide in a CTE or subquery — ``WITH d AS (DELETE FROM t
+        RETURNING *) SELECT * FROM d`` has a ``Select`` root yet runs the DELETE —
+        and let whole statement families (COPY/ATTACH/PRAGMA/…) that sit in
+        neither deny set pass as safe (GHSA-6p94). This walks every node and,
+        when destructive ops are not allowed, also fails closed on any top-level
+        statement that is not a recognized read-only query type.
+        """
         issues = []
-        query_type = type(parsed_query)
-        
-        if query_type in self.DESTRUCTIVE_COMMANDS:
-            if not self.allow_destructive:
+
+        node_types = set()
+        for item in parsed_query.walk():
+            node = item[0] if isinstance(item, tuple) else item
+            node_types.add(type(node))
+
+        if not self.allow_destructive:
+            for query_type in sorted(node_types & self.DESTRUCTIVE_COMMANDS, key=lambda c: c.__name__):
                 issues.append(SQLIssue(
                     severity="CRITICAL",
                     issue_type="destructive_command",
                     description=f"Destructive command '{query_type.__name__}' blocked. Only SELECT is allowed.",
                     recommendation="Use parameterized API endpoints for data modification."
                 ))
-        
-        if query_type in self.ADMIN_COMMANDS:
+
+        for query_type in sorted(node_types & self.ADMIN_COMMANDS, key=lambda c: c.__name__):
             issues.append(SQLIssue(
                 severity="CRITICAL",
                 issue_type="admin_command",
                 description=f"Administrative command '{query_type.__name__}' blocked.",
                 recommendation="Administrative operations must be performed through secure channels."
             ))
-        
+
+        # Fail closed: when destructive ops are not allowed, the top-level
+        # statement must be a recognized read-only query type. A COPY/ATTACH/
+        # PRAGMA or any statement type we do not model is blocked here rather than
+        # waved through — unless it was already flagged above (GHSA-6p94).
+        root_type = type(parsed_query)
+        already_flagged = root_type in self.DESTRUCTIVE_COMMANDS or root_type in self.ADMIN_COMMANDS
+        if (not self.allow_destructive
+                and root_type not in self.READ_ONLY_ROOT_TYPES
+                and not already_flagged):
+            issues.append(SQLIssue(
+                severity="CRITICAL",
+                issue_type="non_read_only_statement",
+                description=f"Only read-only SELECT-style queries are permitted; "
+                            f"'{root_type.__name__}' is not allowed.",
+                recommendation="Submit a read-only SELECT query."
+            ))
+
         return issues
     
     # =========================================================================
@@ -420,29 +576,41 @@ class SQLVerifier:
         """Detect SQL injection patterns."""
         issues = []
         
-        # Tautology detection (1=1, 'a'='a')
-        for condition in parsed_query.find_all(exp.EQ):
-            left_sql = condition.left.sql() if hasattr(condition.left, 'sql') else str(condition.left)
-            right_sql = condition.right.sql() if hasattr(condition.right, 'sql') else str(condition.right)
-            
-            if left_sql == right_sql:
+        # Tautology detection by VALUE, not by matching a fixed set of AST
+        # shapes (GHSA-6cpx). A column-free comparison that folds to true
+        # (1=1, 1=1.0, 'a'='a', 2>1), or a WHERE/HAVING whose whole predicate
+        # folds to true (WHERE 1, WHERE 2>1), is a tautology.
+        _COMPARISONS = tuple(
+            c for c in (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE) if c is not None
+        )
+        for condition in parsed_query.find_all(*_COMPARISONS):
+            if _is_always_true(condition):
                 issues.append(SQLIssue(
                     severity="CRITICAL",
                     issue_type="injection_tautology",
                     description=f"Tautology detected: {condition.sql()}. Likely injection attempt.",
                     recommendation="Validate input before constructing SQL."
                 ))
-        
-        # OR TRUE pattern
+        for clause in parsed_query.find_all(exp.Where, exp.Having):
+            if _is_always_true(clause.this):
+                issues.append(SQLIssue(
+                    severity="CRITICAL",
+                    issue_type="injection_tautology",
+                    description="Always-true filter predicate detected. Likely injection attempt.",
+                    recommendation="Validate input before constructing SQL."
+                ))
+
+        # OR with a constant always-true operand (OR TRUE, OR 1, OR NOT FALSE,
+        # OR 2>1): the OR as a whole isn't constant (the other side reads data),
+        # so each operand is tested on its own.
         for condition in parsed_query.find_all(exp.Or):
-            if hasattr(condition, 'right') and isinstance(condition.right, exp.Boolean):
-                if condition.right.this:
-                    issues.append(SQLIssue(
-                        severity="CRITICAL",
-                        issue_type="injection_or_true",
-                        description="'OR TRUE' pattern detected. Likely injection attempt."
-                    ))
-        
+            if _is_always_true(condition.left) or _is_always_true(condition.right):
+                issues.append(SQLIssue(
+                    severity="CRITICAL",
+                    issue_type="injection_or_true",
+                    description="Always-true OR operand detected. Likely injection attempt."
+                ))
+
         # UNION injection
         if parsed_query.find(exp.Union):
             issues.append(SQLIssue(
@@ -642,17 +810,73 @@ class SQLVerifier:
             ))
             return issues
         
-        # Check table existence
+        # Check table existence. A declared schema is the set of tables the query
+        # may touch, so a table outside it is an admission failure, not a warning
+        # (GHSA-q5g6-6cw2-cjm3). Names defined by the query itself (CTEs) are not
+        # tables of the database.
+        cte_names = {cte.alias_or_name.lower() for cte in parsed_query.find_all(exp.CTE)}
         for table in parsed_query.find_all(exp.Table):
             t_name = table.name.lower()
-            if t_name not in tables_in_schema:
+            if t_name not in tables_in_schema and t_name not in cte_names:
                 issues.append(SQLIssue(
-                    severity="WARNING",
+                    severity="CRITICAL",
                     issue_type="schema_table_missing",
                     description=f"Table '{t_name}' not found in schema.",
-                    recommendation="Verify table name or update schema."
+                    recommendation="Query only the tables in the declared schema, or add the table to it."
                 ))
-        
+
+        issues.extend(self._check_star_sensitive_columns(parsed_query, tables_in_schema))
+
+        return issues
+
+    def _check_star_sensitive_columns(
+        self, parsed_query: exp.Expression, tables_in_schema: Dict[str, Set[str]]
+    ) -> List[SQLIssue]:
+        """Expand ``SELECT *`` / ``t.*`` against the declared schema and apply the
+        sensitive-column denylist to the expansion (GHSA-6cpx).
+
+        The named-column check never sees a star, so ``SELECT * FROM users`` was
+        admitted even when the schema declares a sensitive column like
+        ``password``. Resolve each star to the columns of the table(s) it covers
+        and block it when any of those columns is sensitive.
+        """
+        issues: List[SQLIssue] = []
+
+        # alias (and bare name) -> real table name, for resolving qualified stars.
+        alias_to_table: Dict[str, str] = {}
+        for tbl in parsed_query.find_all(exp.Table):
+            real = tbl.name.lower()
+            alias_to_table[real] = real
+            if tbl.alias:
+                alias_to_table[tbl.alias.lower()] = real
+
+        for star in parsed_query.find_all(exp.Star):
+            parent = star.parent
+            if isinstance(parent, exp.Column) and parent.table:
+                covered = [alias_to_table.get(parent.table.lower())]
+            else:
+                select = _enclosing_select(star)
+                scope = select if select is not None else parsed_query
+                covered = [
+                    alias_to_table.get((t.alias or t.name).lower(), t.name.lower())
+                    for t in scope.find_all(exp.Table)
+                    if select is None or _enclosing_select(t) is select
+                ]
+
+            for t_name in covered:
+                if not t_name:
+                    continue
+                schema_cols = tables_in_schema.get(t_name)
+                if schema_cols is None:
+                    continue  # unknown table is handled by the existence check
+                for col in sorted(schema_cols & self.blocked_columns):
+                    issues.append(SQLIssue(
+                        severity="CRITICAL",
+                        issue_type="sensitive_column_access",
+                        description=f"Star selection over '{t_name}' exposes sensitive column '{col}'.",
+                        recommendation="Select only the non-sensitive columns you need; do not use '*' on tables with restricted columns."
+                    ))
+
         return issues
     
     # =========================================================================

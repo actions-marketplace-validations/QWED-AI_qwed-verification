@@ -2,12 +2,15 @@
 Azure OpenAI Provider Implementation.
 """
 
+import logging
 import os
 import json
 from typing import Dict, Any
 from openai import AzureOpenAI
 from qwed_new.core.schemas import MathVerificationTask
-from qwed_new.providers.base import LLMProvider
+from qwed_new.providers.base import LLMProvider, sanitized_provider_error
+
+logger = logging.getLogger(__name__)
 
 def _detect_image_mime(image_bytes: bytes) -> str:
     """Magic-byte MIME detection for vision data URIs, mirroring
@@ -91,7 +94,7 @@ You MUST call the submit_math_expression function."""
             return MathVerificationTask(**args_dict)
             
         except Exception as e:
-            raise ValueError(f"Azure OpenAI translation failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Azure OpenAI translation failed", e) from e
 
     def translate_logic_dsl(self, user_query: str) -> Dict[str, Any]:
         """
@@ -146,18 +149,22 @@ Your goal is to translate natural language claims into QWED-Logic format (S-Expr
    - Logic: (AND ...), (OR ...), (NOT ...), (IMPLIES a b), (IFF a b), (XOR a b)
    - Comparison: (EQ a b), (NEQ a b), (GT a b), (LT a b), (GTE a b), (LTE a b)
    - Math: (PLUS ...), (MINUS ...), (MULT ...), (DIV ...), (POW a b), (MOD a b)
-   - Quantifiers: (FORALL x (expr)), (EXISTS x (expr))
+   - Quantifiers: (FORALL x (expr)), (EXISTS x (expr)). The first argument is a single variable name;
+     its type comes from the variables list (Int if not listed). The body must be true/false.
+   - IFF, AND, OR, NOT, IMPLIES and XOR take true/false operands: comparisons or Bool variables.
    - Variables: Use string names for variables (e.g., 'x', 'total_cost', 'is_valid').
 
 3. EXAMPLES:
    User: "If x is greater than 5 and y is less than 10, then z must be true."
    Output: (IMPLIES (AND (GT x 5) (LT y 10)) (EQ z True))
+   Variables: z: Bool
 
-   User: "Everyone is happy."
-   Output: (FORALL p (EQ (status p) happy))
+   User: "Every number greater than 5 is also greater than 3."
+   Output: (FORALL n (IMPLIES (GT n 5) (GT n 3)))
 
-   User: "Access is denied unless the user is admin."
-   Output: (IFF (EQ access denied) (NOT (EQ user admin)))
+   User: "Access is denied exactly when the user is not an admin."
+   Output: (IFF access_denied (NOT is_admin))
+   Variables: access_denied: Bool, is_admin: Bool
 
    User: "Find x and y where x > y and x + y = 10."
    Output: (AND (GT x y) (EQ (PLUS x y) 10))
@@ -187,7 +194,6 @@ BEGIN TRANSLATION.
                 raise ValueError("LLM did not call the required function")
             
             function_args = message.tool_calls[0].function.arguments
-            print(f"DEBUG: DSL LLM Args: {function_args}")
             args_dict = json.loads(function_args)
             
             return {
@@ -196,7 +202,7 @@ BEGIN TRANSLATION.
             }
             
         except Exception as e:
-            raise ValueError(f"Azure OpenAI DSL translation failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Azure OpenAI DSL translation failed", e) from e
 
     def translate_logic(self, user_query: str) -> 'LogicVerificationTask':
         """
@@ -264,7 +270,6 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
                 raise ValueError("LLM did not call the required function")
             
             function_args = message.tool_calls[0].function.arguments
-            print(f"DEBUG: Raw LLM Args: {function_args}") # Debugging line
             args_dict = json.loads(function_args)
             
             # Map back to Pydantic model
@@ -274,7 +279,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return LogicVerificationTask(**args_dict)
 
         except Exception as e:
-            raise ValueError(f"Azure OpenAI logic translation failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Azure OpenAI logic translation failed", e) from e
 
     def refine_logic(self, user_query: str, previous_error: str) -> 'LogicVerificationTask':
         """
@@ -344,7 +349,6 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
                 raise ValueError("LLM did not call the required function during refinement")
             
             function_args = message.tool_calls[0].function.arguments
-            print(f"DEBUG: Refined LLM Args: {function_args}")
             args_dict = json.loads(function_args)
             
             if 'vars_map' in args_dict:
@@ -353,7 +357,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return LogicVerificationTask(**args_dict)
             
         except Exception as e:
-            raise ValueError(f"Azure OpenAI logic refinement failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Azure OpenAI logic refinement failed", e) from e
 
     def translate_stats(self, query: str, columns: list[str]) -> str:
         """
@@ -402,8 +406,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return content
             
         except Exception as e:
-            print(f"Stats Translation Error: {e}")
-            raise
+            raise sanitized_provider_error(logger, "Azure OpenAI stats translation failed", e) from e
 
 
     def verify_fact(self, claim: str, context: str) -> Dict[str, Any]:
@@ -445,8 +448,8 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return json.loads(content)
             
         except Exception as e:
-            print(f"Error in verify_fact: {e}")
-            return {"verdict": "ERROR", "reasoning": str(e), "citation": None}
+            logger.warning("Error in verify_fact: %s", e)
+            return {"verdict": "ERROR", "reasoning": "Fact verification failed.", "citation": None}
 
     def verify_image(self, image_bytes: bytes, claim: str) -> Dict[str, Any]:
         """
@@ -501,5 +504,5 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return json.loads(content)
             
         except Exception as e:
-            print(f"Error in verify_image: {e}")
-            return {"verdict": "ERROR", "reasoning": str(e), "confidence": 0.0}
+            logger.warning("Error in verify_image: %s", e)
+            return {"verdict": "ERROR", "reasoning": "Image verification failed.", "confidence": 0.0}

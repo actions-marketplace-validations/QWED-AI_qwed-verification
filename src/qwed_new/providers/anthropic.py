@@ -2,11 +2,14 @@
 Anthropic Provider Implementation.
 """
 
+import logging
 import os
 from typing import Dict, Any
 from anthropic import AnthropicFoundry
 from qwed_new.core.schemas import MathVerificationTask
-from qwed_new.providers.base import LLMProvider
+from qwed_new.providers.base import LLMProvider, sanitized_provider_error
+
+logger = logging.getLogger(__name__)
 
 class AnthropicProvider(LLMProvider):
     """
@@ -71,7 +74,7 @@ You MUST use the submit_math_expression tool."""
             return MathVerificationTask(**tool_use.input)
             
         except Exception as e:
-            raise ValueError(f"Anthropic translation failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Anthropic translation failed", e) from e
 
     def translate_logic_dsl(self, user_query: str) -> Dict[str, Any]:
         """
@@ -123,18 +126,22 @@ Your goal is to translate natural language claims into QWED-Logic format (S-Expr
    - Logic: (AND ...), (OR ...), (NOT ...), (IMPLIES a b), (IFF a b), (XOR a b)
    - Comparison: (EQ a b), (NEQ a b), (GT a b), (LT a b), (GTE a b), (LTE a b)
    - Math: (PLUS ...), (MINUS ...), (MULT ...), (DIV ...), (POW a b), (MOD a b)
-   - Quantifiers: (FORALL x (expr)), (EXISTS x (expr))
+   - Quantifiers: (FORALL x (expr)), (EXISTS x (expr)). The first argument is a single variable name;
+     its type comes from the variables list (Int if not listed). The body must be true/false.
+   - IFF, AND, OR, NOT, IMPLIES and XOR take true/false operands: comparisons or Bool variables.
    - Variables: Use string names for variables (e.g., 'x', 'total_cost', 'is_valid').
 
 3. EXAMPLES:
    User: "If x is greater than 5 and y is less than 10, then z must be true."
    Output: (IMPLIES (AND (GT x 5) (LT y 10)) (EQ z True))
+   Variables: z: Bool
 
-   User: "Everyone is happy."
-   Output: (FORALL p (EQ (status p) happy))
+   User: "Every number greater than 5 is also greater than 3."
+   Output: (FORALL n (IMPLIES (GT n 5) (GT n 3)))
 
-   User: "Access is denied unless the user is admin."
-   Output: (IFF (EQ access denied) (NOT (EQ user admin)))
+   User: "Access is denied exactly when the user is not an admin."
+   Output: (IFF access_denied (NOT is_admin))
+   Variables: access_denied: Bool, is_admin: Bool
 
    User: "Find x and y where x > y and x + y = 10."
    Output: (AND (GT x y) (EQ (PLUS x y) 10))
@@ -163,7 +170,6 @@ BEGIN TRANSLATION.
                 raise ValueError("Claude did not use the required tool")
             
             args_dict = tool_use.input
-            print(f"DEBUG: Claude DSL Args: {args_dict}")
             
             return {
                 "dsl_code": args_dict.get("dsl_code", ""),
@@ -171,7 +177,7 @@ BEGIN TRANSLATION.
             }
             
         except Exception as e:
-            raise ValueError(f"Anthropic DSL translation failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Anthropic DSL translation failed", e) from e
 
     def translate_logic(self, user_query: str) -> 'LogicVerificationTask':
         from qwed_new.core.schemas import LogicVerificationTask
@@ -230,8 +236,9 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             args_dict = tool_use.input
             if 'vars_map' in args_dict:
                 args_dict['variables'] = args_dict.pop('vars_map')
+            return LogicVerificationTask(**args_dict)
         except Exception as e:
-            raise ValueError(f"Anthropic logic translation failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Anthropic logic translation failed", e) from e
 
     def refine_logic(self, user_query: str, previous_error: str) -> 'LogicVerificationTask':
         from qwed_new.core.schemas import LogicVerificationTask
@@ -299,7 +306,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return LogicVerificationTask(**args_dict)
             
         except Exception as e:
-            raise ValueError(f"Anthropic logic refinement failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Anthropic logic refinement failed", e) from e
 
     def translate_stats(self, query: str, columns: list[str]) -> str:
         """
@@ -349,8 +356,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return content
             
         except Exception as e:
-            print(f"Stats Translation Error: {e}")
-            raise
+            raise sanitized_provider_error(logger, "Anthropic stats translation failed", e) from e
 
     def verify_fact(self, claim: str, context: str) -> dict:
         """
@@ -410,7 +416,7 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return tool_use.input
             
         except Exception as e:
-            raise ValueError(f"Anthropic fact verification failed: {str(e)}")
+            raise sanitized_provider_error(logger, "Anthropic fact verification failed", e) from e
 
     def verify_image(self, image_bytes: bytes, claim: str) -> dict:
         """
@@ -484,5 +490,5 @@ CRITICAL: You MUST return a JSON object with EXACTLY these 3 fields:
             return tool_use.input
             
         except Exception as e:
-            print(f"Error in verify_image: {e}")
-            return {"verdict": "ERROR", "reasoning": str(e), "confidence": 0.0}
+            logger.warning("Error in verify_image: %s", e)
+            return {"verdict": "ERROR", "reasoning": "Image verification failed.", "confidence": 0.0}

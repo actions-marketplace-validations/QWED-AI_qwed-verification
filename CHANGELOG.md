@@ -4,6 +4,754 @@ All notable changes to the QWED Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **Role checks on the API-key and audit routes; `rbac.py` removed (#478).**
+  The user-session routes under `/auth/api-keys` and `/audit` only required a
+  logged-in user, so any role could create keys, list and revoke every key in
+  the organisation (the owner's included), and read and export the whole
+  audit log. Not exploitable today, since signup creates one user per
+  organisation, but each became a gap as soon as an organisation has a second
+  user.
+  - Roles and explicit allowlists live in `auth/roles.py`; a role that is not
+    listed is refused, and every checked route also refuses an inactive user
+    or organisation. `/admin/*` uses the same ranking.
+  - API keys: creating one needs member or higher. Admins and owners list
+    every key in their organisation; members and viewers list only their
+    own. Anyone may revoke their own key; revoking another user's needs admin
+    or owner and never a key whose owner ranks higher, as for key rotation.
+    A member or viewer gets 404 for a key that is not theirs, and a
+    non-numeric or out-of-range key id is 404 instead of a server error.
+  - Revoking a key no longer fails with a server error on a fresh install.
+    The route stored a naive `datetime.utcnow()`, which `sqlmodel` 0.0.28 and
+    later reject; with the version a new install gets (0.0.48), every revoke
+    returned 500. It now stores a timezone-aware time.
+- **Agent tokens are stored as a keyed digest, not in plain text (#478).**
+  `Agent.agent_token` held the token itself and was looked up by equality, so
+  a read of the database exposed every agent token.
+  - Tokens are stored as `hmac256:<hex>`, the same keyed MAC as API keys
+    (keyed with `QWED_API_KEY_LOOKUP_SECRET`, under its own label), and looked
+    up by digest. A token is shown once, when it is issued.
+  - At startup, after the fail-closed checks, the server hashes any token
+    still stored in plain text, in place, so existing tokens keep working. The
+    `hmac256:` prefix marks hashed rows, so the step changes nothing once done,
+    and a row is only changed if it still holds the token that was read, so a
+    token re-issued meanwhile is kept. A plaintext row never authenticates
+    directly.
+  - `POST /agents/{agent_id}/token/reissue` (member and above, own
+    organisation) gives an agent a new token and retires the old one. It is
+    optional: a token that sat in plain text may also sit in a database
+    backup.
+  - Registering an agent, authenticating it and logging its activity no
+    longer fail on a fresh install: the agent models and registry used naive
+    datetimes, which `sqlmodel` 0.0.28 and later reject.
+  - Audit: every role may read its organisation's log; exporting it and
+    seeding samples need admin or owner.
+  - `core/rbac.py` is deleted. Nothing imported it, it had no `owner` role,
+    and it could be mistaken for the access control that actually runs.
+
+- **The code-execution sandbox runs a pinned image in a hardened container
+  (#322).** `SecureCodeExecutor.execute()` pulled `amancevice/pandas:slim`, a
+  tag that can move to different content at any time, and ran it with a
+  writable root, the default Linux capabilities and the image's default
+  user (root).
+  - The image is pinned by digest (`amancevice/pandas@sha256:9257b889…`,
+    the `slim` tag as published on 2026-08-10). `QWED_SANDBOX_IMAGE` may
+    name another image, but only by digest; any other value is refused and
+    the pinned image is used.
+  - The container now has a read-only root, drops every capability, sets
+    `no-new-privileges` and never runs as a privileged root, on top of the
+    existing network, memory, CPU and PID limits. It runs as the owner of
+    the host's private `0700` exchange directory: the host user, or, when the
+    host process is root, a fresh uid for this execution (the files are
+    re-owned first, without following links, and the directory last). It
+    comes from 1879048192-2147483646, a range systemd documents as unused,
+    or from `QWED_SANDBOX_UID_RANGE` when the operator reserves one, and is
+    skipped when a host account or group has it, when `/etc/subuid` or
+    `/etc/subgid` delegates it to a user namespace, or when another running
+    execution uses it. Under a rootless daemon run by
+    the same user, the container's root is that unprivileged user. A root
+    process with a rootless daemon, a userns-remap daemon, or a daemon whose
+    security options cannot be read is reported as runtime unavailable
+    instead of being guessed. `HOME` and `TMPDIR` point at `/workspace`, the
+    only writable path.
+
+- **CrossHair runs only inside the Docker sandbox (#431).** CrossHair analyses
+  a function by importing its module, which executes the module's top-level
+  code. `SymbolicVerifier` used to run `python -m crosshair check` as a plain
+  host subprocess on a temp file holding the caller's code.
+  - Every CrossHair run now goes through the new
+    `SecureCodeExecutor.run_isolated()`: no network, read-only root, no host
+    mounts, all capabilities dropped, `no-new-privileges`, user 65534, and the
+    existing memory/CPU/PID limits and concurrency bound. The code travels in
+    the container's environment and is written only to a private tmpfs owned
+    by that user (code over 120 KiB is `BLOCKED`,
+    `symbolic_verifier.input_too_large`), so nothing is written on the host.
+    The output is streamed from the container log and reading stops at the
+    cap. A dropped daemon connection, or a daemon error while waiting, is
+    `BLOCKED` like any other sandbox failure; only a real wait timeout is a
+    timeout.
+  - CrossHair now runs in a child process of the in-container runner. The
+    runner keeps a per-run nonce out of the child's environment, makes itself
+    non-dumpable (so the child cannot read its `/proc` environment or file
+    descriptors), sends the child's output to stderr, and alone writes one
+    result line with the nonce and the child's exit code to stdout. The
+    verifier reads stdout and stderr separately and trusts an exit code only
+    when that line confirms it; otherwise the run is an engine error. So the
+    analysed code cannot forge the result line, and long or unterminated
+    output cannot hide it. The analysed code still controls the child's own
+    exit code, as any code CrossHair imports can, which is why a clean run is
+    only ever "no counterexample found" (`UNVERIFIABLE`), and why an exit 1
+    is a counterexample only together with CrossHair's own report line
+    (`<file>:<line>: error: ...`); an early `os._exit(1)` is an engine error.
+    A `SystemExit` raised from the analysed code while it is imported is an
+    engine error, not a clean run, and a child exit of 97 that comes with a
+    result line is not mistaken for a missing CrossHair.
+  - A `SecureCodeExecutor` that `SymbolicVerifier` creates itself is rebuilt
+    while Docker is unreachable, so the engine recovers once the daemon is
+    back instead of staying `BLOCKED`.
+  - `qwed[symbolic]` now installs the `docker` client. `SymbolicVerifier` no
+    longer imports it at module level, so without it the engine is
+    `BLOCKED` instead of failing to import.
+  - The image comes from `docker/crosshair-sandbox/Dockerfile`
+    (`qwed-crosshair-sandbox:0.0.101`, or `QWED_CROSSHAIR_IMAGE`) and is never
+    pulled at runtime.
+  - Without Docker, a free sandbox slot, the image, or CrossHair inside the
+    image, `verify_code()` returns `BLOCKED`
+    (`symbolic_verifier.runtime_unavailable`). There is no host fallback. This
+    replaces `symbolic_verifier.crosshair_not_available`.
+  - Functions are now named by module qualname (`target.func`,
+    `target.Class.method`). CrossHair reads `file.py:func` as a qualname, so
+    the old form never found the function and exited 1, which was reported as
+    a counterexample for every typed function. An exception escaping CrossHair
+    now exits with its own code and is an engine error, not a counterexample.
+    Nested functions, which CrossHair cannot load by name, are unverifiable.
+
+### Fixed
+
+- **`qwed pii` prints the real count for each entity type (#470).** The
+  detector's report listed each type once, and the CLI counted each type in
+  that list, so two emails printed `EMAIL_ADDRESS: 1`. The report now has
+  `type_counts`, counted over every hit, and `types` is sorted; the CLI prints
+  the counts in type order and falls back to counting `positions` for a report
+  without `type_counts`.
+
+- **The Go and TypeScript SDKs read the DiagnosticResult envelope and gate
+  on admission (#480).** Both read a top-level `verified` field that only
+  `/verify/rag` and `/verify/process` send (their guard's own result, not an
+  admission), so Go's `Verified`, TypeScript's `verified` and both
+  `isVerified()` helpers were false on every other endpoint. They now always
+  equal the admission check, so rag and process, which make no admission
+  decision, are not admitted; the guard's value stays in
+  `developer_fields.verified`. Neither SDK exposed `admission`
+  or `proof_ref`. Go's `VerifyMath` and `VerifyLogic` also failed to decode,
+  because `/verify/math` sends `result` as a boolean and `/verify/logic`
+  sends `error` as a string. **Breaking for both SDKs' types.**
+  - `VerificationStatus` is `VERIFIED`, `UNVERIFIABLE`, `BLOCKED`, or
+    `UNKNOWN` for a missing value or one the SDK does not know; the stale
+    `FAILED`, `CORRECTED`, `ERROR`, `TIMEOUT` and `UNSUPPORTED` are gone. A
+    new `Admission` is `ADMIT`, `BLOCKED` or `UNKNOWN`, and empty (Go) or
+    absent (TypeScript) where the endpoint makes no decision.
+  - The response models the envelope: `status`, `admission`, `proof_ref`,
+    `agent_message`, `developer_fields`, `is_authoritative`,
+    `constraint_id`, and the endpoint's own fields (Go `Extra`, TypeScript
+    other keys). Go drops `Engine`, `Result`, `Attestation`, `Error`,
+    `Metadata`, `ResponseMetadata` and `BatchSummary`; TypeScript drops
+    `engine`, `result`, `proof`, `metadata` and the types only they used.
+  - `IsAdmitted()` (Go) and `isAdmitted()` (TypeScript) are true only for
+    `admission` ADMIT with `status` VERIFIED and a non-empty `proof_ref`.
+    `Verified` / `verified` and `IsVerified()` / `isVerified()` are
+    deprecated and now follow admission.
+  - The batch types match the job the server returns (`job_id`, `status`,
+    `progress_percent`, item counts, `items[]` with `id`, `status`, `query`,
+    `type`, `result`, `error`, `latency_ms`); there is no `summary`.
+  - TypeScript exports `parseVerificationResponse()` and
+    `parseBatchResponse()`, which every `verify*` method except the two
+    agent methods now uses, and `getErrorMessage()` reads a string `error`.
+  - Go's `VerificationResponse` marshals `Extra` back beside the envelope
+    fields, so a decoded response survives a JSON round trip; an `Extra` key
+    never replaces an envelope field. Numbers in `Extra` and
+    `DeveloperFields` are `json.Number`, so large integers and long decimals
+    keep their exact text. (TypeScript numbers come from `JSON.parse` and
+    keep its float limits.)
+  - All three SDKs keep the server's status text as `RawStatus` (Go),
+    `rawStatus` (TypeScript) or `raw_status` (Rust), such as `SAT` or
+    `NOT_MATH_QUERY` where the parsed status is Unknown. It is never used for
+    admission. Go's `MarshalJSON` and a non-enumerable `toJSON` on parsed
+    TypeScript responses write it back as `status`, so a saved response keeps
+    the server's status when parsed again; the Rust response types are
+    deserialise-only. The Rust `VerificationResponse` now deserialises through a
+    private wire type (`#[serde(from)]`) to fill it; a missing or non-string
+    `status` is still an error.
+  - TypeScript's `AgentVerificationResponse.verification.status` is
+    `AgentVerificationStatus`, which adds the maths engine's `DISPROVEN`,
+    `INCONCLUSIVE` and `SYNTAX_ERROR`.
+  - Contract tests in both SDKs parse the captured responses, now shared with
+    the Rust SDK in `sdk-fixtures/`. CI runs `go test` (the Go tests never
+    ran before) and `vitest run` without `--passWithNoTests`. READMEs and the
+    Go example explain gating on admission.
+
+- **The Rust SDK parses the server's responses (#468).** `VerificationResponse`
+  required a top-level `verified` field the server never sends, and
+  `VerificationStatus` had no `UNVERIFIABLE`, so every `verify*` call failed
+  to deserialize. Batch responses also expected a `summary` the server does
+  not send. **Breaking for the `qwed` crate's types.**
+  - `VerificationResponse` models the DiagnosticResult envelope: `status`
+    (`Verified`, `Unverifiable`, `Blocked`, or `Unknown` for a value the SDK
+    does not know), `admission` (`Admit`, `Blocked`, `Unknown`, or `None`
+    where the endpoint makes no decision), `proof_ref`, `agent_message`,
+    `developer_fields`, `is_authoritative`, `constraint_id`, and the
+    endpoint's own fields in `extra`. The `verified`, `engine`, `result`,
+    `attestation`, `error` and `metadata` fields and the `ErrorInfo`,
+    `ResponseMetadata` and `BatchSummary` types are gone.
+  - `is_admitted()` replaces `verified`: true only for `admission` ADMIT with
+    `status` VERIFIED and a `proof_ref`. VERIFIED alone is not enough, because
+    a claim proven false (`2 + 2 = 5`) or code proven unsafe is VERIFIED and
+    BLOCKED. A missing or unknown admission is never admitted. `is_verified()`
+    is deprecated and now returns `is_admitted()`.
+  - `BatchResponse` and `BatchResult` match the batch job the server returns;
+    each item's `result` is a `VerificationResponse`.
+  - A body that does not match now fails as `Error::Serialization` rather
+    than as an HTTP decode error.
+  - Contract tests parse responses captured from the server
+    (now in `sdk-fixtures/`, shared with the Go and TypeScript SDKs), CI now runs `cargo test` for the Rust SDK,
+    and `tests/test_issue_468_rust_sdk_contract.py` fails if the server's
+    answers drift from those fixtures. The README documents the envelope and
+    gating on `is_admitted()`.
+  - `.dockerignore` leaves test folders at any depth and the non-Python
+    SDKs (`sdk-*/`) out of the Docker build context; no image copies them.
+
+- **The Docker image runs the API server, and the Compose stack builds
+  (#467).** The image published as `qwedai/qwed-verification` ran the GitHub
+  Action: its entrypoint was the Action script, the uvicorn `CMD` was passed
+  to it as ignored arguments, and the image had no FastAPI or uvicorn. The
+  Compose file pointed at a Dockerfile in `deploy/`, which does not exist,
+  and mounted a Grafana folder that was never shipped.
+  - The Dockerfile has two targets. `server` runs uvicorn on port 8000 as a
+    non-root user, installs every server dependency from the new hash-pinned
+    `requirements-server.txt`, and has a health check on `/health`. The
+    host and port come from `UVICORN_HOST` and `UVICORN_PORT`, which the
+    health check reads too, so `-e UVICORN_PORT=...` moves both.
+    `action` is the GitHub Action as before; it stays the last stage, so
+    `action.yml`, which builds the Dockerfile without a target, is unchanged.
+  - Docker Hub now gets the `server` target, so `qwedai/qwed-verification`
+    is the API server from 7.3.1. Anyone who ran an earlier tag as a
+    scanner should use the Action instead.
+  - `deploy/docker-compose.yml` builds the server target from the
+    repository root, requires all five server secrets (`QWED_CORS_ORIGINS`,
+    `API_KEY_SECRET`, `QWED_JWT_SECRET_KEY`, `QWED_API_KEY_LOOKUP_SECRET`,
+    `QWED_AUDIT_SECRET_KEY`), checks health without curl, and keeps the
+    server's data in a volume. `deploy/.env.example` lists every setting
+    with empty values. Compose refuses to start until the server settings
+    and `DATABASE_URL` are filled in; the Postgres and Grafana containers
+    refuse to start while their passwords are empty (Grafana would otherwise
+    fall back to `admin`/`admin`). Postgres and Grafana no longer load the
+    whole `.env` file, which handed them the server's secrets; each gets
+    only its own settings. Grafana gets Prometheus and Jaeger data
+    sources, and Prometheus scrapes the API as `qwed-core:8000` instead of
+    `host.docker.internal`, which does not resolve inside the Compose
+    network on Linux.
+  - The `docker` client is part of the `server` extra: the code executor
+    imports it at module level, so a request that reached it failed with an
+    `ImportError` instead of the sandbox's fail-closed result.
+  - The Kubernetes manifest pins `7.3.1`, the first server image. Its
+    Secret lists the three secrets it was missing and ships every value
+    empty instead of with secret-like placeholders.
+  - A new "Docker images" workflow builds the server through Compose,
+    starts it and waits for `/health` and the image's own health check,
+    checks that the default target still runs the Action, and brings the
+    whole Compose stack up until every service is healthy, with the server
+    on Postgres and Prometheus reaching it.
+
+- **`AgentStateGuard` returns `BLOCKED` for deeply nested JSON instead of
+  raising `RecursionError` (#469).** Parsing and canonicalisation recurse once
+  per nesting level and only `ValueError` was caught, so a payload such as
+  `'[' * 200000` escaped the public API as an exception. A payload nested
+  deeper than `MAX_PARSE_DEPTH` (256 levels, above the 64-level validation
+  limit) is now rejected before parsing with `QWED-AGENT-STATE-102`, by a
+  pass that ignores brackets inside strings. Any `RecursionError` or
+  `MemoryError` from parsing or canonicalisation is mapped to the same code,
+  and so is a number whose exponent is outside `Decimal`'s range
+  (`decimal.InvalidOperation`), which also escaped before.
+  Transitions and commits inherit this through `verify_state_payload`.
+- **The GitHub Action's scan modes run with the default `paths`, and an empty
+  scan is no longer admitted (#466).** `action.yml` defaulted `paths` to
+  `'.'`, which `Path('.').glob` rejects, so `scan-code`, `verify-shell` and
+  `scan-secrets` exited with a traceback before scanning anything. A pattern
+  that matched no files reported `VERIFIED · ADMIT`.
+  - `paths` now defaults to empty. Unset, empty or `.` uses the mode's own
+    patterns: `**/*.py`, `**/*.sh`, or the env, JSON, YAML, TOML and INI
+    files for `scan-secrets`.
+  - A scan that covered no files is `UNVERIFIABLE · DENY`, with
+    `verified=false` and a reason in the verification context. It fails the
+    step unless `fail_on_findings` is `false`.
+  - So is a partial scan: a matched file that cannot be read, or a Python
+    file that does not parse, was skipped with a warning and the rest of
+    the scan could still be admitted.
+  - An invalid pattern, or one that matches a file outside the workspace (an
+    absolute path, `..`, or a symlink to a file elsewhere), is reported by
+    name and the scan is `UNVERIFIABLE · DENY` rather than raised. Matches
+    that are not regular files, such as a symlinked directory, are ignored.
+  - `scan-secrets` no longer swaps in the default secret-file patterns when
+    the given `paths` match nothing; that admitted files nobody asked for.
+  - A new `files_scanned` output gives the number of files scanned. A file
+    reached through more than one pattern or link is scanned once, and the
+    mode's file type is checked first, so a link with another name cannot
+    stand in for a `.py` or `.sh` file and leave it unscanned.
+- **The natural-language logic bridge emits the DSL parser's operator names.**
+  `DSLLogicVerifier` translated `!=`, `>=`, `<=` and `*` to `NE`, `GE`, `LE`
+  and `MUL`, which the DSL whitelist does not know (it has `NEQ`, `GTE`,
+  `LTE` and `MULT`). Every bridged constraint using one of them came back
+  `BLOCKED` ("Unknown operator"): fail-closed, but valid constraints such as
+  `x >= 5` or `x * 2 <= 10` could never be verified. The bridge now emits the
+  whitelist names. A test pins every operator the bridge can emit to
+  `QWEDLogicDSL().operators`, and per-operator tests run the real parser,
+  compiler and Z3 and check the exact DSL and the SAT/UNSAT result. No verdict
+  mapping changed; unknown operators, unsupported Python syntax and solver
+  errors still fail closed.
+  The bridge also lowercased `And(...)` / `Or(...)` to `and(...)` / `or(...)`,
+  which is not valid Python, so a constraint written in the function style the
+  bridge supports came back `ERROR`. Keywords in call position now become the
+  `And` / `Or` calls (in any case); infix `AND` / `Or` / `not` still read as
+  operators.
+- **The logic DSL compiles every operator its parser accepts (#428).**
+  `IFF`, `FORALL` and `EXISTS` were whitelisted by the parser and suggested
+  by the provider prompts, but the Z3 compiler had no branch for them, so any
+  program using them failed with `Unknown operator`.
+  - `(IFF a b)` compiles to a biconditional. Both operands must be Boolean
+    (comparisons or `Bool` variables); `(IFF x y)` on two Ints is an error
+    instead of silently becoming `x == y`.
+  - `(FORALL x body)` and `(EXISTS x body)` bind `x` inside `body` only. The
+    bound variable takes its declared sort (`Int` if undeclared, as for free
+    variables), a free variable of the same name outside the quantifier is
+    unaffected, and the body must be Boolean. The parser blocks a binder that
+    is not a plain variable name (a number, an operator, a literal or an
+    expression).
+  - A solver `unknown` (e.g. a timeout on a hard quantified formula) stays
+    `BLOCKED` at `/verify/logic`, as before.
+  - The Anthropic and Azure OpenAI logic prompts now describe the binder and
+    Boolean-operand rules, and their examples are valid DSL: the old
+    `(FORALL p (EQ (status p) happy))` used an operator that does not exist.
+  - A structural test compiles one sample program for every whitelisted
+    operator, so the parser and compiler cannot drift apart again.
+- **The logic DSL no longer turns a Boolean literal into 1 or 0.** Python
+  `True`/`False` are ints and an undeclared name is auto-created as an `Int`,
+  so `(EQ flag True)` compiled to `flag == 1` and came back `SAT` with
+  `flag = 1`: a verified answer to a constraint that did not mean what was
+  asked. z3 likewise turned an `Int` compared with a `Bool` variable into
+  `x == If(b, 1, 0)`.
+  - `EQ`/`NEQ` between a Boolean (literal, `Bool` variable or comparison) and
+    a non-Boolean value is now a compile error (`ERROR`, never `SAT`/`VERIFIED`).
+    `GT`/`LT`/`GTE`/`LTE` reject any Boolean operand, since Booleans have no
+    ordering.
+  - `PLUS`/`MINUS`/`MULT`/`DIV`/`POW`/`MOD` reject Boolean operands, so a
+    Boolean cannot reach a comparison disguised as a number:
+    `(EQ x (PLUS True 0))` used to compile to `x == 1`, and a `Bool` variable
+    inside arithmetic to `If(b, 1, 0)`.
+  - An undeclared name compared with `True`/`False` is rejected, not guessed
+    to be a `Bool`: the error asks for `(VAR name Bool)`. Inferring the sort
+    from the literal would hide a translation that forgot the declaration.
+  - Comparing two Booleans, or a declared `Bool` with `True`/`False`, works as
+    before, and numeric comparisons are unchanged.
+- **A math claim proven false is now `VERIFIED` with admission `DENY`, not
+  `UNVERIFIABLE` (#437).** `2+2=5` used to come back as "Verification
+  inconclusive", which recorded a definite counter-proof as "could not be
+  proven". Admission was `DENY` either way, so nothing unsafe passed, but audit
+  rows and Verification Context documents carried the wrong meaning.
+  - `VerificationEngine` no longer emits `CORRECTION_NEEDED`. A mismatch decided
+    by a concrete computation returns the legacy status `DISPROVEN`.
+  - Symbolic checks (derivative, indefinite integral, limit, `/verify/math`
+    identities) return `DISPROVEN` only when SymPy decides the difference is
+    non-zero: outright, by the coefficients of a bounded polynomial (a
+    coefficient counts as non-zero only when SymPy decides it, so a true
+    identity with an irrational coefficient like `cos(pi/7) - cos(2*pi/7) +
+    cos(3*pi/7) - 1/2` is never disproven), or at an exact witness point. A
+    difference `simplify` cannot decide returns `INCONCLUSIVE`, which maps to
+    `UNVERIFIABLE`.
+  - An identity that only holds after `simplify` cancels a removable
+    singularity (`x/x = 1`, `(x**2-1)/(x-1) = x+1`) is `UNVERIFIABLE` with
+    `constraint_id: math.domain_restricted_identity` in `/verify/math`, and
+    `INCONCLUSIVE` (`reason: domain_mismatch`) in `verify_identity` (#429).
+    The denominators are read from the expression before SymPy evaluates
+    it (after the same NFKC normalization, so fullwidth operators count),
+    including the right side of floor division and modulo (`x//x = 1`,
+    `x % x = 0`); an identity is VERIFIED only when both sides have the same singular
+    factors. An identity using a function with poles or a singular point
+    (`tan`, `sec`, `log`, `factorial`, ...) and a free symbol is never
+    VERIFIED this way; closed constants such as `factorial(5) = 120` are.
+    A symbol-free part that is undefined (`log(0)**0 = 1`, `tan(pi/2)**0 = 1`)
+    or a constant zero denominator (`(1/(x-x))**0 = 1`) also blocks it, even
+    though SymPy evaluates such parts away. Names are read from the AST, so
+    a scientific literal such as `0e0` is never mistaken for a symbol.
+  - A witness point is used only when it satisfies the symbol's declared
+    domain (`n` is a positive integer, so `-1`, `0` and `1/2` are skipped).
+    It is substituted without evaluation and checked by the new
+    `safe_parser.check_closed_expression_cost` first, so a lazy power tower
+    such as `9**9**9**x` is never expanded at a witness.
+    A witness SymPy cannot evaluate is skipped, so the result is
+    `INCONCLUSIVE` rather than an engine error.
+  - A non-zero difference containing a Float literal (`0.1 + 0.2 = 0.3`
+    leaves 5.55e-17) is `INCONCLUSIVE`, not `DISPROVEN`. A numeric mismatch
+    involving a non-finite value (an overflowed sum, a NaN claim) is also
+    `INCONCLUSIVE`.
+  - `verify_irr` decides Newton convergence on the rate step instead of an
+    absolute NPV residual, so small cash flows no longer stop at the
+    initial guess and report a correct IRR claim as `DISPROVEN`. Newton steps
+    are damped to keep `1 + r > 0`, so a negative IRR (`[-100, 20, 20]` is
+    -44%) is no longer replaced by a spurious root below -100%.
+    Non-finite cash flows are `BLOCKED` before the solver runs, and the step
+    halving is bounded, so `[inf, -1]` can no longer hang the request.
+  - Matrix `add`, `multiply`, `inverse`, `transpose` and `determinant` run
+    exactly: each float input is read as the decimal the caller wrote (`0.1`
+    is 1/10), with no tolerance. So `[[0.1]] + [[0.2]]` vs `[[0.3]]` is
+    `VERIFIED`, `[[0.5]] + [[1e9]]` vs `[[1000000001.0]]` is `DISPROVEN`, and
+    the determinant no longer accepts `-2.0000001` for `det([[1, 2], [3, 4]])`.
+    A float claim of an exact entry holds when its decimal or its double is
+    exactly that value, or, for a fraction that is not a double
+    (`inverse([[3]])` is 1/3), when it is the correctly rounded double; a
+    non-zero value that underflows to `0.0` never accepts a `0.0` claim. A
+    claim that only rounds to the same double, or falls inside the rounding
+    window, is `INCONCLUSIVE`. A claimed matrix of the wrong shape is
+    `DISPROVEN`; a non-finite entry is `INCONCLUSIVE`.
+  - Definite integrals and eigenvalues are decided exactly when both sides are
+    exact. With a float claim, the difference itself is evaluated at a
+    precision scaled to the magnitude against the 1e-6 tolerance; a mismatch
+    within the representation error of the least precise Float involved
+    (a double's 2**-52 at least, narrower only for a claim clearly more
+    precise than any double repr, wider for one deliberately less
+    precise) is
+    `INCONCLUSIVE`,
+    anything larger is `DISPROVEN`. Floats are replaced by their exact
+    values before subtracting, so `2**53 + 1` vs `9007199254740992.0` is no
+    longer a difference of 0. Past the precision budget (~1e105) a gross
+    mismatch is still `DISPROVEN` (`2e200` vs `1e200`) and anything closer
+    is `INCONCLUSIVE`. A divergent integral is `INCONCLUSIVE`.
+    Eigenvalues are compared as complex numbers, so a rotation matrix's
+    `+-i` no longer matches a claim of `[0, 0]`.
+  - `verify_unit_conversion` uses the exact legal unit definitions in Decimal
+    (1 lb = 0.45359237 kg, 1 US gal = 3.785411784 L) and `BLOCKED`s units of
+    different dimensions (`m` to `kg`) instead of comparing the numbers.
+    Temperature conversions also run in Decimal, and the tolerance is
+    validated before any branch.
+  - The control plane signs and attests `DISPROVEN` like `VERIFIED`, with
+    `verified=False` in the attestation and `is_valid: false` in the result.
+  - New `DiagnosticResult.disproven()` builds a `VERIFIED` result with
+    `is_valid` forced to `False`. `from_legacy_dict` raises for `DISPROVEN`,
+    because a counter-proof needs a `proof_ref`.
+  - The control-plane math response and `/verify/math` now include
+    `admission`. `/verify/math` logs `is_verified` from `is_valid`, so a
+    proven-false identity is no longer logged as verified.
+  - `/verify/natural_language` now returns the verdict the control plane
+    enforced (attached as `diagnostic`) together with `admission`, instead of
+    re-deriving it from the legacy engine dict, which turned every decided
+    claim into `UNVERIFIABLE`. A malformed diagnostic is `BLOCKED`, and if the
+    output sanitizer rejects the translated expression the verdict is
+    `BLOCKED` too. The verdict carries `translated_expression`,
+    `verification_scope: translated_expression_only` and
+    `query_semantics_verified: false`, so it is not mistaken for proof of the
+    user's question. For the same reason admission is always `DENY` there
+    (and in the control-plane response), even when the translated claim
+    holds: the translation itself is unverified, so the user's question is
+    never admitted. The verdict is not changed, and the log row's
+    `is_verified` follows admission.
+- **`qwed init` and `qwed test` print the verdict with its admission (#438).**
+  Decided cases no longer print `BLOCKED`, and `VERIFIED` never appears alone:
+  `2+2=5 -> VERIFIED (false) | DENY`. A failed self-check prints `FAILED`. The
+  closing lines say `All engines ready.` instead of "All engines verified".
+
+### Changed
+
+- **Contacts and links moved to `qwedai.tech`.** It is now the only QWED
+  domain in the repository.
+  - The maintainer and security contact is `rahul@qwedai.tech` (SECURITY.md,
+    the Code of Conduct, the README, `pyproject.toml`, `funding.json`). Support
+    is `support@qwedai.tech`. The default `ALERT_EMAIL_TO` is now
+    `rahul@qwedai.tech`; set the variable to keep another address.
+  - Website, docs and finance links point to `qwedai.tech`, `docs.qwedai.tech`
+    and `finance.qwedai.tech`. Error messages link to the docs pages directly
+    instead of through redirects, and the `.env.example` LLM guide link, which
+    was a 404, now points to the current page.
+  - Links to hosts that never existed are gone. The 500-error hint says to
+    check the server logs, the SDK READMEs show a self-hosted server as the
+    custom base URL (there is no hosted API), and the issue template links to
+    `docs.qwedai.tech`.
+  - The Verification Context schema `$id` is
+    `https://qwedai.tech/schemas/verification-context/v1.0`, in both copies.
+    Tools that look the schema up by its old `$id` need the new one.
+  - `qwed init` signs up its local bootstrap account with an `example.com`
+    address, and test fixtures use `example.com` and `example.test`. The
+    organisation slug in that address is cut to fit the 64-character limit
+    on an email's local part; a long organisation name used to make signup
+    fail with a 422.
+  - `scripts/setup_and_verify.py` reads the admin login from
+    `QWED_ADMIN_EMAIL`, so a local setup made with the old address keeps
+    working.
+  - `QWEDSyntaxError` now shows its docs link, as the other QWED errors do.
+- **The API now writes its audit rows through the signed hash chain.** Every
+  `/verify/*` endpoint, the Verification Context routes and `POST /audit/seed`
+  used to write `VerificationLog` rows directly, so `entry_hash`,
+  `hmac_signature` and `previous_hash` stayed empty. `/admin/compliance/verify/{log_id}`
+  and `verify_audit_trail` could not verify those rows, and the CSV export
+  marked them `Legacy`. They now append through `AuditLogger`, so new rows are
+  HMAC-signed and chained per organisation.
+- **Breaking: `QWED_AUDIT_SECRET_KEY` is required.** The server refuses to start
+  without it. If an audit append fails at request time (key unset, a chain head
+  that fails verification, a continuity mismatch, a database error), the request
+  returns 500 `audit persistence failed` rather than a result with no audit row.
+  `qwed init` now persists a key alongside the JWT and lookup secrets and never
+  rotates an existing one. Projects onboarded earlier have none in `.env`:
+  re-run `qwed init` (existing secrets are kept) or set it yourself.
+- **Existing rows stay unverified.** Rows written before this change have no
+  hash. `verify_log_entry` reports them as `legacy: true` and never `valid`. The
+  first chained row after them opens a new segment with no `previous_hash`.
+  `verify_audit_trail` lists them under `legacy_entries` and stays
+  `valid: false` while any are in range; pass `start_date` to verify from the
+  upgrade onwards. An unchained row after a chained row is not legacy: appends
+  stop and verification fails.
+- **Single writer.** The audit logger keeps each organisation's chain head in
+  memory, so one process should append to a given database. A second writer
+  makes the next append fail with a continuity error (500) rather than fork the
+  chain. The shipped Dockerfile runs one uvicorn worker.
+- **`/verify/consensus` audit rows store the result JSON** like every other
+  endpoint, instead of a `Consensus: …` summary string that could never be
+  verified.
+- **`POST /audit/seed` is off by default.** It answers 404 and writes nothing
+  unless `QWED_ENABLE_AUDIT_SEED=1`, so sample rows never mix with a production
+  trail. When enabled, its rows are timestamped when written, not backdated,
+  marked `{"sample": true}`, and use a fixed sequence instead of `random`.
+- **The CSV export says `Chained`, not `Verified`.** The column is now
+  `Chain Status`: a present hash is not a verified chain. Use
+  `/admin/compliance/verify/{log_id}` to verify a row.
+- **`qwed init` also proves the audit key.** `/health/identity` returns an
+  `audit_hmac` (503 without a key), and init refuses a running server on a
+  different audit key. An older server without the audit proof is refused
+  too: restart it on this release, then re-run init.
+- **Audit appends use their own connection pool**, take a per-organisation
+  database lock before reading the chain head (a PostgreSQL advisory lock, or
+  `BEGIN IMMEDIATE` on SQLite) as defence in depth, and redact PII per string so
+  stored results stay valid JSON.
+- **`.env` writes keep retained settings verbatim** and quote new values that
+  python-dotenv would otherwise change, so a signing key reads back unchanged.
+
+Verification still does not detect removal of the newest entries; that needs an
+externally stored checkpoint of the latest hash.
+
+## [7.3.0] - 2026-10-16
+
+A fail-closed security and soundness release. It ships five private advisories
+(three of them completing earlier incomplete fixes), the tenant-scoping and
+denial-of-service hardening tracked since 7.2.3, credential-handling fixes, and
+a versioned Go module path. All engine changes make verification stricter and
+fail closed; no response field is removed or renamed. The soundness eval grew
+to 84 known-answer claims, 0 accepted wrongly.
+
+### Security fixes (advisories)
+
+Five advisories, published on the repository Security tab. They affect all
+versions up to 7.2.3; upgrading is recommended. All five have regression tests
+in `tests/`; the SQL, code and logic advisories (GHSA-6p94, GHSA-6cpx,
+GHSA-4phf, GHSA-g25v) also have reproductions in the soundness eval (`evals/`).
+The sandbox advisory (GHSA-j3x4) is exercised by its subprocess test, which the
+eval runner does not cover.
+
+- **SQL commands are classified across the whole statement tree**
+  (GHSA-6p94-4f75-g2wq, high) — destructive DML (`DELETE`/`UPDATE`/`INSERT`/…)
+  hidden inside a CTE or subquery, administrative statements
+  (`COPY`, `ATTACH`, `PRAGMA`, `CALL`, …), and any statement whose root is not a
+  read-only `SELECT`/`UNION`/… are now reported invalid
+  (`developer_fields.is_valid = false`, denied by `admission_decision`) wherever
+  they appear. Before, the command-type check only inspected the top level, so
+  `WITH x AS (DELETE …)` and non-`SELECT` statement families were admitted
+  (`core/sql_verifier.py`).
+- **Code verification never admits alternate process-execution routes or
+  file/network sinks** (GHSA-4phf-6h72-9xfg, high; completes
+  GHSA-6rxr-gq43-694g) — `os.posix_spawn*`, `os.fork`, `pty.fork`,
+  `importlib`/`runpy` dynamic import and execution, `ctypes` library loaders,
+  and reads/writes through `io.open`/`shutil`/`pathlib`/`socket`/`urllib`/
+  `requests`/… are now blocking findings, including the bare `open` builtin and
+  the raw `posix`/`nt` modules (`core/code_verifier.py`).
+- **The code-execution sandbox isolates its namespace**
+  (GHSA-j3x4-v3p2-4mq3, high; completes GHSA-6rxr-gq43-694g) — user code runs
+  under a capability allowlist (`__builtins__` reduced to safe names, a guarded
+  `__import__` that admits only an allowlist of analysis modules such as
+  numpy/pandas/scipy) instead of a static denylist that could be bypassed
+  through package-internal re-exports and reflection. User code is read from a
+  separate file and never inlined into the harness
+  (`core/secure_code_executor.py`).
+- **SQL `SELECT *` is expanded against the schema and tautologies are folded at
+  the value level** (GHSA-6cpx-8jrq-r7h3, moderate) — with `schema_ddl`, a `*`
+  (qualified or not) that resolves to a blocked column is rejected instead of
+  slipping past the sensitive-column denylist; always-true predicates
+  (`OR 1=1`, `OR 'a'='a'`, arithmetic tautologies) are detected by
+  constant-folding the comparison rather than matching text shapes
+  (`core/sql_verifier.py`).
+- **The logic natural-language bridge rejects string constants**
+  (GHSA-g25v-44j8-gg7x, moderate; completes GHSA-mfh5-3c8f-975p) —
+  `_constant_to_dsl` no longer mangles a categorical string into a bare token
+  the compiler turned into a free integer, which had made contradictory claims
+  (`tier == 'gold' AND tier == 'silver'`) satisfiable and VERIFIED. String
+  literals now fail closed; encode categories as explicit integers
+  (`core/dsl_logic_verifier.py`).
+
+### Soundness and access control
+
+- **Admin endpoints are scoped to the caller's tenant** and RBAC is enforced,
+  closing a cross-tenant access gap ([#222], #450).
+- **The money verifier rejects non-finite amounts** (`NaN`/`inf`) and
+  `verify_invoice_total` never raises ([#451]).
+- **The SDK's `verify_fact` fails closed** when the service is unreachable
+  instead of returning a permissive result ([#326], #449).
+
+### Hardening and resource limits
+
+- **Blocking work is kept off the event loop and request bodies are capped**,
+  closing denial-of-service paths ([#390], [#391], [#392], [#445], #447).
+- **Concurrent sandbox containers are bounded** so a burst cannot exhaust the
+  host ([#446], #448).
+- **API-key rotation is atomic**, so concurrent rotations mint a single key
+  ([#452], #453).
+
+### Credential handling
+
+- **Connection URLs (Redis, Postgres) are redacted before logging**, so an
+  embedded password is not written to logs ([#228]); the **auth boundary
+  rejects expired API keys** ([#389]); **provider imports are https-only**
+  ([#229]) (#454).
+- **SDK error detail is sanitized** — full detail is logged for operators and a
+  generic error is raised to callers ([#225], #455).
+
+### SDKs and tooling
+
+- **Go module path is versioned** (`.../sdk-go/v7`) and release tagging emits
+  `sdk-go/vX.Y.Z`, so `go get` resolves the module ([#443], #457).
+
+### Docs
+
+- Whitepaper errata item 8 corrected (the LangChain example) (#456).
+- Assurance case and README updated for the 7.3.0 advisories and eval count.
+
+### Behaviour changes
+
+Every engine change is stricter and fails closed; no response field is removed
+or renamed. The code-execution sandbox now admits only an allowlist of modules
+and builtins, so sandboxed user code that imported other modules will need them
+added to the allowlist. The SQL verifier now denies statements it previously
+admitted (non-`SELECT` roots, DML in CTEs, `*` over blocked columns, value-level
+tautologies) by returning `VERIFIED` with `developer_fields.is_valid = false`,
+which `admission_decision` rejects; the logic NL bridge returns
+`UNVERIFIABLE`/error for categorical string constants.
+
+[#222]: https://github.com/QWED-AI/qwed-verification/issues/222
+[#225]: https://github.com/QWED-AI/qwed-verification/issues/225
+[#228]: https://github.com/QWED-AI/qwed-verification/issues/228
+[#229]: https://github.com/QWED-AI/qwed-verification/issues/229
+[#326]: https://github.com/QWED-AI/qwed-verification/issues/326
+[#389]: https://github.com/QWED-AI/qwed-verification/issues/389
+[#390]: https://github.com/QWED-AI/qwed-verification/issues/390
+[#391]: https://github.com/QWED-AI/qwed-verification/issues/391
+[#392]: https://github.com/QWED-AI/qwed-verification/issues/392
+[#443]: https://github.com/QWED-AI/qwed-verification/issues/443
+[#445]: https://github.com/QWED-AI/qwed-verification/issues/445
+[#446]: https://github.com/QWED-AI/qwed-verification/issues/446
+[#451]: https://github.com/QWED-AI/qwed-verification/issues/451
+[#452]: https://github.com/QWED-AI/qwed-verification/issues/452
+
+## [7.2.3] - 2026-10-13
+
+### Security fixes
+
+This is a fail-closed security release covering three advisories:
+GHSA-6rxr-gq43-694g, GHSA-64xf-wffc-63fm and GHSA-q5g6-6cw2-cjm3. They affect
+all versions up to 7.2.2; upgrading is recommended. The advisories were
+published on the repository Security tab on 2026-10-13. No breaking wire changes.
+
+- **Code verification never admits shell or process execution** —
+  `os.system`, `os.popen`, the `os.exec*` and `os.spawn*` families,
+  `os.posix_spawn*`, `os.startfile`, `subprocess.*`, `pty.spawn` and
+  `asyncio.create_subprocess_*` are now blocking findings
+  (`process_execution`), including calls made through an aliased import
+  (`import subprocess as sp`, `from os import system as run_it`,
+  `from os import *`). Before, they were warnings and such code was admitted,
+  even when caller input reached the shell. `verify_code`,
+  `verify_python_deep` and `POST /verify/code` are covered
+  (`core/code_verifier.py`).
+- **Project-scoped OpenAI keys** — `ConfigGuard` and the code verifier now
+  detect `sk-proj-`, `sk-svcacct-` and `sk-admin-` keys as well as legacy
+  keys (`qwed_sdk/guards/config_guard.py`, `core/code_verifier.py`).
+- **SQL verification** — MySQL and MariaDB executable comments
+  (`/*! ... */`, `/*!NNNNN ... */`, `/*M! ... */`) are expanded before
+  analysis, so SQL inside them is checked; and with `schema_ddl`, a query on a
+  table outside the schema is BLOCKED with `sql_verifier.schema_violation`
+  instead of being admitted with a warning (`core/sql_verifier.py`).
+
+### Behaviour changes
+
+All three make the engines stricter. No response field is removed or
+renamed; the SQL verifier adds the constraint `sql_verifier.schema_violation`
+and the field `developer_fields.executable_comments_expanded`.
+
+- Code that runs a shell command or subprocess is no longer admitted by the
+  code verifier, even with a constant argument. Run such code through a
+  reviewed, sandboxed tool instead.
+- With `schema_ddl`, a reference to an undeclared table is an admission
+  failure (`is_valid: false`, constraint `sql_verifier.schema_violation`).
+  Names defined by the query itself (CTEs) are not tables. Without
+  `schema_ddl`, tables are not checked, as before.
+- Executable comments are analysed as SQL whatever the declared dialect;
+  `developer_fields.executable_comments_expanded` says when that happened.
+
+### Added
+
+- **Soundness eval** (`evals/`, in the repository, not the wheel): claims
+  with a known answer run through the Math, Logic, SQL, Code and Schema
+  engines, including the reproductions from GHSA-j622-qffp-rc27,
+  GHSA-mfh5-3c8f-975p, GHSA-6rxr-gq43-694g and GHSA-q5g6-6cw2-cjm3
+  (GHSA-64xf-wffc-63fm is covered by `tests/test_openai_project_keys.py`,
+  not the eval). `python -m evals.run`
+  reports how many claims were proved, caught or wrongly accepted;
+  `tests/test_evals.py` fails CI on any claim that does not hold but was
+  accepted, or on any engine that raises; and `.github/workflows/eval.yml`
+  attaches the report (`eval-results.json`) to every release.
+
+> **Semver:** patch release — security fixes that restore fail-closed
+> behaviour, plus repository tooling. No breaking wire changes.
+
+## [7.2.2] - 2026-10-09
+
+### Security fixes
+
+This is a fail-closed security release covering four published advisories:
+GHSA-4v5r-g7f4-vvgc, GHSA-mfh5-3c8f-975p, GHSA-j622-qffp-rc27 and
+GHSA-mxwv-x5qm-mrmf. They affect all versions up to 7.2.1; upgrading is
+recommended. No breaking wire changes.
+
+- **Local SDK math verification** — the SymPy expression validator now rejects
+  string literals nested inside container arguments, closing an allow-list
+  bypass that could route untrusted model output to SymPy's string-evaluation
+  path (`qwed_sdk/qwed_local.py`).
+- **Logic verification soundness** — the Z3 constraint evaluator no longer
+  accepts Python boolean operators (`and`/`or`/`not`) or chained comparisons on
+  symbolic objects, and the DSL compiler rejects string literals instead of
+  materialising them as variables. Both could otherwise yield a `VERIFIED`
+  verdict that did not follow from the input
+  (`core/safe_evaluator.py`, `core/dsl/compiler.py`).
+- **Large-number math verification** — `verify_math` now compares results at a
+  precision scaled to the operands, so values beyond 15 significant digits are
+  no longer rounded before the comparison (`core/verifier.py`).
+- **Computational cost bounds** — the math parser applies its cost gates to
+  implicit-multiplication input, and the logic/DSL engines bound
+  statically-known integer powers, preventing short requests from exhausting a
+  worker (`core/safe_parser.py`, `core/safe_evaluator.py`, `core/dsl/compiler.py`).
+
+## [7.2.1] - 2026-09-14
+
+### Security fix
+
+- **Math answer comparison hardening (GHSA-xmm6-8r3x-j567)** — `QWEDLocal._math_answers_match` fed the untrusted model answer to raw `sympy.sympify()`, whose eval sink executes dunder-traversal gadgets smuggled in the answer turn. The answer is now parsed only through the hardened `safe_parse_expr` (character allow-list, AST allow-list, builtins stripped, cost-bounded); unparseable input and a missing parser fail closed to `False`.
+- **Release boundary gate** — `scripts/check_boundary.py` now scans `qwed_sdk/` and forbids raw `sympify` outside approved wrappers (shell findings honor line-scoped `# noqa`).
+
+> **Semver:** patch release — security fix only, no new capability, no breaking wire changes. `qwed` 7.2.1 on PyPI and crates.io carries the fix. (Correction: the npm publish of `@qwed-ai/sdk` 7.2.1 failed, so npm stayed at 7.2.0; the failure was hidden by `continue-on-error` in the publish workflow.)
+
 ## [7.2.0] - 2026-09-07
 
 ### Security hardening batch
@@ -43,8 +791,8 @@ Fail-closed fixes restoring intended behavior — no breaking wire changes:
 
 #### Bridge & Verifier Mappings (#310, #316)
 
-- **`verification_context_from_diagnostic_result()`** — converts `DiagnosticResult` → VC document; VERIFIED without attestation demotes to UNVERIFIABLE (fail-closed, consistent with the core contract).
-- **`to_verification_context()` on all 13 verifiers** — complete engine coverage: Math, Logic, Symbolic, SQL, Code, Schema, Fact, Image, Graph, Reasoning, Stats, Consensus, and SecureCodeExecutor.
+- **`verification_context_from_diagnostic_result()`** — converts `DiagnosticResult` → VC document; VERIFIED without attestation fails closed to BLOCKED via `enforce_trust_decision` (`trust_gate.mandatory_attestation_missing`, consistent with the core contract).
+- **`to_verification_context()` across the verifier classes** — implemented on `CodeVerifier`, `ConsensusVerifier`, `DSLLogicVerifier`, `FactVerifier`, `BatchFactVerifier`, `GraphFactVerifier`, `ImageVerifier`, `MultiVLMVerifier`, `LogicVerifier`, `ReasoningVerifier`, `SchemaVerifier`, `SQLVerifier`, `StatsVerifier`, and `SymbolicVerifier` (14 classes). Math and secure-code-execution results convert through `verification_context_from_diagnostic_result()` instead.
 
 #### Surface Exposure (#311, #313, #314, #315)
 

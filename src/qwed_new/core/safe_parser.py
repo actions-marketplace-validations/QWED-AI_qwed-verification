@@ -58,7 +58,14 @@ from sympy.parsing.sympy_parser import (
     implicit_multiplication_application,
 )
 
-__all__ = ["safe_parse_expr", "validate_variable_name", "get_safe_symbol", "SafeParserError"]
+__all__ = [
+    "safe_parse_expr",
+    "validate_variable_name",
+    "get_safe_symbol",
+    "check_sympy_expansion_cost",
+    "check_closed_expression_cost",
+    "SafeParserError",
+]
 
 MAX_EXPRESSION_LENGTH = 5_000
 _AST_MAX_DEPTH = 30
@@ -273,19 +280,200 @@ def _check_exact_expansion_call_cost(node: ast.AST) -> None:
             )
 
 
-def _check_ast_safety(expression: str) -> None:
-    """Reject Python-parseable expressions that use non-arithmetic syntax,
-    exceed max AST depth, or demand unbounded exact-integer expansion
-    (issues #329/#330/#353).
+def _fold_exact(node: Any):
+    """Fold an exact-number SymPy subtree to an int or Fraction WITHOUT letting
+    SymPy evaluate it, raising the moment a power would exceed the expansion
+    bounds. Returns None for any subtree that is not an exact number (symbols,
+    floats, transcendental constants), so symbolic powers stay lazy.
 
-    Expressions using implicit multiplication (e.g. 2x, sin x) fail
-    ast.parse and skip this check — they are caught by the charset gate
-    and the post-parse sympy depth check.
+    Check Pow BEFORE is_Integer: an unevaluated Pow like 9**(9**9) reports
+    is_Integer == True, and int() on it would force the full expansion this
+    gate exists to prevent. Powers are handled structurally via base/exp.
     """
+    if isinstance(node, sympy.Pow):
+        return _fold_exact_pow(node)
+    if node.is_Integer:
+        return int(node)
+    if node.is_Rational:
+        return Fraction(int(node.p), int(node.q))
+    if isinstance(node, (sympy.Add, sympy.Mul)):
+        return _fold_exact_sum_or_product(node)
+    return None
+
+
+def _check_expansion_digits(value) -> None:
+    if value != 0 and _exact_digits(value) > _MAX_EXPANSION_DIGITS:
+        raise SafeParserError("Expression demands unbounded exact-integer expansion")
+
+
+def _fold_exact_pow(node: Any):
+    base = _fold_exact(node.base)
+    exponent = _fold_exact(node.exp)
+    if exponent is not None and abs(exponent) > _MAX_EXPONENT_MAGNITUDE:
+        # Whatever the base (Integer, Rational, sqrt(2), ...), SymPy
+        # expands an exact power with an exponent this large eagerly.
+        raise SafeParserError(
+            f"Exponent exceeds the maximum magnitude of {_MAX_EXPONENT_MAGNITUDE}"
+        )
+    if base is None or exponent is None:
+        return None
+    if base != 0 and _exact_digits(base) * abs(exponent) > _MAX_EXPANSION_DIGITS:
+        raise SafeParserError("Expression demands unbounded exact-integer expansion")
+    if not isinstance(exponent, int):
+        return None  # irrational result (e.g. 9**(1/2)): not an exact number
+    if exponent >= 0:
+        return base ** exponent
+    return None if base == 0 else Fraction(base) ** exponent
+
+
+def _fold_exact_sum_or_product(node: Any):
+    is_add = isinstance(node, sympy.Add)
+    acc = 0 if is_add else 1
+    for arg in node.args:
+        value = _fold_exact(arg)
+        if value is None:
+            return None
+        acc = acc + value if is_add else acc * value
+        _check_expansion_digits(acc)
+    return acc
+
+
+def _exact_digits(value) -> int:
+    """Upper-bound digit count of an int or Fraction (largest of its parts)."""
+    if isinstance(value, Fraction):
+        return max(_magnitude_digits(value.numerator), _magnitude_digits(value.denominator))
+    return _magnitude_digits(value)
+
+
+def check_sympy_expansion_cost(expr: Any) -> None:
+    """Reject a SymPy tree whose evaluation would demand unbounded expansion.
+
+    The tree must be UNEVALUATED (built with ``evaluate=False``): SymPy
+    expands exact-integer powers and factorials eagerly, so the check has to
+    run before evaluation does. Walks ``.args`` manually — do NOT use
+    sympy.preorder_traversal here: iterating it forces evaluation of nested
+    Pow nodes and re-triggers the very expansion this gate prevents.
+
+    Raises:
+        SafeParserError: if any power, product, factorial or binomial in the
+            tree exceeds the expansion bounds.
+    """
+    if isinstance(expr, sympy.Pow):
+        _fold_exact(expr)
+    elif isinstance(expr, (sympy.Add, sympy.Mul)):
+        _fold_exact(expr)
+    elif isinstance(expr, (sympy.factorial, sympy.binomial, sympy.gamma)):
+        for arg in expr.args:
+            value = _fold_exact(arg)
+            if value is not None and abs(value) > _MAX_EXPONENT_MAGNITUDE:
+                raise SafeParserError(
+                    f"{type(expr).__name__} argument exceeds the maximum magnitude "
+                    f"of {_MAX_EXPONENT_MAGNITUDE}"
+                )
+    for arg in getattr(expr, "args", ()):
+        check_sympy_expansion_cost(arg)
+
+
+# Functions whose value grows like exp(arg): a tower of them is as explosive
+# as a tower of powers once evaluated numerically.
+_EXP_GROWTH_FUNCTIONS = (sympy.exp, sympy.sinh, sympy.cosh)
+
+
+def check_closed_expression_cost(expr: Any) -> None:
+    """Reject a symbol-free SymPy tree that is unsafe to evaluate.
+
+    For a closed expression that is about to be evaluated (e.g. a symbolic
+    claim with a witness point substituted in). The tree must be UNEVALUATED.
+    On top of :func:`check_sympy_expansion_cost`, every power exponent and
+    every exp/sinh/cosh argument must fold to an exact rational within
+    ``_MAX_EXPONENT_MAGNITUDE``. An exponent that does not fold (``9**(33/4)``,
+    ``sin(1)``, ``pi``) cannot be bounded statically, and a tower built from
+    one can make even a numeric ``is_zero`` check hang, so it is rejected.
+
+    Raises:
+        SafeParserError: if the tree has free symbols or fails a bound.
+    """
+    if getattr(expr, "free_symbols", None):
+        raise SafeParserError("Expression is not closed: it still has free symbols")
+    check_sympy_expansion_cost(expr)
+    _check_closed_growth(expr)
+
+
+def _check_closed_growth(node: Any) -> None:
+    if isinstance(node, sympy.Pow):
+        operand = _fold_exact(node.exp)
+    elif isinstance(node, _EXP_GROWTH_FUNCTIONS):
+        operand = _fold_exact(node.args[0])
+    else:
+        operand = 0
+    if operand is None or abs(operand) > _MAX_EXPONENT_MAGNITUDE:
+        raise SafeParserError(
+            "Growth operand is not an exact number within the maximum magnitude "
+            f"of {_MAX_EXPONENT_MAGNITUDE}; evaluation cannot be bounded"
+        )
+    for arg in getattr(node, "args", ()):
+        _check_closed_growth(arg)
+
+
+def _check_unevaluated_sympy_cost(expression: str) -> None:
+    """Cost-gate an expression that is not valid Python (implicit multiplication).
+
+    ``9^9^9 x`` fails ast.parse, so the AST cost gates were skipped entirely and
+    the expression went straight to ``parse_expr`` which expands the exact
+    integer power eagerly (#353 bypass). Parse it WITHOUT evaluation (cheap,
+    measured sub-10ms) and reject any Pow / factorial / binomial whose operands
+    are concrete integers beyond the expansion bounds, before the eager
+    evaluation can run.
+    """
+    # Cheap pre-screen on the RAW string before parse_expr, which itself evaluates
+    # factorial/binomial eagerly even with evaluate=False — so a bomb like
+    # factorial(10**9) would DoS the cost checker itself. Reject oversized numeric
+    # arguments to the exact-expansion calls, and oversized bare integer literals,
+    # up front.
+    for call_match in re.finditer(r"\b(factorial|binomial)\s*\(([^()]*)\)", expression):
+        for num in re.findall(r"\d+", call_match.group(2)):
+            if int(num) > _MAX_EXPONENT_MAGNITUDE:
+                raise SafeParserError(
+                    f"{call_match.group(1)} argument exceeds the maximum magnitude "
+                    f"of {_MAX_EXPONENT_MAGNITUDE}"
+                )
+    for num in re.findall(r"\d+", expression):
+        if len(num) > len(str(_MAX_INTEGER_LITERAL)):
+            raise SafeParserError(
+                "Expression contains an integer literal that is too large"
+            )
+
     try:
-        tree = ast.parse(expression, mode="eval")
-    except SyntaxError:
+        import sympy
+        from sympy.parsing.sympy_parser import (
+            parse_expr,
+            standard_transformations,
+            convert_xor,
+            implicit_multiplication_application,
+        )
+        transformations = standard_transformations + (
+            convert_xor,
+            implicit_multiplication_application,
+        )
+        # NB: a restricted global_dict (empty __builtins__) makes
+        # parse_expr(evaluate=False) raise, so use sympy's default namespace —
+        # this call only inspects structure for cost, it does not feed the result
+        # to the engine (safe_parse_expr re-parses with the hardened namespace).
+        expr = parse_expr(
+            expression,
+            transformations=transformations,
+            evaluate=False,
+        )
+    except SafeParserError:
+        raise
+    except Exception:
+        # Not parseable even by sympy — let the main parse path raise.
         return
+
+    check_sympy_expansion_cost(expr)
+
+
+def _run_cost_gates(tree: ast.AST) -> None:
     depth = _ast_node_depth(tree)
     if depth > _AST_MAX_DEPTH:
         raise SafeParserError(
@@ -297,6 +485,29 @@ def _check_ast_safety(expression: str) -> None:
         _check_pow_cost(node)
         _check_caret_chain_cost(node)
         _check_exact_expansion_call_cost(node)
+
+
+def _check_ast_safety(expression: str) -> None:
+    """Reject Python-parseable expressions that use non-arithmetic syntax,
+    exceed max AST depth, or demand unbounded exact-integer expansion
+    (issues #329/#330/#353).
+
+    Expressions using implicit multiplication (e.g. 2x, sin x) are not valid
+    Python, so ast.parse fails. Rather than skip the cost gates (which let
+    ``9^9^9 x`` through — #353 bypass), re-derive the source sympy will
+    evaluate and run the gates on that. Node-shape checks are not applied to
+    the transformed source because sympy emits Symbol('x')/Integer(...) call
+    wrappers that are not part of the user's grammar; the charset gate already
+    bounds the raw input, and the cost gates are what matter here.
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        # Implicit-multiplication input (e.g. "9^9^9 x") is not valid Python.
+        # Gate it on the unevaluated sympy tree instead of skipping (#353 bypass).
+        _check_unevaluated_sympy_cost(expression)
+        return
+    _run_cost_gates(tree)
 
 
 _ASTRONOMICAL = float("inf")

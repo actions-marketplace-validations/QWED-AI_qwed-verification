@@ -1,25 +1,35 @@
 """
 Audit log routes for QWED Enterprise Portal.
 """
+import asyncio
+import os
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from typing import Optional
 import csv
 import io
-from datetime import datetime, timedelta
 from fastapi.responses import StreamingResponse
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
 from qwed_new.core.database import get_session
+from qwed_new.core.audit_logger import SecurityError, get_audit_logger
 from qwed_new.core.models import VerificationLog, User
-from .routes import get_current_user
+from .roles import ADMIN_ROLES, READ_ROLES
+from .routes import ROLE_REFUSED, require_user_role
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
-@router.get("/logs")
+# #478: every role may read its organisation's log; only admins and owners may
+# export it in bulk or seed samples. Built once, at import (Ruff B008).
+_READER = Depends(require_user_role(READ_ROLES))
+_ADMIN = Depends(require_user_role(ADMIN_ROLES))
+
+@router.get("/logs", responses=ROLE_REFUSED)
 async def get_logs(
     limit: int = Query(50, le=200),
     status: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = _READER,
     session: Session = Depends(get_session)
 ):
     """Get audit logs for the current organization."""
@@ -54,10 +64,13 @@ async def get_logs(
         ]
     }
 
-@router.get("/logs/{log_id}")
+@router.get(
+    "/logs/{log_id}",
+    responses={**ROLE_REFUSED, 404: {"description": "No such log in the organisation"}},
+)
 async def get_log_detail(
     log_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = _READER,
     session: Session = Depends(get_session)
 ):
     """Get detailed information for a single audit log."""
@@ -75,9 +88,9 @@ async def get_log_detail(
         "created_at": log.timestamp.isoformat()
     }
 
-@router.get("/export")
+@router.get("/export", responses=ROLE_REFUSED)
 async def export_logs(
-    current_user: User = Depends(get_current_user),
+    current_user: User = _ADMIN,
     session: Session = Depends(get_session)
 ):
     """Export audit logs as CSV."""
@@ -118,14 +131,35 @@ async def export_logs(
         headers={"Content-Disposition": "attachment; filename=qwed_audit_logs.csv"}
     )
 
-@router.post("/seed")
+SEED_ENABLED_ENV_VAR = "QWED_ENABLE_AUDIT_SEED"
+
+
+@router.post(
+    "/seed",
+    responses={
+        **ROLE_REFUSED,
+        404: {"description": "Sample seeding is disabled"},
+        500: {"description": "Audit persistence failed"},
+    },
+)
 async def seed_sample_data(
-    current_user: User = Depends(get_current_user),
+    current_user: User = _ADMIN,
     session: Session = Depends(get_session)
 ):
-    """Seed sample audit logs for testing (dev only)."""
-    import random
-    
+    """Seed sample audit logs for testing (development only).
+
+    Disabled unless QWED_ENABLE_AUDIT_SEED is set to 1: a production audit
+    trail must hold genuine decisions only, so the route answers 404 by
+    default and writes nothing.
+
+    Sample rows go through the signed audit chain like any other row, marked
+    ``{"sample": true}`` in their result and timestamped when written. A row
+    added outside the chain would become an unverifiable head and stop every
+    later append for the organisation.
+    """
+    if os.getenv(SEED_ENABLED_ENV_VAR, "").strip() != "1":
+        raise HTTPException(status_code=404, detail="Not found")
+
     queries = [
         "Is P=NP?",
         "Verify the Riemann Hypothesis",
@@ -134,20 +168,26 @@ async def seed_sample_data(
         "Analyze quantum coherence state"
     ]
     
-    for _ in range(10):
-        query = random.choice(queries)
-        is_verified = random.choice([True, False])
-        
-        log = VerificationLog(
-            organization_id=current_user.organization_id,
-            user_id=current_user.id,
-            query=query,
-            result="Sample result data",
-            is_verified=is_verified,
-            domain=random.choice(["MATH", "LOGIC", "PHYSICS"]),
-            timestamp=datetime.utcnow() - timedelta(minutes=random.randint(1, 1000))
-        )
-        session.add(log)
-    
-    session.commit()
+    domains = ["MATH", "LOGIC", "PHYSICS"]
+
+    # Sample rows are a fixed, repeatable sequence: no randomness is needed
+    # for fixture data, and none reaches a signed audit row.
+    def _append_samples() -> None:
+        audit_logger = get_audit_logger()
+        for i in range(10):
+            audit_logger.log_verification(
+                organization_id=current_user.organization_id,
+                user_id=current_user.id,
+                query=queries[i % len(queries)],
+                result={"sample": True},
+                is_verified=i % 2 == 0,
+                domain=domains[i % len(domains)],
+            )
+
+    # The appends are blocking database transactions: run them in a worker
+    # thread so the event loop keeps serving other requests.
+    try:
+        await asyncio.to_thread(_append_samples)
+    except (SecurityError, SQLAlchemyError):
+        raise HTTPException(status_code=500, detail="audit persistence failed") from None
     return {"message": "Sample logs seeded successfully"}

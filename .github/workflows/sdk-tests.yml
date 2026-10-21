@@ -8,6 +8,7 @@ on:
       - 'sdk-ts/**'
       - 'sdk-go/**'
       - 'sdk-rust/**'
+      - 'sdk-fixtures/**'
   pull_request:
     branches: [main]
     paths:
@@ -15,6 +16,7 @@ on:
       - 'sdk-ts/**'
       - 'sdk-go/**'
       - 'sdk-rust/**'
+      - 'sdk-fixtures/**'
   workflow_dispatch:  # Manual trigger
 
 permissions:
@@ -28,10 +30,12 @@ jobs:
     name: Python SDK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       
+        with:
+          persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.11'
       
@@ -55,27 +59,78 @@ jobs:
     name: TypeScript SDK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
       
       - name: Install Dependencies
         run: |
           cd sdk-ts
-          npm install
+          npm ci
+      
+      - name: Typecheck
+        run: |
+          cd sdk-ts
+          npm run typecheck
       
       - name: Build
         run: |
           cd sdk-ts
           npm run build
       
-      - name: Lint (optional)
+      - name: Lint
         run: |
           cd sdk-ts
-          npm run lint || true
+          npm run lint
+      
+      - name: Test (contract tests against captured server responses)
+        run: |
+          cd sdk-ts
+          npx vitest run
+
+  # ============================================
+  # TypeScript SDK consumer compat (oldest supported runtime)
+  # ============================================
+  # The toolchain above runs on Node 24 while engines stays >=18 by design
+  # (devDeps never ship; see sdk-ts/README.md). This job guards that promise:
+  # it builds with the Node 24 toolchain, then imports the built artifact on
+  # Node 18 so a newer runtime API slipping into src/ fails CI instead of
+  # reaching Node 18 consumers.
+  typescript-consumer-compat:
+    name: TypeScript SDK consumer compat (Node 18)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24 (build toolchain)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+
+      - name: Install + Build
+        run: |
+          cd sdk-ts
+          npm ci
+          npm run build
+
+      - name: Set up Node.js 18 (oldest supported consumer runtime)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '18'
+
+      - name: Smoke-test built artifact on Node 18
+        # Empty options on purpose: the constructor only stores fields and makes
+        # no request, and a key-shaped literal here trips secret scanning.
+        run: |
+          cd sdk-ts
+          node -e "import('./dist/index.mjs').then(m => { new m.QWEDClient({}); console.log('consumer smoke OK'); })"
 
   # ============================================
   # Go SDK
@@ -84,10 +139,12 @@ jobs:
     name: Go SDK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       
+        with:
+          persist-credentials: false
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.21'
       
@@ -106,6 +163,11 @@ jobs:
           cd sdk-go
           go vet ./...
 
+      - name: Test (contract tests against captured server responses)
+        run: |
+          cd sdk-go
+          go test -v ./...
+
   # ============================================
   # Rust SDK
   # ============================================
@@ -113,8 +175,10 @@ jobs:
     name: Rust SDK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       
+        with:
+          persist-credentials: false
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       
@@ -122,7 +186,14 @@ jobs:
         run: |
           cd sdk-rust
           cargo build --verbose
-      
+
+      # Unit tests, doc tests and the contract tests that parse responses
+      # captured from the server (tests/fixtures, #468).
+      - name: Test
+        run: |
+          cd sdk-rust
+          cargo test --verbose
+
       - name: Clippy (Lint)
         run: |
           cd sdk-rust
@@ -133,7 +204,7 @@ jobs:
   # ============================================
   summary:
     name: SDK Test Summary
-    needs: [python-sdk, typescript-sdk, go-sdk, rust-sdk]
+    needs: [python-sdk, typescript-sdk, typescript-consumer-compat, go-sdk, rust-sdk]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -142,5 +213,6 @@ jobs:
           echo "=== SDK Test Results ==="
           echo "Python:     ${{ needs.python-sdk.result }}"
           echo "TypeScript: ${{ needs.typescript-sdk.result }}"
+          echo "TS-compat:  ${{ needs.typescript-consumer-compat.result }}"
           echo "Go:         ${{ needs.go-sdk.result }}"
           echo "Rust:       ${{ needs.rust-sdk.result }}"

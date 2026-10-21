@@ -11,21 +11,279 @@ Provides sandboxed execution of LLM-generated code with:
 
 import ast
 import docker
+import requests
+import urllib3
 from docker.types import LogConfig
 import tempfile
 import json
+import math
 import os
+import re
+import secrets
+import stat
+import threading
 import time
 import logging
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 from .diagnostics import AdvisoryCheck, DiagnosticResult
+# Re-exported: callers import these from here as well as from sandbox_errors.
+from .sandbox_errors import (  # noqa: F401
+    MAX_ISOLATED_ENV_VALUE_BYTES,
+    ExecutionError,
+    SandboxUnavailable,
+)
 
 
 logger = logging.getLogger(__name__)
 
 # #341: hard bound on every Docker daemon API call (ping/create/start/kill)
 _DOCKER_API_TIMEOUT_SECONDS = 30
+
+# #446: a process-wide admission bound on how many sandbox containers run at
+# once. Without it, N concurrent requests start N containers and can exhaust
+# host memory/PIDs/CPU. The semaphore is shared across every SecureCodeExecutor
+# instance (consensus creates one per request), so the bound is global to the
+# worker process. A request that cannot get a slot within the acquire timeout is
+# rejected rather than spawning another container.
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
+def _env_timeout(name: str, default: float) -> float:
+    # A finite, positive timeout only. A non-finite value (e.g. nan) would make
+    # semaphore.acquire(timeout=...) poll forever instead of rejecting, so an
+    # invalid value falls back to the default — fail closed on the bound.
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+_SANDBOX_MAX_CONCURRENT = _env_int("QWED_SANDBOX_MAX_CONCURRENT", 4)
+# Default kept well under the ~30s request deadline on the consensus path, so
+# under capacity pressure a request is cleanly rejected (SANDBOX_CAPACITY_REACHED)
+# before the outer deadline fires (Sentry on PR #448). Passing the exact
+# remaining request budget down to acquire() is a larger change, deferred.
+_SANDBOX_ACQUIRE_TIMEOUT_SECONDS = _env_timeout("QWED_SANDBOX_ACQUIRE_TIMEOUT", 10.0)
+_sandbox_slots = threading.BoundedSemaphore(_SANDBOX_MAX_CONCURRENT)
+SANDBOX_CAPACITY_REACHED = "Sandbox capacity reached — retry shortly."
+
+# Container settings for run_isolated(): analysis tools that import untrusted
+# code (CrossHair, #431) get no network, a read-only root, no Linux
+# capabilities, no privilege escalation and an unprivileged user. Nothing on
+# the host is mounted: inputs arrive in the environment, the only writable
+# path is a private tmpfs owned by that user, and the output is read from the
+# container log.
+_WORKSPACE = "/workspace"
+_ISOLATED_USER = "65534"
+_ISOLATED_SCRATCH = _WORKSPACE
+_ISOLATED_HARDENING = {
+    "read_only": True,
+    "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges"],
+    "user": f"{_ISOLATED_USER}:{_ISOLATED_USER}",
+    "tmpfs": {
+        _ISOLATED_SCRATCH: (
+            f"rw,noexec,nosuid,nodev,size=16m,"
+            f"uid={_ISOLATED_USER},gid={_ISOLATED_USER},mode=0700"
+        ),
+    },
+    "working_dir": _ISOLATED_SCRATCH,
+}
+_ISOLATED_BASE_ENVIRONMENT = {
+    "HOME": _ISOLATED_SCRATCH,
+    "TMPDIR": _ISOLATED_SCRATCH,
+    "PYTHONDONTWRITEBYTECODE": "1",
+}
+_DEFAULT_ISOLATED_OUTPUT_BYTES = 64 * 1024
+
+# The image execute() runs code in (#322). A tag such as "slim" can be moved to
+# different content at any time; a digest cannot, so the sandbox only ever
+# runs the exact image that was reviewed. This is amancevice/pandas:slim as
+# published on 2026-08-10. QWED_SANDBOX_IMAGE may name another image, but
+# only by digest; any other value is refused and the pinned image is used.
+SANDBOX_IMAGE = (
+    "amancevice/pandas@sha256:9257b88909bddf60c8a85b06d572fc6dfc708ea9c8a3c3dc2149e312d57f91e3"
+)
+SANDBOX_IMAGE_ENV = "QWED_SANDBOX_IMAGE"
+# A Docker image reference pinned by digest: an optional registry host, then
+# lowercase path components, an optional tag and the digest. As in Docker, the
+# first part is a host only when it has a dot or a port, is "localhost", or is
+# a bracketed IPv6 address.
+_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_REFERENCE_HOST = (
+    r"(?:(?:(?:localhost|" + _HOST_LABEL + r"(?:\." + _HOST_LABEL + r")+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?"
+    + r"|" + _HOST_LABEL + r":[0-9]+)/)?"
+)
+_REFERENCE_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_DIGEST_REFERENCE = re.compile(
+    _REFERENCE_HOST
+    + _REFERENCE_COMPONENT
+    + r"(?:/" + _REFERENCE_COMPONENT + r")*"
+    + r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    + r"@sha256:[0-9a-f]{64}"
+)
+
+
+def _sandbox_image() -> str:
+    override = os.environ.get(SANDBOX_IMAGE_ENV, "").strip()
+    if not override:
+        return SANDBOX_IMAGE
+    if _DIGEST_REFERENCE.fullmatch(override):
+        return override
+    logger.error(
+        "%s must name an image by digest (name@sha256:<64 hex>); using the pinned sandbox image",
+        SANDBOX_IMAGE_ENV,
+    )
+    return SANDBOX_IMAGE
+
+
+# execute() hardening (#322), on top of the network, memory, CPU and PID
+# limits: a read-only root, no Linux capabilities, no privilege escalation,
+# and never root inside the container. /workspace is the host's private
+# exchange directory (inputs in, result.json out); HOME and TMPDIR point
+# there because nothing else is writable.
+_EXECUTE_HARDENING = {
+    "read_only": True,
+    "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges"],
+    "environment": {
+        "HOME": _WORKSPACE,
+        "TMPDIR": _WORKSPACE,
+        "MPLCONFIGDIR": _WORKSPACE,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    },
+}
+# Docker Desktop shares the folder with every container user, so the shared
+# unprivileged uid is enough there.
+_UNPRIVILEGED_UID = 65534
+# When this process is root, each workspace is handed to a fresh uid. It comes
+# from a range no allocator hands out: by default 1879048192-2147483646, which
+# systemd's UID/GID allocation documents as unused (above the container range
+# 524288-1879048191, below the 2^31 range kernels and tools mishandle), or
+# from QWED_SANDBOX_UID_RANGE="first-last" when the operator reserves one.
+# Every pick is also checked against the user and group databases and the
+# /etc/subuid and /etc/subgid delegations, so no account or user namespace
+# on the host owns it.
+SANDBOX_UID_RANGE_ENV = "QWED_SANDBOX_UID_RANGE"
+_DEFAULT_SANDBOX_UID_RANGE = (1879048192, 2147483646)
+_SUBORDINATE_ID_FILES = ("/etc/subuid", "/etc/subgid")
+_sandbox_uids_in_use: set = set()
+_sandbox_uids_lock = threading.Lock()
+
+
+def _sandbox_uid_range() -> Tuple[int, int]:
+    """The inclusive (first, last) uid range workspaces are handed to."""
+    configured = os.environ.get(SANDBOX_UID_RANGE_ENV, "").strip()
+    if not configured:
+        return _DEFAULT_SANDBOX_UID_RANGE
+    first, sep, last = configured.partition("-")
+    if sep and first.strip().isdigit() and last.strip().isdigit():
+        first_uid, last_uid = int(first), int(last)
+        # Never the ordinary account range, never past the 2^31 boundary.
+        if 65536 <= first_uid <= last_uid <= _DEFAULT_SANDBOX_UID_RANGE[1]:
+            return first_uid, last_uid
+    logger.error(
+        "%s must be FIRST-LAST within 65536-%d; using the default sandbox uid range",
+        SANDBOX_UID_RANGE_ENV,
+        _DEFAULT_SANDBOX_UID_RANGE[1],
+    )
+    return _DEFAULT_SANDBOX_UID_RANGE
+
+
+def _subordinate_ranges() -> List[Tuple[int, int]]:
+    """The (start, count) id blocks /etc/subuid and /etc/subgid delegate to
+    users' namespaces (rootless containers, podman, systemd-nspawn)."""
+    ranges = []
+    for path in _SUBORDINATE_ID_FILES:
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.strip().split(":")
+            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                ranges.append((int(parts[1]), int(parts[2])))
+    return ranges
+
+
+def _random_sandbox_uid() -> int:
+    first, last = _sandbox_uid_range()
+    return first + secrets.randbelow(last - first + 1)
+
+
+def _host_id_exists(uid: int) -> bool:
+    try:
+        import grp
+        import pwd
+    except ImportError:  # pragma: no cover - POSIX only
+        return False
+    for lookup in (pwd.getpwuid, grp.getgrgid):
+        try:
+            lookup(uid)
+            return True
+        except KeyError:
+            continue
+    return False
+
+
+# Ids checked per claim: every id of a small (operator-reserved) range, and a
+# bounded walk through a large one, where a free id comes up almost at once.
+_MAX_UID_PROBES = 4096
+
+
+def _claim_sandbox_uid() -> int:
+    """A uid (also used as the gid) from the sandbox range that no host
+    account or group has, no subordinate id range covers, and no other
+    workspace of this process is using.
+
+    The range is walked in order from a random starting point, so a range
+    with a single free id always finds it instead of retrying busy ones. A
+    delegated subuid/subgid block is skipped whole, as one probe, so a large
+    block cannot use up the probes.
+    """
+    first, last = _sandbox_uid_range()
+    size = last - first + 1
+    start = secrets.randbelow(size)
+    delegated = _subordinate_ranges()
+    step = probes = 0
+    while step < size and probes < _MAX_UID_PROBES:
+        probes += 1
+        uid = first + (start + step) % size
+        block_end = _delegated_block_end(uid, delegated)
+        if block_end is not None:
+            # Up to the block's end, or to the range's end, where the walk
+            # wraps around to the range's start.
+            step += min(block_end, last + 1) - uid
+            continue
+        step += 1
+        with _sandbox_uids_lock:
+            if uid in _sandbox_uids_in_use:
+                continue
+            _sandbox_uids_in_use.add(uid)
+        if not _host_id_exists(uid):
+            return uid
+        _release_sandbox_uid(uid)
+    raise SandboxUnavailable("No unused uid is available for the sandbox workspace")
+
+
+def _delegated_block_end(uid: int, delegated: List[Tuple[int, int]]) -> Optional[int]:
+    """The first id after the delegated block covering ``uid``, or None."""
+    ends = [start + count for start, count in delegated if start <= uid < start + count]
+    return max(ends) if ends else None
+
+
+def _release_sandbox_uid(uid: int) -> None:
+    with _sandbox_uids_lock:
+        _sandbox_uids_in_use.discard(uid)
+
 SECURE_RUNTIME_UNAVAILABLE = "SECURE_RUNTIME_UNAVAILABLE"
 CONSTRAINT_VERIFIER_UNAVAILABLE = "secure_code_executor.verifier_unavailable"
 CONSTRAINT_BASIC_SAFETY_ADVISORY = "secure_code_executor.basic_safety_advisory"
@@ -53,7 +311,12 @@ _DANGEROUS_OS_CALLS = {
     "execl", "execle", "execlp", "execlpe",
     "spawnv", "spawnve", "spawnvp", "spawnvpe",
     "spawnl", "spawnle", "spawnlp", "spawnlpe",
+    # Stopgap for the call-name gap (GHSA-j3x4). The structural fix is the
+    # isolated execution namespace in SecureCodeExecutor._wrap_code; these just
+    # close the obvious holes in the static gate too.
+    "posix_spawn", "posix_spawnp",
     "fork", "forkpty",
+    "Popen",
 }
 _DANGEROUS_CALL_TARGETS = frozenset(_DANGEROUS_BUILTINS | _DANGEROUS_OS_CALLS)
 
@@ -204,6 +467,53 @@ def _find_dangerous_pattern_fallback(code: str) -> Optional[str]:
             return keyword
     return None
 
+def _is_wait_timeout(error: BaseException) -> bool:
+    """True when ``container.wait`` gave up because the container ran past its
+    timeout. docker-py surfaces that as a requests timeout, or, over the Unix
+    socket adapter, as a ConnectionError wrapping urllib3's ReadTimeoutError;
+    any other error is the daemon failing, not the container running long."""
+    if isinstance(error, requests.exceptions.Timeout):
+        return True
+    if not isinstance(error, requests.exceptions.ConnectionError):
+        return False
+    for arg in error.args:
+        # The adapter wraps the read timeout directly, or in a MaxRetryError
+        # whose reason is the timeout; only an untyped cause falls back to
+        # the message text.
+        if isinstance(arg, urllib3.exceptions.ReadTimeoutError):
+            return True
+        if isinstance(getattr(arg, "reason", None), urllib3.exceptions.ReadTimeoutError):
+            return True
+        if isinstance(arg, str) and "timed out" in arg.lower():
+            return True
+    return False
+
+
+def _read_capped_logs(container: Any, max_bytes: int, *, stdout: bool, stderr: bool) -> str:
+    """One stream of the container log, read as a stream and stopped at
+    ``max_bytes`` so a noisy container never loads its whole log (up to the
+    10 MB json-file cap) into this process."""
+    stream = container.logs(stdout=stdout, stderr=stderr, stream=True, follow=False)
+    chunks: List[bytes] = []
+    size = 0
+    truncated = False
+    try:
+        for chunk in stream:
+            room = max_bytes - size
+            if len(chunk) > room:
+                chunks.append(chunk[:room])
+                truncated = True
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    return output + "\n[output truncated]" if truncated else output
+
+
 def _sanitize_log_msg(msg: str) -> str:
     """Strip newline characters to prevent log injection."""
     return str(msg).replace('\n', ' ').replace('\r', ' ')
@@ -247,9 +557,11 @@ class SecureCodeExecutor:
         # on-disk JSON unboundedly.
         self.max_result_bytes = 2 * 1024 * 1024
         self.execution_count = 0
-        
-        # Docker image to use
-        self.image = "amancevice/pandas:slim"
+
+        # Docker image to use: pinned by digest (#322).
+        self.image = _sandbox_image()
+        self._daemon_mode_cache: Optional[str] = None
+        self._workspace_users: Dict[str, int] = {}
     
     def execute(self, code: str, context: Dict[str, Any]) -> Tuple[bool, Optional[str], Any]:
         """
@@ -279,25 +591,41 @@ class SecureCodeExecutor:
         # 2. Create temporary directory for data exchange
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
+                # All three files are read by python3 inside the container, which
+                # decodes source as UTF-8 (PEP 263 default). Write UTF-8 here so a
+                # non-UTF-8 host locale can't corrupt a non-ASCII byte on the way
+                # in.
                 # Write context data
                 context_file = os.path.join(tmpdir, "context.json")
-                with open(context_file, 'w') as f:
+                with open(context_file, 'w', encoding='utf-8') as f:
                     # Serialize context (handle DataFrames if present)
                     serializable_context = self._serialize_context(context)
                     json.dump(serializable_context, f)
-                
-                # Write code to execute
+
+                # The untrusted user code runs in an ISOLATED namespace, not
+                # inline in the harness module scope (GHSA-j3x4). Write it to its
+                # own file so the harness can exec it with a restricted builtins
+                # set and a module allowlist; the harness (script.py) keeps full
+                # builtins to load context and serialize the result.
+                with open(os.path.join(tmpdir, "user_code.py"), 'w', encoding='utf-8') as f:
+                    f.write(code)
+
+                # Write the trusted harness.
                 code_file = os.path.join(tmpdir, "script.py")
-                with open(code_file, 'w') as f:
+                with open(code_file, 'w', encoding='utf-8') as f:
                     wrapped_code = self._wrap_code(code)
                     f.write(wrapped_code)
                 
                 logger.debug(f"Context and code written to {tmpdir}")
-                
-                # 3. Run in Docker container
+
+                # 3. Run in Docker container, under the process-wide sandbox
+                # concurrency bound (#446).
                 try:
-                    self._run_in_container(tmpdir, execution_id)
-                    
+                    self._hand_workspace_to_container_user(tmpdir)
+                    if not self._run_in_container_bounded(tmpdir, execution_id):
+                        logger.warning("Sandbox capacity reached, rejecting %s", execution_id)
+                        return False, SANDBOX_CAPACITY_REACHED, None
+
                     # 4. Parse result
                     result_file = os.path.join(tmpdir, "result.json")
                     if os.path.exists(result_file):
@@ -330,17 +658,165 @@ class SecureCodeExecutor:
                     safe_image = _sanitize_log_msg(str(self.image))
                     logger.exception("Docker image not found: %s", safe_image)
                     return False, f"Docker image '{safe_image!s}' not found. Please pull it first.", None
-                    
+
+                except SandboxUnavailable:
+                    logger.exception("Sandbox cannot run this execution")
+                    return False, SECURE_RUNTIME_UNAVAILABLE, None
+
                 except Exception as e:
                     logger.exception("Unexpected execution error")
                     return False, f"Execution error: {e!s}", None
-                    
+
+                finally:
+                    self._release_workspace_user(tmpdir)
+                                        
         except OSError as e:
             logger.exception("Failed to create temporary directory")
             return False, f"Setup error: {e!s}", None
     
-    def _run_in_container(self, tmpdir: str, execution_id: str) -> Any:
-        """Run code in Docker container with resource limits."""
+    def _daemon_mode(self) -> str:
+        """How the Docker daemon maps container users: "rootless" (container
+        root is the unprivileged daemon owner), "userns" (userns-remap), or
+        "default". Raises SandboxUnavailable when the daemon cannot be asked,
+        so an unknown mapping is never guessed; a known answer is cached."""
+        cached = getattr(self, "_daemon_mode_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            options = self.client.info().get("SecurityOptions") or []
+        except Exception as e:
+            raise SandboxUnavailable("Could not read the Docker daemon's security options") from e
+        names = [str(option) for option in options] if isinstance(options, list) else []
+        if any("name=rootless" in name for name in names):
+            mode = "rootless"
+        elif any("name=userns" in name for name in names):
+            mode = "userns"
+        else:
+            mode = "default"
+        self._daemon_mode_cache = mode
+        return mode
+
+    def _container_user(self, tmpdir: Optional[str] = None) -> str:
+        """The uid:gid the execute() container runs as; never a privileged root.
+
+        The exchange directory is the host's private 0700 temp directory, so
+        the container runs as its owner:
+        - this process is not root: the host user;
+        - this process is root: the fresh uid execute() handed the workspace
+          to (see _hand_workspace_to_container_user), never a shared one;
+        - a rootless daemon, run by the same non-root user: container root,
+          which that daemon maps to the host user;
+        - Docker Desktop (no getuid): 65534, as the folder is shared with any
+          container user.
+        A root process with a rootless daemon, or a userns-remap daemon, maps
+        container users away from the directory's owner, so those are refused
+        (SandboxUnavailable) rather than run with a directory they cannot use.
+        """
+        getuid = getattr(os, "getuid", None)
+        if getuid is None:
+            return f"{_UNPRIVILEGED_UID}:{_UNPRIVILEGED_UID}"
+        mode = self._daemon_mode()
+        uid = getuid()
+        if mode == "userns":
+            raise SandboxUnavailable("A userns-remap Docker daemon cannot use the sandbox workspace")
+        if mode == "rootless":
+            if uid == 0:
+                raise SandboxUnavailable("A root process cannot hand the workspace to a rootless daemon")
+            return "0:0"
+        if uid != 0:
+            return f"{uid}:{os.getgid()}"
+        handed = getattr(self, "_workspace_users", {}).get(tmpdir) if tmpdir else None
+        if handed is None:
+            # Not a workspace execute() prepared: run as a fresh uid that owns
+            # nothing on the host, which can only fail closed.
+            handed = _random_sandbox_uid()
+        return f"{handed}:{handed}"
+
+    def _hand_workspace_to_container_user(self, tmpdir: str) -> None:
+        """When this process is root under a default daemon, give the private
+        exchange directory to a fresh uid no other host process has, so it
+        stays 0700 and private to this execution.
+
+        The files are re-owned first, without following links and only if
+        they are regular files, and the directory last: until then it is
+        still root's, so nothing can swap an entry in between.
+        """
+        getuid = getattr(os, "getuid", None)
+        if getuid is None or getuid() != 0 or self._daemon_mode() != "default":
+            return
+        uid = _claim_sandbox_uid()
+        self._workspace_users[tmpdir] = uid
+        for name in os.listdir(tmpdir):
+            path = os.path.join(tmpdir, name)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                raise SandboxUnavailable(f"Unexpected non-regular workspace entry: {name}")
+            os.chown(path, uid, uid, follow_symlinks=False)
+        os.chown(tmpdir, uid, uid, follow_symlinks=False)
+
+    def _release_workspace_user(self, tmpdir: str) -> None:
+        uid = getattr(self, "_workspace_users", {}).pop(tmpdir, None)
+        if uid is not None:
+            _release_sandbox_uid(uid)
+
+    def _run_in_container_bounded(self, tmpdir: str, execution_id: str) -> bool:
+        """Run the container under the process-wide sandbox slot (#446).
+
+        Returns False if no slot was available within the acquire timeout (the
+        caller rejects the request). Otherwise runs the container and returns
+        True; container errors propagate to the caller. The slot covers the whole
+        container lifetime and is released once the container is confirmed
+        removed; if removal could not be confirmed the slot is intentionally held,
+        because a leaked container still consumes resources (fail closed).
+        """
+        if not _sandbox_slots.acquire(timeout=_SANDBOX_ACQUIRE_TIMEOUT_SECONDS):
+            return False
+        # Default: nothing leaked (released). Only a container that was created
+        # and could not be removed sets leaked=True; a failure before creation
+        # leaks nothing, so the slot frees.
+        cleanup_status: Dict[str, Any] = {"leaked": False}
+        try:
+            self._run_in_container(tmpdir, execution_id, cleanup_status)
+        finally:
+            if cleanup_status["leaked"]:
+                logger.error(
+                    "Holding sandbox slot for %s: container removal unconfirmed",
+                    execution_id,
+                )
+            else:
+                _sandbox_slots.release()
+        return True
+
+    def _remove_container(self, container, execution_id: str) -> bool:
+        """Force-remove the container, with one retry. Returns True if it is
+        confirmed gone, False if removal failed (the container may still run).
+
+        A NotFound on either attempt counts as confirmed gone — the container is
+        already removed (for example the first call removed it but its response
+        timed out), so the slot is safe to release."""
+        try:
+            container.remove(force=True)
+            return True
+        except docker.errors.NotFound:
+            return True
+        except Exception:
+            time.sleep(0.5)
+        try:
+            container.remove(force=True)
+            return True
+        except docker.errors.NotFound:
+            return True
+        except Exception:
+            logger.warning(
+                "Failed to remove sandbox container for %s", execution_id,
+                exc_info=True,
+            )
+            return False
+
+    def _run_in_container(self, tmpdir: str, execution_id: str, cleanup_status: Optional[Dict[str, Any]] = None) -> Any:
+        """Run code in Docker container with resource limits.
+
+        cleanup_status, if given, receives {'removed': bool} so the caller can
+        hold the concurrency slot when a container could not be removed (#446)."""
         logger.info(f"Launching container for {execution_id}")
         
         # Use pre-built pandas image
@@ -356,7 +832,7 @@ class SecureCodeExecutor:
         create_kwargs = {
             "image": self.image,
             "command": cmd,
-            "volumes": {tmpdir: {'bind': '/workspace', 'mode': 'rw'}},
+            "volumes": {tmpdir: {'bind': _WORKSPACE, 'mode': 'rw'}},
             "mem_limit": self.memory_limit,
             "cpu_period": 100000,
             "cpu_quota": int(self.cpu_limit * 100000),
@@ -369,6 +845,9 @@ class SecureCodeExecutor:
                 config={"max-size": "10m", "max-file": "1"},
             ),
             "pids_limit": self.pids_limit,
+            # #322: read-only root, no capabilities, never root.
+            **_EXECUTE_HARDENING,
+            "user": self._container_user(tmpdir),
         }
         try:
             container = self.client.containers.create(**create_kwargs)
@@ -411,18 +890,127 @@ class SecureCodeExecutor:
             # the operator signal — alert on it; a daemon-side reaper
             # (label-filtered `docker container prune`) remains follow-up
             # material if leak accumulation is ever observed.
-            try:
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    time.sleep(0.5)
-                    container.remove(force=True)
-            except Exception:
-                logger.warning(
-                    "Failed to remove sandbox container for %s", execution_id,
-                    exc_info=True,
-                )
+            #
+            # #446: the removal outcome is reported so the caller holds the
+            # concurrency slot when the container could not be confirmed gone —
+            # a leaked container still consumes host resources, so admitting a
+            # replacement would exceed the bound (fail closed on the slot).
+            removed = self._remove_container(container, execution_id)
+            if cleanup_status is not None and not removed:
+                cleanup_status["leaked"] = True
     
+    def run_isolated(
+        self,
+        command: List[str],
+        *,
+        image: str,
+        timeout: float,
+        environment: Optional[Dict[str, str]] = None,
+        max_output_bytes: int = _DEFAULT_ISOLATED_OUTPUT_BYTES,
+    ) -> Tuple[int, str, str]:
+        """Run ``command`` in a hardened container.
+
+        For analysis tools that import, and therefore execute, untrusted code
+        (#431). The container has no network, a read-only root, no
+        capabilities, no privilege escalation and runs as an unprivileged
+        user (see ``_ISOLATED_HARDENING``), under the same memory, CPU, PID
+        and process-wide concurrency bounds as ``execute``. Nothing on the
+        host is mounted or written: inputs travel in ``environment`` (each
+        value at most ``MAX_ISOLATED_ENV_VALUE_BYTES``), and the command's
+        only writable path is its working directory, a private tmpfs. The
+        image is never pulled: it must already exist on the daemon.
+
+        Returns ``(exit_code, stdout, stderr)``, each stream of the container
+        log read separately and capped at ``max_output_bytes``. Raises ``SandboxUnavailable`` when the
+        run cannot happen in the sandbox (no Docker, no free slot, missing
+        image, daemon or connection error), ``ExecutionError`` when it
+        exceeds ``timeout`` and ``ValueError`` for an oversized input. There
+        is no host fallback.
+        """
+        environment = dict(environment or {})
+        for name, value in environment.items():
+            if len(str(value).encode("utf-8")) > MAX_ISOLATED_ENV_VALUE_BYTES:
+                raise ValueError(f"Isolated input {name} exceeds {MAX_ISOLATED_ENV_VALUE_BYTES} bytes")
+        if not self.is_available():
+            raise SandboxUnavailable(SECURE_RUNTIME_UNAVAILABLE)
+
+        self.execution_count += 1
+        execution_id = f"isolated_{self.execution_count}"
+        create_kwargs = {
+            "image": image,
+            "command": list(command),
+            "environment": {**_ISOLATED_BASE_ENVIRONMENT, **environment},
+            "mem_limit": self.memory_limit,
+            "cpu_period": 100000,
+            "cpu_quota": int(self.cpu_limit * 100000),
+            "network_mode": "none",
+            "log_config": LogConfig(
+                type=LogConfig.types.JSON,
+                config={"max-size": "10m", "max-file": "1"},
+            ),
+            "pids_limit": self.pids_limit,
+            **_ISOLATED_HARDENING,
+        }
+        if not _sandbox_slots.acquire(timeout=_SANDBOX_ACQUIRE_TIMEOUT_SECONDS):
+            raise SandboxUnavailable(SANDBOX_CAPACITY_REACHED)
+        cleanup_status: Dict[str, Any] = {"leaked": False}
+        try:
+            return self._run_isolated_container(
+                create_kwargs, execution_id, timeout, max_output_bytes, cleanup_status
+            )
+        except docker.errors.ImageNotFound as e:
+            raise SandboxUnavailable(
+                f"Sandbox image '{_sanitize_log_msg(image)}' is not available on the Docker daemon"
+            ) from e
+        except (docker.errors.DockerException, requests.exceptions.RequestException) as e:
+            # docker-py wraps HTTP status errors in DockerException but lets
+            # transport failures (the daemon socket dropping after ping) through
+            # as requests exceptions; both mean the sandbox could not run.
+            raise SandboxUnavailable(f"Sandbox runtime error: {_sanitize_log_msg(e)}") from e
+        finally:
+            if cleanup_status["leaked"]:
+                logger.error(
+                    "Holding sandbox slot for %s: container removal unconfirmed",
+                    execution_id,
+                )
+            else:
+                _sandbox_slots.release()
+
+    def _run_isolated_container(
+        self,
+        create_kwargs: Dict[str, Any],
+        execution_id: str,
+        timeout: float,
+        max_output_bytes: int,
+        cleanup_status: Dict[str, Any],
+    ) -> Tuple[int, str, str]:
+        """Create, start and wait for one isolated container; read its exit
+        code and capped stdout and stderr before it is removed (the same create/start/
+        remove lifecycle as ``_run_in_container``, which stays untouched)."""
+        container = self.client.containers.create(**create_kwargs)
+        try:
+            container.start()
+            try:
+                wait_result = container.wait(timeout=timeout)
+            except Exception as e:
+                try:
+                    container.kill()
+                except Exception:
+                    logger.debug("Failed to kill isolated container", exc_info=True)
+                if _is_wait_timeout(e):
+                    raise ExecutionError(f"Execution timed out after {timeout}s") from e
+                raise  # a daemon error, not a timeout: run_isolated reports it as unavailable
+            status = wait_result.get("StatusCode") if isinstance(wait_result, dict) else None
+            exit_code = status if isinstance(status, int) else -1
+            return (
+                exit_code,
+                _read_capped_logs(container, max_output_bytes, stdout=True, stderr=False),
+                _read_capped_logs(container, max_output_bytes, stdout=False, stderr=True),
+            )
+        finally:
+            if not self._remove_container(container, execution_id):
+                cleanup_status["leaked"] = True
+
     def _is_safe_code(self, code: str) -> DiagnosticResult:
         """
         Use AST analysis to validate code safety.
@@ -516,22 +1104,32 @@ class SecureCodeExecutor:
         return serialized
     
     def _wrap_code(self, user_code: str) -> str:
-        """
-        Wrap user code with safety harness and I/O handling.
-        
-        This wrapper:
-        1. Loads context from JSON
-        2. Reconstructs DataFrames if present
-        3. Executes user code
-        4. Saves result to JSON
-        5. Catches all exceptions
+        """Build the trusted harness that runs the untrusted user code in an
+        ISOLATED namespace (GHSA-j3x4).
+
+        The harness keeps full builtins (it loads context and serializes the
+        result), but the user code — read from user_code.py — is exec'd in a
+        namespace whose ``__builtins__`` is a capability allowlist and whose
+        ``__import__`` permits only a safe set of modules. The static gates key
+        on identifier syntax and can be defeated (names assembled from string
+        literals, ``getattr`` with string constants, ``sys.modules``
+        re-acquisition, stored references); once ``eval``/``exec``/``getattr``/
+        ``vars``/``__import__``/``sys.modules`` and the os/subprocess/socket/…
+        modules are simply absent at runtime, those bypasses reach nothing.
+
+        ``user_code`` is accepted for signature compatibility but is NOT inlined;
+        it is written to user_code.py by the caller and read back here.
         """
         return f'''
 import json
 import sys
+import builtins as _builtins
 import numpy as np
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
-# Custom encoder for NumPy types
 class QwedEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer): return int(obj)
@@ -539,30 +1137,76 @@ class QwedEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray): return obj.tolist()
         return super().default(obj)
 
-# Load context
+# --- capability allowlist (GHSA-j3x4) -------------------------------------
+# Only these modules may be imported by the executed code; everything that
+# reaches a process/file/network/reflection primitive is absent.
+_ALLOWED_MODULES = {{
+    "numpy", "pandas", "scipy", "sklearn", "statsmodels", "patsy",
+    "math", "cmath", "statistics", "decimal", "fractions", "random",
+    "datetime", "json", "re", "collections", "itertools", "functools",
+    "operator", "array", "bisect", "heapq", "string", "typing",
+}}
+# Safe builtins only. Absent on purpose: eval, exec, compile, __import__
+# (replaced by a guarded import below), getattr, setattr, delattr, vars,
+# globals, locals, open, input, memoryview — the reflection and
+# code/module-acquisition capabilities the bypasses depend on.
+_SAFE_BUILTIN_NAMES = (
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "complex", "dict", "divmod", "enumerate", "filter",
+    "float", "format", "frozenset", "hash", "hex", "int", "isinstance",
+    "issubclass", "iter", "len", "list", "map", "max", "min", "next", "oct",
+    "ord", "pow", "print", "range", "repr", "reversed", "round", "set",
+    "slice", "sorted", "str", "sum", "tuple", "type", "zip",
+    "True", "False", "None",
+    "Exception", "ArithmeticError", "ZeroDivisionError", "OverflowError",
+    "ValueError", "TypeError", "KeyError", "IndexError", "AttributeError",
+    "RuntimeError", "StopIteration", "NotImplementedError", "FloatingPointError",
+)
+_safe_builtins = {{}}
+for _n in _SAFE_BUILTIN_NAMES:
+    if hasattr(_builtins, _n):
+        _safe_builtins[_n] = getattr(_builtins, _n)
+
+_real_import = _builtins.__import__
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".")[0] if name else name
+    if level != 0 or root not in _ALLOWED_MODULES:
+        raise ImportError("import of %r is not permitted in the sandbox (GHSA-j3x4)" % (name,))
+    return _real_import(name, globals, locals, fromlist, level)
+_safe_builtins["__import__"] = _guarded_import
+
+# Isolated namespace for the executed code. Pre-bind the scientific modules the
+# generated code uses (np/pd) so it need not import them; nothing dangerous.
+_sandbox = {{"__builtins__": _safe_builtins, "np": np, "numpy": np}}
+if pd is not None:
+    _sandbox["pd"] = pd
+    _sandbox["pandas"] = pd
+
+# Load context (trusted harness, full builtins) into the sandbox namespace.
 with open('/workspace/context.json', 'r') as f:
     context = json.load(f)
-
-# Reconstruct DataFrames if present
 for key, value in context.items():
     if isinstance(value, dict) and value.get('_type') == 'dataframe':
+        if pd is None:
+            print("pandas unavailable; cannot reconstruct DataFrame", file=sys.stderr)
+            continue
         try:
-            import pandas as pd
-            df = pd.DataFrame(value['data'])
-            globals()[key] = df
+            _sandbox[key] = pd.DataFrame(value['data'])
         except Exception as e:
             print(f"Failed to reconstruct DataFrame: {{e}}", file=sys.stderr)
     else:
-        globals()[key] = value
+        _sandbox[key] = value
+
+# Read and run the untrusted user code in the isolated namespace.
+with open('/workspace/user_code.py', 'r') as f:
+    _user_src = f.read()
 
 try:
-    # User code executes here
-{self._indent_code(user_code, spaces=4)}
+    exec(compile(_user_src, 'user_code.py', 'exec'), _sandbox)
 
-    # Save result (user code should set 'result' variable)
-    if 'result' in globals():
-        res = globals()['result']
-        # Handle DataFrame results
+    # Save result (user code should set 'result').
+    if 'result' in _sandbox:
+        res = _sandbox['result']
         if hasattr(res, 'to_dict'):
             payload = {{'result': res.to_dict(orient='records')}}
         else:
@@ -591,7 +1235,7 @@ try:
         with open('/workspace/result.json', 'w') as f:
             json.dump({{'error': 'Code did not set result variable'}}, f)
         sys.exit(1)
-        
+
 except Exception as e:
     # Save error
     with open('/workspace/result.json', 'w') as f:
@@ -622,6 +1266,3 @@ except Exception as e:
             return False
 
 
-class ExecutionError(Exception):
-    """Raised when code execution fails."""
-    pass
