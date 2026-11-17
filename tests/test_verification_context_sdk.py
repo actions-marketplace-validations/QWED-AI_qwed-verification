@@ -54,8 +54,9 @@ def test_sdk_verification_context_methods_call_endpoints(monkeypatch):
         query="mean of a == 2",
         verifier="TestVerifier",
     )
-    client.validate_verification_context({"spec_version": "1.0"})
-    client.resolve_verification_context({"spec_version": "1.0"})
+    # The schema and commitment alone; the attestation is #319's tests'.
+    client.validate_verification_context({"spec_version": "1.0"}, require_attestation=False)
+    client.resolve_verification_context({"spec_version": "1.0"}, require_attestation=False)
 
     assert calls == [
         (
@@ -69,6 +70,6 @@ def test_sdk_verification_context_methods_call_endpoints(monkeypatch):
                 "attestation_token": None,
             },
         ),
-        ("POST", "/verification-context/validate", {"document": {"spec_version": "1.0"}}),
-        ("POST", "/verification-context/resolve", {"document": {"spec_version": "1.0"}}),
+        ("POST", "/verification-context/validate", {"document": {"spec_version": "1.0"}, "require_attestation": False}),
+        ("POST", "/verification-context/resolve", {"document": {"spec_version": "1.0"}, "require_attestation": False}),
     ]

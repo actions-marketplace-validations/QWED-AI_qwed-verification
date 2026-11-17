@@ -22,6 +22,16 @@
 //! (`ADMIT` or `BLOCKED`) where the endpoint makes one, and a `proof_ref`
 //! when the status is `VERIFIED`. [`VerificationResponse::is_admitted`] is
 //! the only check to gate on.
+//!
+//! A VERIFIED answer also carries `attestation`, the server's signed token;
+//! [`QWEDClient::verify_attestation`] verifies it (see [`attestation`]).
+
+pub mod attestation;
+
+pub use attestation::{
+    check_admission, statement_hash, verify_attestation, AttestationClaims, AttestationError, AttestationOptions,
+    AttestedResult, Jwk, Jwks, QwedClaims, DEFAULT_ISSUER, JWKS_PATH,
+};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -117,6 +127,10 @@ pub struct VerificationResponse {
     pub admission: Option<Admission>,
     /// Set only when `status` is VERIFIED.
     pub proof_ref: Option<String>,
+    /// The server's signed attestation, an ES256 JWT, on a VERIFIED answer
+    /// that passed its trust step (#319). Verify it against the server's
+    /// keys at `/.well-known/jwks.json`. `None` otherwise.
+    pub attestation: Option<String>,
     pub agent_message: Option<String>,
     pub is_authoritative: Option<bool>,
     pub constraint_id: Option<String>,
@@ -134,6 +148,8 @@ struct WireResponse {
     admission: Option<Admission>,
     #[serde(default)]
     proof_ref: Option<String>,
+    #[serde(default)]
+    attestation: Option<String>,
     #[serde(default)]
     agent_message: Option<String>,
     #[serde(default)]
@@ -156,6 +172,7 @@ impl From<WireResponse> for VerificationResponse {
             raw_status: wire.status,
             admission: wire.admission,
             proof_ref: wire.proof_ref,
+            attestation: wire.attestation,
             agent_message: wire.agent_message,
             is_authoritative: wire.is_authoritative,
             constraint_id: wire.constraint_id,
@@ -262,6 +279,8 @@ pub struct QWEDClient {
     api_key: String,
     base_url: String,
     client: Client,
+    /// The server's attestation keys (#319), fetched one caller at a time.
+    jwks: attestation::KeyCache,
 }
 
 impl QWEDClient {
@@ -283,6 +302,7 @@ impl QWEDClient {
                 .timeout(timeout)
                 .build()
                 .expect("Failed to create HTTP client"),
+            jwks: Default::default(),
         }
     }
 
@@ -403,7 +423,7 @@ impl QWEDClient {
 
 /// Whether the server admitted the result. Same as
 /// [`VerificationResponse::is_admitted`].
-#[deprecated(since = "7.3.1", note = "use VerificationResponse::is_admitted; a `verified` field is not an admission decision")]
+#[deprecated(since = "8.0.0", note = "use VerificationResponse::is_admitted; a `verified` field is not an admission decision")]
 pub fn is_verified(response: &VerificationResponse) -> bool {
     response.is_admitted()
 }
@@ -501,15 +521,24 @@ mod tests {
     fn test_envelope_fields_still_parse_through_the_wire_type() {
         let r = response(
             r#"{"status":"VERIFIED","admission":"ADMIT","proof_ref":"sha256:ab","agent_message":"ok",
-                "is_authoritative":true,"constraint_id":"c","developer_fields":{"is_valid":true},"is_valid":true}"#,
+                "is_authoritative":true,"constraint_id":"c","developer_fields":{"is_valid":true},"is_valid":true,
+                "attestation":"t"}"#,
         );
         assert!(r.is_admitted());
+        assert_eq!(r.attestation.as_deref(), Some("t"));
         assert_eq!(r.agent_message.as_deref(), Some("ok"));
         assert_eq!(r.is_authoritative, Some(true));
         assert_eq!(r.constraint_id.as_deref(), Some("c"));
         assert_eq!(r.developer_fields.unwrap()["is_valid"], true);
         assert_eq!(r.extra["is_valid"], true);
-        for key in ["status", "admission", "proof_ref", "agent_message", "developer_fields"] {
+        for key in [
+            "status",
+            "admission",
+            "proof_ref",
+            "agent_message",
+            "developer_fields",
+            "attestation",
+        ] {
             assert!(!r.extra.contains_key(key), "{key} leaked into extra");
         }
         // A field of the wrong type is still an error.

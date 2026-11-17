@@ -30,6 +30,23 @@ services:
       - QWED_JWT_SECRET_KEY=${QWED_JWT_SECRET_KEY:?set QWED_JWT_SECRET_KEY}
       - QWED_API_KEY_LOOKUP_SECRET=${QWED_API_KEY_LOOKUP_SECRET:?set QWED_API_KEY_LOOKUP_SECRET}
       - QWED_AUDIT_SECRET_KEY=${QWED_AUDIT_SECRET_KEY:?set QWED_AUDIT_SECRET_KEY}
+      # Attestation signing key (#319), optional: unset, the server generates
+      # one per process and its attestations do not survive a restart. Set
+      # one: the PEM, or the path of a key file mounted into the container.
+      - QWED_SIGNING_KEY=${QWED_SIGNING_KEY:-}
+      - QWED_SIGNING_KEY_FILE=${QWED_SIGNING_KEY_FILE:-}
+      # How long an attestation stays valid, in seconds (#319): unset is 24
+      # hours; 60 to 2592000 (30 days), anything else stops the server.
+      - QWED_ATTESTATION_TTL_SECONDS=${QWED_ATTESTATION_TTL_SECONDS:-}
+      # Maths limits (#591), optional, passed by name: Compose takes each
+      # from the shell or deploy/.env, and one set in neither stays unset in
+      # the container, so the server keeps its default. A value the server
+      # cannot use stops it; deploy/.env.example lists the ranges.
+      - QWED_MATH_WORKERS
+      - QWED_MATH_TIMEOUT_SECONDS
+      - QWED_MATH_MAX_WAITING
+      - QWED_MATH_WORKER_MEMORY_MB
+      - QWED_BATCH_MATH_BUDGET_SECONDS
       # All-tenant metrics operator allowlist (issue #337): user IDs permitted
       # to read /metrics and /metrics/prometheus. Unset = deny every caller,
       # including the Prometheus scraper. Set it to the scraper identity's

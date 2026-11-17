@@ -2,19 +2,19 @@
 
 Official Go SDK for the [QWED Verification Protocol](https://github.com/QWED-AI/qwed-verification).
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/QWED-AI/qwed-verification/sdk-go/v7.svg)](https://pkg.go.dev/github.com/QWED-AI/qwed-verification/sdk-go/v7)
-[![Go Report Card](https://goreportcard.com/badge/github.com/QWED-AI/qwed-verification/sdk-go/v7)](https://goreportcard.com/report/github.com/QWED-AI/qwed-verification/sdk-go/v7)
+[![Go Reference](https://pkg.go.dev/badge/github.com/QWED-AI/qwed-verification/sdk-go/v10.svg)](https://pkg.go.dev/github.com/QWED-AI/qwed-verification/sdk-go/v10)
+[![Go Report Card](https://goreportcard.com/badge/github.com/QWED-AI/qwed-verification/sdk-go/v10)](https://goreportcard.com/report/github.com/QWED-AI/qwed-verification/sdk-go/v10)
 [![CI](https://github.com/QWED-AI/qwed-verification/actions/workflows/ci.yml/badge.svg)](https://github.com/QWED-AI/qwed-verification/actions)
 
 ## Installation
 
 ```bash
-go get github.com/QWED-AI/qwed-verification/sdk-go/v7
+go get github.com/QWED-AI/qwed-verification/sdk-go/v10
 ```
 
 The module lives in the `sdk-go/` subdirectory and tracks the main QWED version
-line, so it carries the `/v7` major-version suffix and is released under
-`sdk-go/vX.Y.Z` tags — e.g. `go get github.com/QWED-AI/qwed-verification/sdk-go/v7@v7.3.0`.
+line, so it carries the `/v10` major-version suffix and is released under
+`sdk-go/vX.Y.Z` tags, such as `go get github.com/QWED-AI/qwed-verification/sdk-go/v10@v10.0.0`.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ import (
     "fmt"
     "log"
 
-    qwed "github.com/QWED-AI/qwed-verification/sdk-go/v7"
+    qwed "github.com/QWED-AI/qwed-verification/sdk-go/v10"
 )
 
 func main() {
@@ -52,18 +52,61 @@ Every verification returns the server's DiagnosticResult envelope:
 |-------|---------|
 | `Status` | `StatusVerified`, `StatusUnverifiable` or `StatusBlocked` (`StatusUnknown` for a missing value or one this SDK does not know) |
 | `RawStatus` | The server's status text exactly as sent, such as `SAT` where `Status` is `StatusUnknown`; never used for admission |
-| `Admission` | `AdmissionAdmit` or `AdmissionBlocked` where the endpoint decides (`AdmissionUnknown` for a value this SDK does not know); empty where it does not, as on `/verify/logic`, `/verify/fact` and batch items |
+| `Admission` | `AdmissionAdmit` or `AdmissionBlocked` where the endpoint decides (`AdmissionUnknown` for a value this SDK does not know); empty where it does not, as on `/verify/fact` and batch fact items |
 | `ProofRef` | Set only when `Status` is `StatusVerified` |
+| `Attestation` | On a `StatusVerified` answer, the server's signed token: an ES256 JWT whose header `kid` names a key at `GET /.well-known/jwks.json`, and whose `qwed.proof_hash` claim is the answer's `ProofRef`. Verify it with `client.VerifyAttestation` (below). |
 | `AgentMessage`, `DeveloperFields`, `IsAuthoritative`, `ConstraintID` | Explanation and detail |
 | `Extra` | The endpoint's own fields, such as `is_valid`, `issues` or `error`. Numbers here and in `DeveloperFields` are `json.Number`, so they keep their exact text |
 
 **Gate on `IsAdmitted()`, not on `Status`.** `VERIFIED` means the engine reached a deterministic answer, not that the claim holds: `2 + 2 = 5` is `VERIFIED · BLOCKED` (proven false), and unsafe code is `VERIFIED · BLOCKED` (proven unsafe). `IsAdmitted()` is true only for `ADMIT` together with `VERIFIED` and a `ProofRef`; a missing or unknown admission is never admitted.
 
-The `Verified` field and `IsVerified()` are deprecated. Decoding always sets `Verified` to `IsAdmitted()`, whatever the body says, and `IsVerified()` returns `IsAdmitted()`. Endpoints that make no admission decision (`/verify/logic`, `/verify/fact`, `/verify/rag`, `/verify/process` and batch items today) are therefore never admitted. `/verify/rag` and `/verify/process` do send a top-level `verified`, which is their guard's own result; it is kept in `Extra["verified"]` and `DeveloperFields["verified"]`.
+The `Verified` field and `IsVerified()` are deprecated. Decoding always sets `Verified` to `IsAdmitted()`, whatever the body says, and `IsVerified()` returns `IsAdmitted()`. Endpoints that make no admission decision (`/verify/fact`, `/verify/rag`, `/verify/process`, and batch fact items) are therefore never admitted. `/verify/logic` and batch logic items decide one as `/verify/natural_language` does: their verdict covers the constraints an LLM translated the question into, so the admission is `AdmissionBlocked` until QWED verifies the translation itself ([#585](https://github.com/QWED-AI/qwed-verification/issues/585)). `/verify/rag` and `/verify/process` return `StatusUnverifiable`: what their guards check comes from the request itself, so the guard's result is advisory only, in `developer_fields.advisory_checks` ([#320](https://github.com/QWED-AI/qwed-verification/issues/320)). An older server also sent the guard's result as a top-level `verified`; it is kept in `Extra["verified"]` and `DeveloperFields["verified"]`.
+
+### Verifying the attestation
+
+Every `StatusVerified` answer carries `Attestation`, an ES256 JWT the server
+signed after checking the verdict. Verifying it shows that server issued a
+VERIFIED verdict for this answer's `ProofRef` (and, when you pass `Query`,
+for that statement). On a route that decides an admission (maths, code,
+SQL and natural language, the agent route, and their batch items), the
+token signs that too, and `VerifyAttestation`
+checks it is the answer's `Admission`. It covers only what the token signs,
+not other fields of the response such as `AgentMessage`:
+
+```go
+result, err := client.VerifyMath(ctx, "2+2=4")
+if err != nil {
+    log.Fatal(err)
+}
+// Fetches /.well-known/jwks.json (cached for five minutes), then checks the
+// signature, issuer, expiry (and any nbf), a VERIFIED status, and that the
+// token is this answer's (its proof_hash is result.ProofRef). If no cached
+// key verifies it, the keys are fetched once more, at most once every 30 s,
+// to pick up a rotated key or a restarted server's new one.
+claims, err := client.VerifyAttestation(ctx, result, qwed.AttestationOptions{Query: "2+2=4"})
+if err != nil {
+    log.Printf("attestation does not verify for this answer: %v", err)
+} else {
+    log.Printf("attested by %s", claims.Issuer)
+}
+```
+
+Every error wraps `ErrAttestation`. `ErrKeysUnavailable` says the keys could
+not be fetched; that failure is returned to every caller for 30 seconds
+after the fetch ends, without another request (a token the cached keys do
+not verify gets it too), and keys past their five minutes are not used
+instead. A caller waiting for another's fetch stops when its own context
+ends. `GetJWKS` returns a copy of the keys. To verify offline, or against
+keys you pinned, call
+`qwed.VerifyAttestation(token, &jwks, proofRef, opts)` (set `opts.Admission` to check the
+admission; for an answer without one, `qwed.CheckAdmission(claims, "")` requires
+that the token signs none) with the JWKS you
+hold. A token says the server reached the verdict; whether to act on it is
+still `IsAdmitted()`.
 
 ## Features
 
-- **Zero Dependencies** - Uses only Go standard library
+- **Zero Dependencies** - Uses only Go standard library, attestation checks included
 - **Context Support** - All methods accept `context.Context` for cancellation
 - **Mockable** - Implements `Verifier` interface for easy testing
 - **Type Safe** - Full type definitions for all requests/responses

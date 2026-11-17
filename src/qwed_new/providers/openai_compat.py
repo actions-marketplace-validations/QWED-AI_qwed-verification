@@ -17,7 +17,13 @@ from typing import Dict, Any, List
 
 from openai import OpenAI
 from qwed_new.core.schemas import MathVerificationTask
-from qwed_new.providers.base import LLMProvider
+from qwed_new.providers.base import (
+    LLMProvider,
+    configured_model,
+    logic_translation_system,
+    translation_request,
+    translation_system,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +48,12 @@ class OpenAICompatProvider(LLMProvider):
     ):
         self.base_url = base_url or os.getenv("CUSTOM_BASE_URL")
         self.api_key = api_key or os.getenv("CUSTOM_API_KEY")
-        self.model = model or os.getenv("CUSTOM_MODEL", "gpt-4o-mini")
 
         if not self.base_url:
             raise ValueError(
                 "Base URL not found. Set CUSTOM_BASE_URL env var or run: qwed init"
             )
+        self.model = configured_model(model, "CUSTOM_MODEL", "the OpenAI-compatible provider")
 
         # Handle no-auth endpoints: use dummy key if None
         client_api_key = self.api_key if self.api_key else "dummy"
@@ -111,7 +117,7 @@ Convert natural language math to formal expressions.
 Respond with JSON: {"expression": "...", "claimed_answer": ..., "reasoning": "...", "confidence": 0.95}"""
 
         try:
-            result = self._call_json(system, user_query)
+            result = self._call_json(translation_system(system), translation_request(user_query))
             return MathVerificationTask(**result)
         except Exception as e:
             logger.debug("OpenAI-Compatible translation error: %s", type(e).__name__)
@@ -127,10 +133,10 @@ Rules:
   - "approval is required" -> "approval == 1"
   - "approval is not required" -> "approval == 0"
 - Avoid natural-language constraints.
-Respond with JSON: {"variables": {"x": "Int"}, "constraints": ["x > 0"], "goal": "SATISFIABILITY"}"""
+Respond with JSON: {"variables": {"x": "Int"}, "constraints": ["x > 5"], "claim": "x > 3", "goal": "VALIDITY"}"""
 
         try:
-            result = self._call_json(system, user_query)
+            result = self._call_json(logic_translation_system(system), translation_request(user_query))
             return LogicVerificationTask(**result)
         except Exception as e:
             logger.debug("OpenAI-Compatible logic translation error: %s", type(e).__name__)
@@ -139,11 +145,13 @@ Respond with JSON: {"variables": {"x": "Int"}, "constraints": ["x > 0"], "goal":
     def refine_logic(self, user_query: str, previous_error: str) -> 'LogicVerificationTask':
         from qwed_new.core.schemas import LogicVerificationTask
 
-        system = f"""You are a Logic Translator. Fix based on error: "{previous_error}"
-Respond with JSON: {{"variables": {{}}, "constraints": [], "goal": "SATISFIABILITY"}}"""
+        system = """You are a Logic Translator. Your previous translation of this question
+failed with the error in the <previous_error> tags. Fix the translation.
+Respond with JSON: {"variables": {}, "constraints": [], "goal": "SATISFIABILITY"}"""
 
+        request = translation_request(user_query, previous_error=previous_error)
         try:
-            result = self._call_json(system, user_query)
+            result = self._call_json(translation_system(system), request)
             return LogicVerificationTask(**result)
         except Exception as e:
             logger.debug("OpenAI-Compatible logic refinement error: %s", type(e).__name__)
@@ -155,7 +163,7 @@ Write code using Pandas. Dataset is in `df`. Assign result to `result`.
 Output ONLY Python code."""
 
         try:
-            return self._call_text(system, f"Columns: {columns}\nQuery: {query}")
+            return self._call_text(translation_system(system), translation_request(query, columns=columns))
         except Exception as e:
             logger.debug("OpenAI-Compatible stats translation error: %s", type(e).__name__)
             raise ValueError("OpenAI-Compatible stats translation failed.") from None

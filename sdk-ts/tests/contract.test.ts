@@ -41,8 +41,9 @@ describe('captured server responses', () => {
         ['code_unsafe', VerificationStatus.Verified, Admission.Blocked, true, false],
         ['sql', VerificationStatus.Verified, Admission.Admit, true, true],
         ['natural_language', VerificationStatus.Unverifiable, Admission.Blocked, false, false],
-        // /verify/logic and /verify/fact make no admission decision.
-        ['logic', VerificationStatus.Blocked, undefined, false, false],
+        // /verify/logic decides admission as /verify/natural_language does (#320).
+        ['logic', VerificationStatus.Blocked, Admission.Blocked, false, false],
+        // /verify/fact makes no admission decision.
         ['fact', VerificationStatus.Unverifiable, undefined, false, false],
     ] as const)('%s is %s / %s', (name, status, admission, proof, admitted) => {
         const r = response(name);
@@ -100,18 +101,18 @@ describe('captured server responses', () => {
 
         expect(batch.items.map(item => item.status)).toEqual(['completed', 'completed']);
         expect(batch.items.map(item => item.type)).toEqual(['math', 'math']);
+        // Both are decided: the second is proven false, as on /verify/math (#530).
         expect(batch.items.map(item => item.result?.status)).toEqual([
             VerificationStatus.Verified,
-            VerificationStatus.Unverifiable,
+            VerificationStatus.Verified,
         ]);
         expect(batch.items[0].result?.proof_ref).toMatch(/^sha256:/);
 
-        // Batch math items carry no admission decision today, so none is admitted.
-        for (const item of batch.items) {
-            expect(item.result?.admission).toBeUndefined();
-            expect(isAdmitted(item.result)).toBe(false);
-            expect(item.verified).toBe(false);
-        }
+        // Batch math items carry the admission /verify/math decides: the proven
+        // identity is admitted, the disproven one is not.
+        expect(batch.items.map(item => item.result?.admission)).toEqual([Admission.Admit, Admission.Blocked]);
+        expect(batch.items.map(item => isAdmitted(item.result))).toEqual([true, false]);
+        expect(batch.items.map(item => item.verified)).toEqual([true, false]);
     });
 });
 
@@ -417,11 +418,11 @@ describe('client', () => {
         expect(isAdmitted(await client.verifyCode('unsafe code placeholder'))).toBe(false);
     });
 
-    it('verifyLogic parses a response without an admission', async () => {
+    it('verifyLogic parses a blocked response', async () => {
         serve('logic');
         const r = await client.verifyLogic('(A AND B) implies B');
         expect(r.status).toBe(VerificationStatus.Blocked);
-        expect(r.admission).toBeUndefined();
+        expect(r.admission).toBe(Admission.Blocked);
         expect(isAdmitted(r)).toBe(false);
     });
 
@@ -433,6 +434,6 @@ describe('client', () => {
         ]);
         expect(batch.items).toHaveLength(2);
         expect(batch.items[0].result?.status).toBe(VerificationStatus.Verified);
-        expect(batch.items.some(item => isAdmitted(item.result))).toBe(false);
+        expect(batch.items.map(item => isAdmitted(item.result))).toEqual([true, false]);
     });
 });

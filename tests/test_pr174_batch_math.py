@@ -11,35 +11,24 @@ def test_batch_math_identity_verification_returns_valid(monkeypatch):
         verification_type=VerificationType.MATH,
     )
 
-    # Mock attestation + enforcement — crypto/JWT internals are deployment
-    # concerns, not batch orchestration behavior (#271)
-    from qwed_new.core.attestation import AttestationResult, AttestationStatus
-    from qwed_new.core.diagnostics import DiagnosticResult
-    monkeypatch.setattr(
-        "qwed_new.core.batch.create_verification_attestation",
-        lambda **kwargs: AttestationResult(
-            status=AttestationStatus.ISSUED, token="test-sentinel-token", error_code=None, error=None,
-        ),
-    )
-    monkeypatch.setattr(
-        "qwed_new.core.batch.enforce_trust_decision",
-        lambda result, **kwargs: result,
-    )
-
+    # Signed and enforced for real, as /verify/math is (#320): the attestation
+    # key is generated per process, so no mock is needed.
     result = asyncio.run(service._verify_item(item, organization_id=1))
 
     # VERIFIED with proof_ref + attestation — trust boundary hit (#271)
     assert result["type"] == "math"
     assert result["is_valid"] is True
     assert result["status"] == "VERIFIED"
-    assert result["agent_message"] == "Identity verified"
+    # The message /verify/math gives, from the shared verdict (#530).
+    assert result["agent_message"] == "Identity is true"
     assert result["proof_ref"] is not None
     assert result["is_authoritative"] is True
 
 
-def test_batch_math_verified_attestation_failure_preserves_fields(monkeypatch):
-    """When attestation signing fails, batch math must return UNVERIFIABLE
-    while preserving type/query/is_valid/diff developer fields (#271)."""
+def test_batch_math_verified_attestation_failure_is_blocked(monkeypatch):
+    """When attestation signing fails, a batch math identity is BLOCKED, as
+    /verify/math is, with the verdict that was not admitted kept beside the
+    block (#320; it was UNVERIFIABLE before, #271)."""
     service = BatchVerificationService()
     item = BatchItem(
         id="math-attestation-fail",
@@ -47,9 +36,10 @@ def test_batch_math_verified_attestation_failure_preserves_fields(monkeypatch):
         verification_type=VerificationType.MATH,
     )
 
+    from qwed_new.core import trust
     from qwed_new.core.attestation import AttestationResult, AttestationStatus
     monkeypatch.setattr(
-        "qwed_new.core.batch.create_verification_attestation",
+        trust, "create_verification_attestation",
         lambda **kwargs: AttestationResult(
             status=AttestationStatus.UNVERIFIABLE,
             token=None,
@@ -57,25 +47,22 @@ def test_batch_math_verified_attestation_failure_preserves_fields(monkeypatch):
             error="signing unavailable",
         ),
     )
-    monkeypatch.setattr(
-        "qwed_new.core.batch.enforce_trust_decision",
-        lambda result, **kwargs: result,
-    )
 
     result = asyncio.run(service._verify_item(item, organization_id=1))
 
-    assert result["status"] == "UNVERIFIABLE"
+    assert result["status"] == "BLOCKED"
     assert result["proof_ref"] is None
-    # is_valid comes from the math evaluation, not the attestation outcome.
-    # Signing failure marks the verdict unverifiable; the math itself was proven.
-    assert result["is_valid"] is True
-    assert result["type"] == "math"
-    assert result["query"] == "x + x = 2*x"
+    assert result["is_authoritative"] is False
     assert result["constraint_id"] == "api.attestation.signing_error"
     assert result["attestation_error"] == "CRYPTO_UNAVAILABLE"
+    assert result["engine"] == "math"
+    assert result["verdict_status"] == "VERIFIED"
+    assert result["verdict_proof_ref"].startswith("sha256:")
 
 
 def test_batch_math_non_identity_verification_returns_invalid():
+    """A claim proven false is a decided verdict, as on /verify/math: VERIFIED
+    with is_valid False and admission BLOCKED, not UNVERIFIABLE (#437, #530)."""
     service = BatchVerificationService()
     item = BatchItem(
         id="math-not-equal",
@@ -87,10 +74,10 @@ def test_batch_math_non_identity_verification_returns_invalid():
 
     assert result["type"] == "math"
     assert result["is_valid"] is False
-    assert result["status"] == "UNVERIFIABLE"
-    assert "Not equal" in result["agent_message"]
-    assert result["proof_ref"] is None
-    assert result["is_authoritative"] is False
+    assert result["status"] == "VERIFIED"
+    assert result["agent_message"] == "Identity is false"
+    assert result["proof_ref"] is not None
+    assert result["admission"] == "BLOCKED"
 
 
 def test_batch_math_simplification_only_is_not_reported_as_valid():

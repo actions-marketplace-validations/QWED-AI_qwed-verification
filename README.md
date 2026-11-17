@@ -18,18 +18,22 @@
 
 ---
 
-QWED is an open-source (Apache-2.0) verification layer that checks claims in LLM and AI-agent output with deterministic engines, including SymPy, Z3, SQLGlot and Python AST analysis. A claim that QWED cannot check is never reported as verified: it fails closed. It runs in your own environment as a Python library, a CLI, a self-hosted API or a Docker image, with SDKs for TypeScript, Go and Rust.
+QWED is an open-source (Apache-2.0) verification layer that checks claims in LLM and AI-agent output with deterministic engines, including SymPy, Z3, SQLGlot and Python AST analysis. It is designed to fail closed: a claim it cannot check should not be reported as verified. A known exception: the logic route reports `VERIFIED` for a claim it proves from the constraints a model translated the question into, and does not admit that result; it is tracked in [#320](https://github.com/QWED-AI/qwed-verification/issues/320) and [#581](https://github.com/QWED-AI/qwed-verification/issues/581). It runs in your own environment as a Python library, a CLI, a self-hosted API or a Docker image, with SDKs for TypeScript, Go and Rust.
 
-This repository is the reference implementation of the QWED verification protocol and of [Verification Context v1.0](spec/), the record format for a verification result.
+This repository is the reference implementation of the QWED verification protocol and of [Verification Context v1.0 and v1.1](spec/), the record format for a verification result. A v1.1 document carries the issuing server's signature.
 
 ## How a result reads
 
-Every verification API endpoint returns a `DiagnosticResult` with two separate answers:
+Every verification API endpoint except `/verify/batch` returns a `DiagnosticResult` with a `status`. `/verify/math`, `/verify/code`, `/verify/sql`, `/verify/logic`, `/verify/natural_language` and `/agents/{agent_id}/verify` also return a separate `admission`; the other routes do not yet ([#581](https://github.com/QWED-AI/qwed-verification/issues/581)):
 
 | Field | Values | Meaning |
 |---|---|---|
 | `status` | `VERIFIED`, `UNVERIFIABLE`, `BLOCKED` | Whether QWED could establish the result deterministically. `VERIFIED` always carries a `proof_ref`, a SHA-256 commitment to the evidence. |
 | `admission` | `ADMIT`, `BLOCKED` | Whether the checked output may be acted on. In a Verification Context document this is `ADMIT` or `DENY`. |
+
+`/verify/batch` returns a job whose `status` is the job's state (`pending`, `processing`, `completed`, `partial` or `failed`). Each item has its own `status` and `error`, and its `result` is null when the item failed. Check those first: a math, code, SQL, natural-language or logic item's admission is in its `result`, as `result.admission`.
+
+In Python, a `DiagnosticResult` has no `admission` field; `admission_decision(result)` applies the rule of the math, code and SQL routes. `SQLVerifier.verify_sql` and `CodeVerifier.verify_code` return one; `VerificationEngine.verify_math()` returns a dict with its own `status` values. An engine called in process runs without some of the server's limits, such as the time and memory limits of `/verify/math`, so send untrusted input through the API. A natural-language or logic result is admitted by `natural_language_admission`, which blocks unless the query's meaning was verified (`query_semantics_verified`); QWED does not verify that yet ([#585](https://github.com/QWED-AI/qwed-verification/issues/585)), so such a result is not admitted, even when its translated expression or constraints are verified.
 
 The two are independent. Proving that a SQL statement is destructive is a verified result that must not run:
 
@@ -53,7 +57,7 @@ print([issue["type"] for issue in result.developer_fields["issues"]])
 - **It does not cover every domain.** Claims outside a supported engine come back `UNVERIFIABLE`.
 - **It is only as sound as its engines.** Results depend on SymPy, Z3, SQLGlot, CrossHair and QWED's own rule sets. Past soundness bugs are listed in the [security advisories](https://github.com/QWED-AI/qwed-verification/security/advisories); each advisory in which an engine returned VERIFIED for a false claim is reproduced in the [soundness eval](evals/README.md), which runs at every release.
 - **Natural-language checks use an LLM to translate.** `/verify/natural_language` and `/verify/logic` ask the model you configure to turn text into a formal statement; that translation is not itself verified. Prompts go to that provider unless you run a local model (for example with Ollama).
-- **Advisory engines do not decide.** Fact, Graph, Image, Reasoning and Consensus produce signals for review. Heuristic results are never reported as `VERIFIED`.
+- **Advisory engines do not decide.** Fact, Graph, Image, Reasoning and Consensus produce signals for review. Graph, Image and Consensus can still return `VERIFIED` on a deterministic sub-path that carries a `proof_ref` (see [#320](https://github.com/QWED-AI/qwed-verification/issues/320)): treat that as evidence, not proof.
 
 ## Install
 
@@ -76,10 +80,10 @@ Other languages and runtimes:
 
 | | Install | Notes |
 |---|---|---|
-| TypeScript | `npm install @qwed-ai/sdk` | Published on each release; pin a version, e.g. `@7.3.0` |
-| Go | `go get github.com/QWED-AI/qwed-verification/sdk-go/v7` | Released under `sdk-go/vX.Y.Z` tags; pin a version, e.g. `@v7.3.0` |
+| TypeScript | `npm install @qwed-ai/sdk` | Published on each release; pin a version, e.g. `@10.0.0` |
+| Go | `go get github.com/QWED-AI/qwed-verification/sdk-go/v10` | Released under `sdk-go/vX.Y.Z` tags; pin a version, e.g. `@v10.0.0`. From 10.0.0 the module path ends in `/v10` |
 | Rust | `cargo add qwed` | |
-| Docker | `docker pull qwedai/qwed-verification` | The API server on port 8000, from 7.3.1 (earlier tags ran the GitHub Action). It needs `QWED_CORS_ORIGINS`, `API_KEY_SECRET`, `QWED_JWT_SECRET_KEY`, `QWED_API_KEY_LOOKUP_SECRET` and `QWED_AUDIT_SECRET_KEY`. With Postgres, Redis and monitoring: `docker compose -f deploy/docker-compose.yml up -d` after filling in `deploy/.env` from `deploy/.env.example`. See [self-hosting](https://docs.qwedai.tech/advanced/self-hosting) |
+| Docker | `docker pull qwedai/qwed-verification` | The API server on port 8000, from 8.0.0 (earlier tags ran the GitHub Action). It needs `QWED_CORS_ORIGINS`, `API_KEY_SECRET`, `QWED_JWT_SECRET_KEY`, `QWED_API_KEY_LOOKUP_SECRET` and `QWED_AUDIT_SECRET_KEY`; set `QWED_SIGNING_KEY` (an EC P-256 key) too, or attestations stop verifying after a restart or on another replica. With Postgres, Redis and monitoring: `docker compose -f deploy/docker-compose.yml up -d` after filling in `deploy/.env` from `deploy/.env.example`. See [self-hosting](https://docs.qwedai.tech/advanced/self-hosting) |
 
 From source:
 
@@ -97,7 +101,7 @@ qwed doctor   # health check: engines, provider, server, database
 qwed test     # runs the built-in engine tests
 ```
 
-`qwed init` supports `--provider nvidia | openai | anthropic | gemini | custom` (any OpenAI-compatible endpoint) and `--non-interactive` for CI. `qwed test` runs twelve deterministic checks and needs no model or server:
+`qwed init` supports `--provider nvidia | openai | anthropic | gemini | custom` (any OpenAI-compatible endpoint) and `--non-interactive` for CI. QWED names no default model, so `init` asks for the one to use; with `--non-interactive`, pass `--model` or set the provider's model variable (for example `OPENAI_MODEL`). It asks for the organisation owner's email and password, so you can sign in later (for example to qwed-dashboard); pass `--owner-email`, and with `--non-interactive` set `QWED_OWNER_PASSWORD`. `qwed test` runs twelve deterministic checks and needs no model or server:
 
 ```text
 Math:
@@ -166,6 +170,14 @@ curl -X POST http://localhost:8000/verify/math \
 
 The full endpoint list is in the [API reference](https://docs.qwedai.tech/api/overview). For running QWED without the server, see [QWEDLocal](https://docs.qwedai.tech/advanced/qwed-local).
 
+At startup the server checks the `.pth` startup hooks in `site-packages` and refuses to start if one is unknown or holds a suspicious pattern. In a Python 3.11 venv, setuptools' `distutils-precedence.pth` and coverage's `a1_coverage.pth` both trip it. Allow such a file by the SHA-256 of its exact contents, in `QWED_ALLOWED_STARTUP_PTH_FILES` (comma-separated):
+
+```bash
+python -c "import hashlib,os,sys; p=sys.argv[1]; print(os.path.basename(p) + ':sha256:' + hashlib.sha256(open(p,'rb').read()).hexdigest())" path/to/site-packages/distutils-precedence.pth
+```
+
+Put the printed `NAME.pth:sha256:<hex>` in the variable. A pinned file is allowed only while its contents match; when the package that wrote it is upgraded, take the digest again. A plain file name there allows an unknown file, but it is still scanned for suspicious patterns. `QWED_SKIP_ENV_INTEGRITY_CHECK=true` turns the whole check off.
+
 ## Engines and guards
 
 QWED has 13 engines and 9 policy guards. What an engine may claim depends on its tier ([details](https://docs.qwedai.tech/engines/overview)).
@@ -177,7 +189,7 @@ QWED has 13 engines and 9 policy guards. What an engine may claim depends on its
 | Math | SymPy | Arithmetic and algebraic identities |
 | Logic | Z3 | Satisfiability of constraints (QWED DSL) |
 | SQL | SQLGlot | Query structure, destructive statements, injection patterns, schema |
-| Code | Python AST and rules | Dangerous calls and patterns in generated code |
+| Code | Python AST and lists | Python: admits only listed standard-library modules and module names, listed builtins and listed special attributes, with no attribute's value read by a name made at run time; other languages: dangerous calls and patterns |
 | Schema | JSON Schema | Structure of JSON output |
 | Symbolic | CrossHair, in the Docker sandbox | Searches for counterexamples; returns `UNVERIFIABLE` or `BLOCKED`, not proofs |
 
@@ -192,12 +204,14 @@ The Stats engine executes statistical code in a sandbox and returns `UNVERIFIABL
 ## GitHub Action
 
 ```yaml
-- uses: QWED-AI/qwed-verification@v7.3.0
+- uses: QWED-AI/qwed-verification@v10.0.0
   with:
     action: scan-secrets        # or scan-code, verify-shell
     paths: "**/*.py,**/*.env"
     output_format: sarif
 ```
+
+A passing scan means no known dangerous pattern was found, not that the code is safe. `scan-code` also reports attribute access by a computed name (`getattr(obj, name)`) as a warning: it cannot be checked, and it does not fail the scan.
 
 With `output_format: sarif` the action writes `qwed-results.sarif`; add [`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action) to show the findings in the Security tab. The `verify` action calls a QWED API and needs `api_key` and a reachable server.
 
@@ -259,4 +273,4 @@ The QWED protocol technical note is [10.5281/zenodo.18075234](https://doi.org/10
 
 ## License
 
-[Apache License 2.0](LICENSE). Apache-2.0 comes with no warranty; see sections 7 and 8 of the license.
+[Apache License 2.0](https://github.com/QWED-AI/qwed-verification/blob/main/LICENSE). Apache-2.0 comes with no warranty; see sections 7 and 8 of the license. Redistributions keep the attribution in [NOTICE](https://github.com/QWED-AI/qwed-verification/blob/main/NOTICE), and [TRADEMARKS.md](https://github.com/QWED-AI/qwed-verification/blob/main/TRADEMARKS.md) says how the QWED name and logo may be used.

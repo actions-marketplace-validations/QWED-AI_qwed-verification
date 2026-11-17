@@ -15,6 +15,13 @@ unverified, and the first chained row after them opens a new segment.
 Single writer: the in-memory per-organisation chain head assumes one process
 appends to a given database. A second writer makes the next append fail with a
 continuity SecurityError rather than fork the chain.
+
+Releases: since #484 the entry hash covers ``api_key_id`` and
+``verifier_version``, and since #307 ``admission``. An older release cannot
+verify a row hashed that way,
+so with such a row as an organisation's chain head it refuses further appends
+for that organisation. Upgrade every process together, and do not run an
+older release against a database a newer one has written to.
 """
 
 import hashlib
@@ -26,15 +33,20 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy import text
+from sqlalchemy import and_, case, func, literal, text
 from sqlmodel import Session, create_engine, select
 
+from qwed_new import __version__ as _QWED_VERSION
 from qwed_new.core import database as _database
 from qwed_new.core.models import Organization, VerificationLog
+from qwed_new.core.request_caller import request_api_key_id, request_latency_ms
 
 logger = logging.getLogger(__name__)
 
 AUDIT_SECRET_ENV_VAR = "QWED_AUDIT_SECRET_KEY"
+
+# Rows per page when verify_audit_trail walks the chain.
+_TRAIL_PAGE_ROWS = 500
 
 # Namespace for the per-organisation PostgreSQL advisory lock ("QWED").
 _ADVISORY_LOCK_NAMESPACE = 0x51574544
@@ -124,9 +136,15 @@ class AuditLogger:
         is_verified: bool,
         domain: str,
         raw_llm_output: Optional[str] = None,
+        admission: Optional[str] = None,
     ) -> str:
         """
         Log a verification event with cryptographic signature.
+
+        ``admission`` is the admission decision the route made ("ADMIT" or
+        "BLOCKED"; "ADMIT" or "DENY" from the Verification Context route), or
+        None when the route decides none (#307).
+        It is stored and covered by the hash.
 
         ``result`` is either a dict, serialised here, or an already-serialised
         JSON string, stored as given so a caller's size cap holds. The hash
@@ -149,6 +167,9 @@ class AuditLogger:
             stored_result = json.dumps(result)
             hashed_result = result
 
+        # Measured before waiting for the append lock, so it is the route's
+        # time, not the queue's (#528).
+        latency_ms = request_latency_ms()
         with self._append_lock:
             return self._append(
                 organization_id=organization_id,
@@ -159,6 +180,8 @@ class AuditLogger:
                 is_verified=is_verified,
                 domain=domain,
                 raw_llm_output=raw_llm_output,
+                admission=admission,
+                latency_ms=latency_ms,
             )
 
     def _append(
@@ -172,6 +195,8 @@ class AuditLogger:
         is_verified: bool,
         domain: str,
         raw_llm_output: Optional[str],
+        admission: Optional[str] = None,
+        latency_ms: Optional[int] = None,
     ) -> str:
         """Append one entry under the chain lock (see log_verification)."""
         timestamp = datetime.now(timezone.utc)
@@ -194,6 +219,9 @@ class AuditLogger:
                     "Audit chain continuity mismatch: in-memory chain head does not match persisted audit trail"
                 )
 
+            # The caller and the server version (#484), both covered by the
+            # hash: clearing either on a stored row fails verification.
+            api_key_id = request_api_key_id()
             log_data = {
                 "organization_id": organization_id,
                 "user_id": user_id,
@@ -204,6 +232,14 @@ class AuditLogger:
                 "timestamp": timestamp.isoformat(),
                 "previous_hash": previous_hash,
                 "raw_llm_output": raw_llm_output,
+                "api_key_id": api_key_id,
+                "verifier_version": _QWED_VERSION,
+                # The admission the route decided (#307); None when it
+                # decided none. Covered, so it cannot be set or cleared later.
+                "admission": admission,
+                # How long the route took (#528); None outside a request.
+                # Covered too.
+                "latency_ms": latency_ms,
             }
 
             entry_hash = self._compute_hash(log_data)
@@ -221,6 +257,10 @@ class AuditLogger:
                 hmac_signature=signature,
                 previous_hash=previous_hash,
                 raw_llm_output=raw_llm_output,
+                api_key_id=api_key_id,
+                verifier_version=_QWED_VERSION,
+                admission=admission,
+                latency_ms=latency_ms,
             )
             session.add(log_entry)
             session.commit()
@@ -403,6 +443,37 @@ class AuditLogger:
         chained_before = self._has_chained_entry_before(
             session, log_entry.organization_id, log_id
         )
+        prev_log = self._previous_entry(session, log_entry.organization_id, log_id)
+        return self._check_entry(log_entry, prev_log, chained_before)
+
+    def _previous_entry(
+        self, session: Session, organization_id: int, log_id: int
+    ) -> Optional[VerificationLog]:
+        """The organisation's row just before ``log_id``, or None."""
+        return self._run_select(
+            session,
+            select(VerificationLog)
+            .where(VerificationLog.organization_id == organization_id)
+            .where(VerificationLog.id < log_id)
+            .order_by(VerificationLog.id.desc())
+            # Result.first() does not add a LIMIT: without it every earlier
+            # row is fetched to read one.
+            .limit(1),
+        ).first()
+
+    def _check_entry(
+        self,
+        log_entry: VerificationLog,
+        prev_log: Optional[VerificationLog],
+        chained_before: bool,
+    ) -> Dict[str, Any]:
+        """Check one entry against the row before it (see verify_log_entry).
+
+        ``chained_before`` says whether the organisation has a chained row
+        (one with an entry hash) before this one. verify_log_entry looks both
+        up; verify_audit_trail carries them along as it walks the chain.
+        """
+        log_id = log_entry.id
         if _is_unchained(log_entry) and not chained_before:
             # Written before the chain was wired in: nothing to verify, and
             # never reported valid.
@@ -423,13 +494,6 @@ class AuditLogger:
 
         errors = []
         hash_valid, signature_valid = self._verify_hash_and_signature(log_entry, errors)
-        prev_log = self._run_select(
-            session,
-            select(VerificationLog)
-            .where(VerificationLog.organization_id == log_entry.organization_id)
-            .where(VerificationLog.id < log_id)
-            .order_by(VerificationLog.id.desc()),
-        ).first()
         chain_valid = self._verify_chain_link(
             log_entry, prev_log, errors, chained_before=chained_before
         )
@@ -451,6 +515,28 @@ class AuditLogger:
 
     def _reconstruct_log_data(self, log_entry: VerificationLog) -> Dict[str, Any]:
         """Rebuild the canonical payload for integrity verification."""
+        return {
+            **self._reconstruct_pre_latency_log_data(log_entry),
+            "latency_ms": log_entry.latency_ms,
+        }
+
+    def _reconstruct_pre_latency_log_data(self, log_entry: VerificationLog) -> dict[str, Any]:
+        """Rebuild the payload for entries hashed before latency was covered (#528)."""
+        return {
+            **self._reconstruct_pre_admission_log_data(log_entry),
+            "admission": log_entry.admission,
+        }
+
+    def _reconstruct_pre_admission_log_data(self, log_entry: VerificationLog) -> dict[str, Any]:
+        """Rebuild the payload for entries hashed before admission was covered (#307)."""
+        return {
+            **self._reconstruct_pre_caller_log_data(log_entry),
+            "api_key_id": log_entry.api_key_id,
+            "verifier_version": log_entry.verifier_version,
+        }
+
+    def _reconstruct_pre_caller_log_data(self, log_entry: VerificationLog) -> dict[str, Any]:
+        """Rebuild the payload for entries hashed before the caller was covered (#484)."""
         return {
             "organization_id": log_entry.organization_id,
             "user_id": log_entry.user_id,
@@ -529,12 +615,36 @@ class AuditLogger:
         #380, runtime-verified). The extra spellings admit no forgery: the
         HMAC still gates on the stored hash, and without the key no valid
         signature can be minted for any spelling.
+
+        A row that records its caller (``api_key_id`` or ``verifier_version``
+        set, #484) is checked against the current payload only. The older
+        shapes leave both fields out, so accepting them for such a row would
+        let anyone with database write access set or change the caller on a
+        row written before #484 without breaking its hash.
+
+        The same holds for ``admission`` (#307): a row that records one is
+        checked against the current payload only. No older shape covers
+        admission, so every older shape (the #484 one and the ones before
+        it) is a candidate only while ``admission`` is null; otherwise
+        setting an admission on an older row would leave its hash matching.
+
+        And for ``latency_ms`` (#528): no older shape covers it, so every
+        older shape is a candidate only while it is null. Setting a latency
+        on a row written before #528 then fails verification, and so does
+        clearing it on a row written since.
         """
+        payloads = [self._reconstruct_log_data(log_entry)]
+        if log_entry.latency_ms is None:
+            payloads.append(self._reconstruct_pre_latency_log_data(log_entry))
+            if log_entry.admission is None:
+                payloads.append(self._reconstruct_pre_admission_log_data(log_entry))
+                if log_entry.api_key_id is None and log_entry.verifier_version is None:
+                    payloads += [
+                        self._reconstruct_pre_caller_log_data(log_entry),
+                        self._reconstruct_legacy_log_data(log_entry),
+                    ]
         candidates = []
-        for payload in (
-            self._reconstruct_log_data(log_entry),
-            self._reconstruct_legacy_log_data(log_entry),
-        ):
+        for payload in payloads:
             candidates.append(self._compute_hash(payload))
             naive_payload = dict(payload)
             naive_payload["timestamp"] = _naive_ts(log_entry.timestamp).isoformat()
@@ -592,53 +702,114 @@ class AuditLogger:
                 "total_entries": int,
                 "verified_entries": int,
                 "failed_entries": list[int],
-                "errors": list[str]
+                "errors": list[str],
+                "first_entry_id": int | None,
+                "last_entry_id": int | None,
+                "head_hash": str | None,
             }
         """
+        in_period = []
+        if start_date:
+            in_period.append(VerificationLog.timestamp >= start_date)
+        if end_date:
+            in_period.append(VerificationLog.timestamp <= end_date)
+
+        # One ordered pass (#485): find the id range of the period's entries,
+        # then walk the organisation's rows over that range, carrying the
+        # previous row and whether a chained row came before, instead of two
+        # lookups per entry. Rows in the range but outside the period (a clock
+        # that went back) are walked for the chain but not counted, as before.
+        tally = _TrailTally()
         with Session(engine) as session:
-            query = select(VerificationLog).where(
-                VerificationLog.organization_id == organization_id
+            low, high = self._run_select(
+                session,
+                select(func.min(VerificationLog.id), func.max(VerificationLog.id)).where(
+                    VerificationLog.organization_id == organization_id, *in_period
+                ),
+            ).one()
+            if low is not None:
+                prev_log = self._previous_entry(session, organization_id, low)
+                chained_before = self._has_chained_entry_before(session, organization_id, low)
+                for log, counts in self._trail_rows(session, organization_id, low, high, in_period):
+                    if counts:
+                        tally.add(log, self._check_entry(log, prev_log, chained_before))
+                    chained_before = chained_before or bool(log.entry_hash)
+                    prev_log = log
+        return tally.result(organization_id)
+
+    def _trail_rows(self, session: Session, organization_id: int, low: int, high: int, in_period: list):
+        """The organisation's rows with ids from ``low`` to ``high``, in id order,
+        each with whether it falls in the period, a page at a time.
+
+        Each page is read in full before its rows are checked, so no SELECT
+        stays open during the walk: on SQLite an open cursor holds a shared
+        lock, which would make a concurrent audit append wait and fail.
+        """
+        counted = case((and_(*in_period), True), else_=False) if in_period else literal(True)
+        after = low - 1
+        while True:
+            page = self._run_select(
+                session,
+                select(VerificationLog, counted.label("in_period"))
+                .where(VerificationLog.organization_id == organization_id)
+                .where(VerificationLog.id > after, VerificationLog.id <= high)
+                .order_by(VerificationLog.id)
+                .limit(_TRAIL_PAGE_ROWS),
+            ).all()
+            yield from page
+            if len(page) < _TRAIL_PAGE_ROWS:
+                return
+            after = page[-1][0].id
+
+
+class _TrailTally:
+    """What verify_audit_trail counts as it walks the chain."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.verified = 0
+        self.failed: list[int] = []
+        self.legacy: list[int] = []
+        self.errors: list[str] = []
+        self.first_id: Optional[int] = None
+        self.last_id: Optional[int] = None
+        self.head_hash: Optional[str] = None
+
+    def add(self, log: VerificationLog, result: Dict[str, Any]) -> None:
+        self.total += 1
+        if self.first_id is None:
+            self.first_id = log.id
+        self.last_id, self.head_hash = log.id, log.entry_hash
+        if result["valid"]:
+            self.verified += 1
+        elif result.get("legacy"):
+            self.legacy.append(log.id)
+        else:
+            self.failed.append(log.id)
+            self.errors.extend(result["errors"])
+
+    def result(self, organization_id: int) -> Dict[str, Any]:
+        errors = list(self.errors)
+        if self.legacy:
+            # Unverified, not failed: they predate the chain. The trail is
+            # still not reported valid while they are in range.
+            errors.append(
+                f"{len(self.legacy)} entries predate the audit chain and cannot be verified"
             )
-
-            if start_date:
-                query = query.where(VerificationLog.timestamp >= start_date)
-            if end_date:
-                query = query.where(VerificationLog.timestamp <= end_date)
-
-            logs = self._run_select(session, query.order_by(VerificationLog.id)).all()
-
-            total = len(logs)
-            verified = 0
-            failed = []
-            legacy = []
-            errors = []
-
-            for log in logs:
-                result = self.verify_log_entry(log.id, session)
-                if result["valid"]:
-                    verified += 1
-                elif result.get("legacy"):
-                    legacy.append(log.id)
-                else:
-                    failed.append(log.id)
-                    errors.extend(result["errors"])
-
-            if legacy:
-                # Unverified, not failed: they predate the chain. The trail is
-                # still not reported valid while they are in range.
-                errors.append(
-                    f"{len(legacy)} entries predate the audit chain and cannot be verified"
-                )
-
-            return {
-                "valid": verified == total,
-                "total_entries": total,
-                "verified_entries": verified,
-                "failed_entries": failed,
-                "legacy_entries": legacy,
-                "errors": errors,
-                "organization_id": organization_id,
-            }
+        return {
+            "valid": self.verified == self.total,
+            "total_entries": self.total,
+            "verified_entries": self.verified,
+            "failed_entries": self.failed,
+            "legacy_entries": self.legacy,
+            "errors": errors,
+            "organization_id": organization_id,
+            # The range checked. Each entry hash covers the previous one, so
+            # the head hash commits to the whole chain up to it.
+            "first_entry_id": self.first_id,
+            "last_entry_id": self.last_id,
+            "head_hash": self.head_hash,
+        }
 
 
 class SecurityError(Exception):

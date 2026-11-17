@@ -37,17 +37,65 @@ class VerificationResult:
     error: Optional[str] = None
     provider_used: Optional[str] = None
     latency_ms: float = 0.0
-    
+    # Set only on a VERIFIED answer that passed the server's trust step: its
+    # signed attestation, an ES256 JWT (#319). Check it with
+    # QWEDClient.verify_attestation or qwed_sdk.attestation.verify_attestation.
+    attestation: Optional[str] = None
+    proof_ref: Optional[str] = None
+    # The server's admission decision, ADMIT or BLOCKED, where the route
+    # makes one; the attestation signs it too (#321). Act on it, not on
+    # status alone.
+    admission: str | None = None
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VerificationResult":
         return cls(
             status=data.get("status", "UNKNOWN"),
-            is_verified=data.get("is_verified", data.get("is_valid", False)),
+            is_verified=is_admitted(data),
             result=data,
             error=data.get("error"),
             provider_used=data.get("provider_used"),
-            latency_ms=data.get("latency_ms", 0.0)
+            latency_ms=data.get("latency_ms", 0.0),
+            **token_fields(data),
         )
+
+
+def is_admitted(data: Dict[str, Any]) -> bool:
+    """Whether a response admits its answer (GHSA-jppc-7r58-7pjh).
+
+    A route that decides an admission returns it, and only ``ADMIT``
+    admits. A route that decides none is admitted by the server's own rule
+    (``admission_decision``): a ``VERIFIED`` status with ``is_valid`` true,
+    not reached on a model's translation of the question
+    (``query_semantics_verified``, where present, must be true, and a
+    response whose ``verification_scope`` is ``translated_expression_only``
+    must carry it as true; #630).
+    A bare ``is_valid`` or ``is_verified`` never admits on its own: the
+    server flattens the engine's fields into the response, so a result a
+    gate blocked can still carry the engine's ``is_valid: true``.
+    """
+    admission = data.get("admission")
+    if admission is not None:
+        return admission == "ADMIT"
+    return (
+        data.get("status") == "VERIFIED"
+        and data.get("is_valid") is True
+        and data.get(
+            "query_semantics_verified",
+            data.get("verification_scope") != "translated_expression_only",
+        ) is True
+    )
+
+
+def token_fields(data: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """A response's ``attestation``, ``proof_ref`` and ``admission``, each
+    a non-empty string or None, for every VerificationResult built from a
+    server response (#319, #321): what the attestation binds."""
+    fields: Dict[str, Optional[str]] = {}
+    for name in ("attestation", "proof_ref", "admission"):
+        value = data.get(name)
+        fields[name] = value if isinstance(value, str) and value else None
+    return fields
 
 
 @dataclass

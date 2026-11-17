@@ -26,6 +26,7 @@ from qwed_new.core.diagnostics import (
     AdmissionDecision,
     DiagnosticResult,
     admission_decision,
+    claim_verified,
     enforce_trust_decision,
 )
 from qwed_new.core.attestation import create_verification_attestation, AttestationStatus
@@ -128,7 +129,10 @@ class ControlPlane:
         result, with the evidence string its attestation must bind to.
 
         A proven-false claim (#437) is VERIFIED with is_valid False, so
-        admission is DENY; it is never reported as UNVERIFIABLE.
+        admission is DENY; it is never reported as UNVERIFIABLE. An
+        expression that holds gets no is_valid: it proves the model's
+        translation, not the user's claim, so nothing in the result may read
+        as a valid claim (#630), as for a satisfiable logic result.
         """
         legacy_status = verification_result["status"]
         evidence = {
@@ -142,7 +146,7 @@ class ControlPlane:
         if legacy_status == "VERIFIED":
             dr = DiagnosticResult.verified(
                 "Expression verified successfully",
-                developer_fields={**verification_result, "is_valid": True},
+                developer_fields=verification_result,
                 evidence=evidence,
                 proof_data=str(evidence),
             )
@@ -194,7 +198,10 @@ class ControlPlane:
         # engine actually verified, not the user's prose.
         att_result = create_verification_attestation(
             status="VERIFIED",
-            verified=dr.developer_fields.get("is_valid") is True,
+            # claim_verified (#577): false here even when the expression
+            # holds, as the expression is the model's translation of the
+            # question. The route's own token says the same.
+            verified=claim_verified(dr),
             engine="math",
             query=expression,
             confidence=1.0,
@@ -347,6 +354,14 @@ class ControlPlane:
                 "latency_ms": (time.time() - start_time) * 1000
             }
 
+    def _logic_solve(self, dsl_code: str, variables: Any, claim_dsl: Optional[str]) -> tuple:
+        """The z3 call for a logic translation (#631), as (function, args):
+        prove the claim from the constraints, or, with no claim, check the
+        constraints alone, which proves nothing however satisfiable."""
+        if claim_dsl is None:
+            return self.logic_verifier.verify_from_dsl, (dsl_code, variables)
+        return self.logic_verifier.prove_from_dsl, (dsl_code, claim_dsl, variables)
+
     async def process_logic_query(
         self,
         query: str,
@@ -391,13 +406,14 @@ class ControlPlane:
             # Provider translation runs off the loop and concurrently; the z3
             # solve runs on the single z3 thread. So the loop is never blocked,
             # logic requests translate in parallel, and z3 stays thread-safe.
-            dsl_code, variables, resolved_provider, error = await _run_provider_call(
+            dsl_code, variables, resolved_provider, error, claim_dsl = await _run_provider_call(
                 self.logic_verifier.translate_to_dsl, query, provider
             )
             if error is not None:
                 result = error
             else:
-                result = await _run_z3_call(self.logic_verifier.verify_from_dsl, dsl_code, variables)
+                solve, args = self._logic_solve(dsl_code, variables, claim_dsl)
+                result = await _run_z3_call(solve, *args)
                 result.provider_used = resolved_provider
                 if not result.dsl_code:
                     result.dsl_code = dsl_code
@@ -412,7 +428,15 @@ class ControlPlane:
                 "provider_used": resolved_provider,
                 "latency_ms": (time.time() - start_time) * 1000
             }
-            
+            constraint_id = getattr(result, "constraint_id", None)
+            if constraint_id:
+                response["constraint_id"] = constraint_id
+            # The sorts Z3 decided the declared variables as: part of the
+            # statement the verdict is about, beside the DSL.
+            declarations = getattr(result, "declarations", None)
+            if declarations:
+                response["declarations"] = declarations
+
             # Sanitize Output
             response = self.output_sanitizer.sanitize_output(
                 result=response,

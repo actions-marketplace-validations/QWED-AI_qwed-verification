@@ -4,12 +4,81 @@ QWED SDK Client.
 Provides synchronous and asynchronous clients for the QWED API.
 """
 
+import asyncio
+import functools
+import threading
 import httpx
 import time
 from typing import List, Dict, Any, Optional
 import os
 
-from qwed_sdk.models import VerificationResult, BatchResult
+from qwed_sdk.attestation import (
+    DEFAULT_ISSUER,
+    JWKS_PATH,
+    AttestationError,
+    KeyMismatchError,
+    KeysUnavailableError,
+    check_admission,
+    document_attestation,
+    require_answer,
+    verify_attestation,
+    verify_document_attestation,
+)
+from qwed_sdk.models import VerificationResult, BatchResult, token_fields
+
+# How long a fetched JWKS is reused, as the server's Cache-Control says.
+_JWKS_MAX_AGE_SECONDS = 300.0
+# The least time since the last fetch ended before another: after a token
+# none of the cached keys verifies (a key rotation or a restart with a new
+# ephemeral key is picked up within this, but a stream of forged tokens
+# cannot turn each one into a request), and after a failed fetch, whose
+# failure every caller gets meanwhile instead of a request each (#512). It
+# counts from the end, so a fetch that is slow to fail is still shared for
+# all of it (#513).
+_JWKS_MIN_REFRESH_SECONDS = 30.0
+
+
+# The error validate and resolve report, when they require a Verification
+# Context document's attestation (#319), for a document with none and for
+# one whose attestation does not verify or is not this document's.
+ATTESTATION_REQUIRED = "attestation_required"
+ATTESTATION_INVALID = "attestation_invalid"
+
+
+def _require_document_attestation(document: Any) -> None:
+    """Raise AttestationError for a document with no attestation, before
+    any key is fetched."""
+    if document_attestation(document) is None:
+        raise AttestationError("no attestation")
+
+
+def _unreachable_code_result(start: float) -> VerificationResult:
+    """The result of a code check the server could not be reached for:
+    UNVERIFIABLE and not admitted (GHSA-4rj3-8wqj-cqwc), as for verify_fact
+    (#326)."""
+    return VerificationResult(
+        status="UNVERIFIABLE",
+        is_verified=False,
+        result={"message": "The QWED server could not be reached, so the code was not verified."},
+        error="server unreachable",
+        latency_ms=(time.time() - start) * 1000,
+    )
+
+
+def _attestation_of(
+    result: VerificationResult | dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """The token, proof_ref and admission of an answer, typed or as the
+    response dict. The token and proof_ref are checked before any key is
+    fetched, so a missing one is an AttestationError, not a network error."""
+    if isinstance(result, VerificationResult):
+        token, proof_ref, admission = result.attestation, result.proof_ref, result.admission
+    elif isinstance(result, dict):
+        token, proof_ref, admission = result.get("attestation"), result.get("proof_ref"), result.get("admission")
+    else:
+        raise TypeError("expected a VerificationResult or a response dict")
+    require_answer(token, proof_ref)
+    return token, proof_ref, admission
 
 
 class QWEDClient:
@@ -42,7 +111,104 @@ class QWEDClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
-    
+        self._jwks: Optional[Dict[str, Any]] = None
+        self._jwks_fetched_at = 0.0
+        self._jwks_attempted_at = 0.0
+        self._jwks_error: Exception | None = None
+        # One fetch at a time: callers that wait reuse what it fetched.
+        self._jwks_lock = threading.Lock()
+
+    def _jwks_fresh(self) -> bool:
+        return self._jwks is not None and time.monotonic() - self._jwks_fetched_at <= _JWKS_MAX_AGE_SECONDS
+
+    def _raise_recent_failure(self) -> None:
+        """Within _JWKS_MIN_REFRESH_SECONDS of a failed fetch, its failure
+        again, without a request. Keys past their age are not used instead:
+        a key the server has since withdrawn would still verify."""
+        if self._jwks_error is not None and \
+                time.monotonic() - self._jwks_attempted_at < _JWKS_MIN_REFRESH_SECONDS:
+            raise KeysUnavailableError("attestation keys unavailable; the last fetch failed") \
+                from self._jwks_error
+
+    def _fetch_jwks(self) -> dict[str, Any]:
+        try:
+            response = self._client.get(f"{self.base_url}{JWKS_PATH}")
+            response.raise_for_status()
+            jwks = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            self._jwks_error, self._jwks_attempted_at = exc, time.monotonic()
+            raise KeysUnavailableError("attestation keys unavailable") from exc
+        self._jwks, self._jwks_error = jwks, None
+        self._jwks_fetched_at = self._jwks_attempted_at = time.monotonic()
+        return jwks
+
+    def get_jwks(self, refresh: bool = False) -> Dict[str, Any]:
+        """The server's attestation keys (GET /.well-known/jwks.json, no API
+        key), reused for five minutes as the server's Cache-Control says.
+        Raises KeysUnavailableError if they cannot be fetched, and for
+        _JWKS_MIN_REFRESH_SECONDS after, unless ``refresh``."""
+        if not refresh and self._jwks_fresh():
+            return self._jwks
+        with self._jwks_lock:
+            # Callers that waited get what the fetch before them got.
+            if not refresh:
+                if self._jwks_fresh():
+                    return self._jwks
+                self._raise_recent_failure()
+            return self._fetch_jwks()
+
+    def _jwks_after_mismatch(self, used: dict[str, Any]) -> dict[str, Any] | None:
+        """Keys to try once more after none in ``used`` verified a token:
+        those another caller fetched meanwhile, else a fresh fetch if the
+        last one ended at least _JWKS_MIN_REFRESH_SECONDS ago. Within that,
+        the last fetch's failure if it failed (not a missing key, #513), else
+        None."""
+        with self._jwks_lock:
+            if self._jwks is not None and self._jwks is not used:
+                return self._jwks
+            if time.monotonic() - self._jwks_attempted_at < _JWKS_MIN_REFRESH_SECONDS:
+                self._raise_recent_failure()
+                return None
+            return self._fetch_jwks()
+
+    def verify_attestation(
+        self,
+        result: VerificationResult | dict[str, Any],
+        query: Optional[str] = None,
+        *,
+        issuer: str = DEFAULT_ISSUER,
+        leeway: int = 0,
+    ) -> Dict[str, Any]:
+        """Verify an answer's attestation against this server's keys and
+        return its claims; raise qwed_sdk.attestation.AttestationError if it
+        does not verify or is not this answer's (#319): its proof_ref, and
+        the admission it carries, which the token must sign (none if it
+        carries none, #321).
+
+        ``query``, when given, must be the statement the verdict covers. To
+        verify against keys you pinned, use
+        qwed_sdk.attestation.verify_attestation with your JWKS.
+        """
+        token, proof_ref, admission = _attestation_of(result)
+        verify = functools.partial(
+            verify_attestation, token, proof_ref=proof_ref, query=query, issuer=issuer, leeway=leeway,
+        )
+        jwks = self.get_jwks()
+        try:
+            claims = verify(jwks)
+        except KeyMismatchError:
+            # The key may have rotated, or the server restarted with a new
+            # key under the same kid, since the JWKS was cached: try the
+            # keys once more (see _jwks_after_mismatch).
+            newer = self._jwks_after_mismatch(jwks)
+            if newer is None:
+                raise
+            claims = verify(newer)
+        # The token signs the server's admission where the route decides one
+        # (#321): the answer's admission must be that one.
+        check_admission(claims, admission)
+        return claims
+
     def _headers(self) -> Dict[str, str]:
         return {
             "X-API-Key": self.api_key,
@@ -78,7 +244,20 @@ class QWEDClient:
         verifier_version: Optional[str] = None,
         attestation_token: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Create a schema-valid Verification Context from a DiagnosticResult."""
+        """Create a schema-valid Verification Context from a DiagnosticResult.
+
+        The server records the diagnostic without vouching for it: the
+        message and developer fields are kept under
+        ``developer_fields.caller_supplied`` and decide nothing. The admission
+        is DENY unless ``attestation_token`` signs ADMIT for this verdict
+        (#321), as a token from a maths, code, SQL or natural-language answer,
+        or an agent or batch item's,
+        that the server admitted does.
+
+        The document returned is spec v1.1, signed by the server: its
+        ``attestation`` is what validate_verification_context and
+        resolve_verification_context require by default (#319).
+        """
         return self._request(
             "POST",
             "/verification-context/from-diagnostic",
@@ -91,20 +270,84 @@ class QWEDClient:
             },
         )
 
-    def validate_verification_context(self, document: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate a Verification Context document against the v1.0 schema."""
+    def verify_document_attestation(
+        self,
+        document: Dict[str, Any],
+        *,
+        issuer: str = DEFAULT_ISSUER,
+        leeway: int = 0,
+    ) -> Dict[str, Any]:
+        """Verify a Verification Context document's ``attestation`` against
+        this server's keys and return its claims; raise
+        qwed_sdk.attestation.AttestationError if it has none, or it does not
+        verify or is not this document's (#319). To verify against keys you
+        pinned, use qwed_sdk.attestation.verify_document_attestation.
+        """
+        _require_document_attestation(document)
+        verify = functools.partial(verify_document_attestation, document, issuer=issuer, leeway=leeway)
+        jwks = self.get_jwks()
+        try:
+            return verify(jwks)
+        except KeyMismatchError:
+            # As in verify_attestation: the keys may have changed since.
+            newer = self._jwks_after_mismatch(jwks)
+            if newer is None:
+                raise
+            return verify(newer)
+
+    def _document_refusal(self, document: Dict[str, Any]) -> Optional[str]:
+        """The error to report for a document whose attestation is required,
+        or None if it verifies. Keys that cannot be fetched decide nothing,
+        so KeysUnavailableError is raised, not reported as invalid."""
+        if document_attestation(document) is None:
+            return ATTESTATION_REQUIRED
+        try:
+            self.verify_document_attestation(document)
+        except KeysUnavailableError:
+            raise
+        except AttestationError:
+            return ATTESTATION_INVALID
+        return None
+
+    def validate_verification_context(
+        self, document: Dict[str, Any], require_attestation: bool = True,
+    ) -> Dict[str, Any]:
+        """Validate a Verification Context document against its schema.
+
+        By default the document must be one this server issued (#319): its
+        ``attestation`` is verified here, against the server's keys, first.
+        A document with none is ``{"valid": False, "error":
+        "attestation_required"}``; one whose attestation does not verify or
+        is not this document's, ``"attestation_invalid"``. Pass
+        ``require_attestation=False`` to validate the schema alone, as for a
+        v1.0 document built locally.
+        """
+        if require_attestation and (refusal := self._document_refusal(document)) is not None:
+            return {"valid": False, "error": refusal}
         return self._request(
             "POST",
             "/verification-context/validate",
-            json={"document": document},
+            json={"document": document, "require_attestation": require_attestation},
         )
 
-    def resolve_verification_context(self, document: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolve the proof_ref commitment for a Verification Context document."""
+    def resolve_verification_context(
+        self, document: Dict[str, Any], require_attestation: bool = True,
+    ) -> Dict[str, Any]:
+        """Resolve the proof_ref commitment for a Verification Context document.
+
+        By default the document's ``attestation`` is required and verified
+        first, as for validate_verification_context: a failure is
+        ``{"resolved": False, "error": ...}``. A ``proof_ref`` alone is a
+        commitment anyone can compute; the attestation shows this server
+        issued the document. Pass ``require_attestation=False`` to resolve
+        the commitment alone.
+        """
+        if require_attestation and (refusal := self._document_refusal(document)) is not None:
+            return {"resolved": False, "error": refusal}
         return self._request(
             "POST",
             "/verification-context/resolve",
-            json={"document": document},
+            json={"document": document, "require_attestation": require_attestation},
         )
 
     def verify(
@@ -158,30 +401,24 @@ class QWEDClient:
         code: str,
         language: str = "python"
     ) -> VerificationResult:
-        """Verify code for security vulnerabilities."""
+        """Verify code for security vulnerabilities with the server's CodeVerifier.
+
+        The server decides: its admission is the result's ``is_verified``. A
+        local blocklist is not a verification, so none is used in its place
+        (GHSA-4rj3-8wqj-cqwc); a server that cannot be reached is
+        UNVERIFIABLE, never VERIFIED.
+        """
         start = time.time()
-        # Try local execution first (Technical Safety - Phase 12)
         try:
-            from qwed_new.guards.code_guard import CodeGuard
-            guard = CodeGuard()
-            result_dict = guard.verify_safety(code, language=language)
-            
-            result = VerificationResult(
-                status="VERIFIED" if result_dict["verified"] else "UNVERIFIED",
-                is_verified=result_dict["verified"],
-                result=result_dict,
-                latency_ms=(time.time() - start) * 1000
-            )
-            return result
-        except ImportError:
-            # Fallback to API
             data = self._request(
                 "POST",
                 "/verify/code",
                 json={"code": code, "language": language}
             )
-            data["latency_ms"] = (time.time() - start) * 1000
-            return VerificationResult.from_dict(data)
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return _unreachable_code_result(start)
+        data["latency_ms"] = (time.time() - start) * 1000
+        return VerificationResult.from_dict(data)
     
     def verify_fact(
         self,
@@ -238,31 +475,30 @@ class QWEDClient:
         schema_ddl: str = "",
         dialect: str = "sqlite"
     ) -> VerificationResult:
-        """Verify SQL query against schema."""
+        """Verify an SQL query against the schema with the server's SQLVerifier.
+
+        The server decides: its admission is the result's ``is_verified``. The
+        local SQLGuard is a pre-filter, not a verification, so it is not used
+        in the server's place (GHSA-45jv-2j44-4c2q); a server that cannot be
+        reached is UNVERIFIABLE, never VERIFIED.
+        """
         start = time.time()
-        # Try local execution first (Technical Safety - Phase 12)
         try:
-            from qwed_new.guards.sql_guard import SQLGuard
-            # Note: SQLGuard in client ignores schema/dialect for deep checks in this simple integration
-            # but we can pass dialect if needed.
-            guard = SQLGuard() 
-            result_dict = guard.verify_query(query, dialect)
-            
-            result = VerificationResult(
-                status="VERIFIED" if result_dict["verified"] else "UNVERIFIED",
-                is_verified=result_dict["verified"],
-                result=result_dict,
-                latency_ms=(time.time() - start) * 1000
-            )
-            return result
-        except ImportError:
             data = self._request(
                 "POST",
                 "/verify/sql",
                 json={"query": query, "schema_ddl": schema_ddl, "dialect": dialect}
             )
-            data["latency_ms"] = (time.time() - start) * 1000
-            return VerificationResult.from_dict(data)
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return VerificationResult(
+                status="UNVERIFIABLE",
+                is_verified=False,
+                result={"message": "The QWED server could not be reached, so the query was not verified."},
+                error="server unreachable",
+                latency_ms=(time.time() - start) * 1000,
+            )
+        data["latency_ms"] = (time.time() - start) * 1000
+        return VerificationResult.from_dict(data)
 
     def verify_stats(
         self,
@@ -324,11 +560,16 @@ class QWEDClient:
         # The API returns: { "final_answer": ..., "confidence": ..., "verification_chain": ... }
         # We wrap this in a VerificationResult.
 
+        # The server's status, and meets_requirement, which it sets only for
+        # a VERIFIED result that meets the confidence (#269); a truthy value
+        # that is not exactly True admits nothing (GHSA-jppc-7r58-7pjh).
         return VerificationResult(
-            status="VERIFIED" if data.get("meets_requirement", False) else "UNVERIFIED",
-            is_verified=data.get("meets_requirement", False),
+            status=data.get("status") or ("VERIFIED" if data.get("meets_requirement") is True else "UNVERIFIED"),
+            is_verified=data.get("meets_requirement") is True,
             result=data,
-            latency_ms=data.get("latency_ms", 0.0) or (time.time() - start) * 1000
+            latency_ms=data.get("latency_ms", 0.0) or (time.time() - start) * 1000,
+            # So verify_attestation works on a consensus answer too (#319).
+            **token_fields(data),
         )
     
     def verify_image(
@@ -426,7 +667,85 @@ class QWEDAsyncClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
-    
+        self._jwks: Optional[Dict[str, Any]] = None
+        self._jwks_fetched_at = 0.0
+        self._jwks_attempted_at = 0.0
+        self._jwks_error: Exception | None = None
+        # One fetch at a time: callers that wait reuse what it fetched.
+        self._jwks_lock = asyncio.Lock()
+
+    def _jwks_fresh(self) -> bool:
+        return self._jwks is not None and time.monotonic() - self._jwks_fetched_at <= _JWKS_MAX_AGE_SECONDS
+
+    def _raise_recent_failure(self) -> None:
+        """Within _JWKS_MIN_REFRESH_SECONDS of a failed fetch, its failure
+        again, without a request. Keys past their age are not used instead:
+        a key the server has since withdrawn would still verify."""
+        if self._jwks_error is not None and \
+                time.monotonic() - self._jwks_attempted_at < _JWKS_MIN_REFRESH_SECONDS:
+            raise KeysUnavailableError("attestation keys unavailable; the last fetch failed") \
+                from self._jwks_error
+
+    async def _fetch_jwks(self) -> dict[str, Any]:
+        if not self._client:
+            raise RuntimeError("Client not initialized. Use 'async with' context.")
+        # Recorded when the fetch ends; a cancelled task records nothing.
+        try:
+            response = await self._client.get(f"{self.base_url}{JWKS_PATH}")
+            response.raise_for_status()
+            jwks = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            self._jwks_error, self._jwks_attempted_at = exc, time.monotonic()
+            raise KeysUnavailableError("attestation keys unavailable") from exc
+        self._jwks, self._jwks_error = jwks, None
+        self._jwks_fetched_at = self._jwks_attempted_at = time.monotonic()
+        return jwks
+
+    async def get_jwks(self, refresh: bool = False) -> Dict[str, Any]:
+        """The server's attestation keys; see QWEDClient.get_jwks."""
+        if not refresh and self._jwks_fresh():
+            return self._jwks
+        async with self._jwks_lock:
+            if not refresh:
+                if self._jwks_fresh():
+                    return self._jwks
+                self._raise_recent_failure()
+            return await self._fetch_jwks()
+
+    async def _jwks_after_mismatch(self, used: dict[str, Any]) -> dict[str, Any] | None:
+        """See QWEDClient._jwks_after_mismatch."""
+        async with self._jwks_lock:
+            if self._jwks is not None and self._jwks is not used:
+                return self._jwks
+            if time.monotonic() - self._jwks_attempted_at < _JWKS_MIN_REFRESH_SECONDS:
+                self._raise_recent_failure()
+                return None
+            return await self._fetch_jwks()
+
+    async def verify_attestation(
+        self,
+        result: VerificationResult | dict[str, Any],
+        query: Optional[str] = None,
+        *,
+        issuer: str = DEFAULT_ISSUER,
+        leeway: int = 0,
+    ) -> Dict[str, Any]:
+        """Verify an answer's attestation; see QWEDClient.verify_attestation."""
+        token, proof_ref, admission = _attestation_of(result)
+        verify = functools.partial(
+            verify_attestation, token, proof_ref=proof_ref, query=query, issuer=issuer, leeway=leeway,
+        )
+        jwks = await self.get_jwks()
+        try:
+            claims = verify(jwks)
+        except KeyMismatchError:
+            newer = await self._jwks_after_mismatch(jwks)
+            if newer is None:
+                raise
+            claims = verify(newer)
+        check_admission(claims, admission)
+        return claims
+
     async def __aenter__(self):
         self._client = httpx.AsyncClient(timeout=self.timeout)
         return self
@@ -472,7 +791,20 @@ class QWEDAsyncClient:
         verifier_version: Optional[str] = None,
         attestation_token: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Create a schema-valid Verification Context from a DiagnosticResult."""
+        """Create a schema-valid Verification Context from a DiagnosticResult.
+
+        The server records the diagnostic without vouching for it: the
+        message and developer fields are kept under
+        ``developer_fields.caller_supplied`` and decide nothing. The admission
+        is DENY unless ``attestation_token`` signs ADMIT for this verdict
+        (#321), as a token from a maths, code, SQL or natural-language answer,
+        or an agent or batch item's,
+        that the server admitted does.
+
+        The document returned is spec v1.1, signed by the server: its
+        ``attestation`` is what validate_verification_context and
+        resolve_verification_context require by default (#319).
+        """
         return await self._request(
             "POST",
             "/verification-context/from-diagnostic",
@@ -485,20 +817,62 @@ class QWEDAsyncClient:
             },
         )
 
-    async def validate_verification_context(self, document: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate a Verification Context document against the v1.0 schema."""
+    async def verify_document_attestation(
+        self,
+        document: Dict[str, Any],
+        *,
+        issuer: str = DEFAULT_ISSUER,
+        leeway: int = 0,
+    ) -> Dict[str, Any]:
+        """Verify a Verification Context document's attestation; see
+        QWEDClient.verify_document_attestation."""
+        _require_document_attestation(document)
+        verify = functools.partial(verify_document_attestation, document, issuer=issuer, leeway=leeway)
+        jwks = await self.get_jwks()
+        try:
+            return verify(jwks)
+        except KeyMismatchError:
+            newer = await self._jwks_after_mismatch(jwks)
+            if newer is None:
+                raise
+            return verify(newer)
+
+    async def _document_refusal(self, document: Dict[str, Any]) -> Optional[str]:
+        """See QWEDClient._document_refusal."""
+        if document_attestation(document) is None:
+            return ATTESTATION_REQUIRED
+        try:
+            await self.verify_document_attestation(document)
+        except KeysUnavailableError:
+            raise
+        except AttestationError:
+            return ATTESTATION_INVALID
+        return None
+
+    async def validate_verification_context(
+        self, document: Dict[str, Any], require_attestation: bool = True,
+    ) -> Dict[str, Any]:
+        """Validate a Verification Context document; see
+        QWEDClient.validate_verification_context."""
+        if require_attestation and (refusal := await self._document_refusal(document)) is not None:
+            return {"valid": False, "error": refusal}
         return await self._request(
             "POST",
             "/verification-context/validate",
-            json={"document": document},
+            json={"document": document, "require_attestation": require_attestation},
         )
 
-    async def resolve_verification_context(self, document: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolve the proof_ref commitment for a Verification Context document."""
+    async def resolve_verification_context(
+        self, document: Dict[str, Any], require_attestation: bool = True,
+    ) -> Dict[str, Any]:
+        """Resolve a Verification Context document's proof_ref; see
+        QWEDClient.resolve_verification_context."""
+        if require_attestation and (refusal := await self._document_refusal(document)) is not None:
+            return {"resolved": False, "error": refusal}
         return await self._request(
             "POST",
             "/verification-context/resolve",
-            json={"document": document},
+            json={"document": document, "require_attestation": require_attestation},
         )
 
     async def verify(
@@ -543,13 +917,16 @@ class QWEDAsyncClient:
         code: str,
         language: str = "python"
     ) -> VerificationResult:
-        """Verify code for security vulnerabilities."""
+        """Verify code with the server's CodeVerifier; see QWEDClient.verify_code."""
         start = time.time()
-        data = await self._request(
-            "POST",
-            "/verify/code",
-            json={"code": code, "language": language}
-        )
+        try:
+            data = await self._request(
+                "POST",
+                "/verify/code",
+                json={"code": code, "language": language}
+            )
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return _unreachable_code_result(start)
         data["latency_ms"] = (time.time() - start) * 1000
         return VerificationResult.from_dict(data)
     
@@ -598,11 +975,16 @@ class QWEDAsyncClient:
             }
         )
 
+        # The server's status, and meets_requirement, which it sets only for
+        # a VERIFIED result that meets the confidence (#269); a truthy value
+        # that is not exactly True admits nothing (GHSA-jppc-7r58-7pjh).
         return VerificationResult(
-            status="VERIFIED" if data.get("meets_requirement", False) else "UNVERIFIED",
-            is_verified=data.get("meets_requirement", False),
+            status=data.get("status") or ("VERIFIED" if data.get("meets_requirement") is True else "UNVERIFIED"),
+            is_verified=data.get("meets_requirement") is True,
             result=data,
-            latency_ms=data.get("latency_ms", 0.0) or (time.time() - start) * 1000
+            latency_ms=data.get("latency_ms", 0.0) or (time.time() - start) * 1000,
+            # So verify_attestation works on a consensus answer too (#319).
+            **token_fields(data),
         )
 
     async def verify_image(

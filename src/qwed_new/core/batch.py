@@ -6,18 +6,30 @@ with progress tracking and result aggregation.
 """
 
 import asyncio
+import contextvars
 import os
 import time
 import uuid
 import logging
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 
-from qwed_new.core.diagnostics import DiagnosticResult, admission_decision, enforce_trust_decision, merge_diagnostic_result
-from qwed_new.core.attestation import create_verification_attestation, AttestationStatus
+from qwed_new.core.diagnostics import admission_decision, merge_diagnostic_result
+from qwed_new.core.math_worker import _setting as _numeric_setting
+from qwed_new.core.route_diagnostics import logic_diagnostic, natural_language_diagnostic
+from qwed_new.core.trust import attest_and_enforce
+
+# An item whose job had no math budget left (GHSA-qgjc).
+BATCH_MATH_BUDGET = "batch.math_budget"
+# The job's math deadline (time.monotonic()), set by process_job for the items
+# it runs. Each item task, and the thread it hands math to, copies it.
+_math_deadline: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "qwed_batch_math_deadline", default=None
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +123,14 @@ class BatchVerificationService:
     # Wall-clock bound per item, so a stalled verification is marked failed
     # rather than keeping the job active forever (#447 review).
     _ITEM_TIMEOUT_SECONDS = float(os.environ.get("QWED_BATCH_ITEM_TIMEOUT", "60"))
+    # Wall-clock budget for all math items of one job together (GHSA-qgjc):
+    # each item also has the math time limit, so a batch of slow items cannot
+    # hold the math workers for batch size times that limit. It is read with
+    # the math worker's check: a value that is not a finite number of at
+    # least 0 stops the import, since an infinite budget would remove the
+    # bound and a negative one is no budget. 0 leaves batch math none, so its
+    # items are not run.
+    _MATH_BUDGET_SECONDS = _numeric_setting("QWED_BATCH_MATH_BUDGET_SECONDS", 120.0, 0)
 
     def __init__(self, max_concurrency: int = 10):
         self.max_concurrency = max_concurrency
@@ -175,13 +195,20 @@ class BatchVerificationService:
         self._jobs[job_id] = job
         return job
     
-    async def process_job(self, job: BatchJob) -> BatchJob:
+    async def process_job(
+        self,
+        job: BatchJob,
+        audit: Callable[[BatchJob, BatchItem], Awaitable[None]] | None = None,
+    ) -> BatchJob:
         """
         Process all items in a batch job concurrently.
-        
+
         Args:
             job: The batch job to process
-            
+            audit: Appends one audit row per item, after the item is verified
+                or has failed (#477). If it raises, the item is failed and its
+                result withheld, so no result is returned without its row.
+
         Returns:
             Updated BatchJob with results
         """
@@ -212,9 +239,16 @@ class BatchVerificationService:
                     logger.warning(f"Batch item {item.id} failed: {e}")
                 finally:
                     item.latency_ms = (time.time() - start_time) * 1000
+                if audit is not None:
+                    await self._audit_item(job, item, audit)
         
-        # Process all items concurrently
-        await asyncio.gather(*[process_item(item) for item in job.items])
+        # Process all items concurrently. The tasks copy the job's math
+        # deadline from this context (GHSA-qgjc).
+        deadline_token = _math_deadline.set(time.monotonic() + self._MATH_BUDGET_SECONDS)
+        try:
+            await asyncio.gather(*[process_item(item) for item in job.items])
+        finally:
+            _math_deadline.reset(deadline_token)
         
         # Update job status
         job.completed_at = datetime.utcnow()
@@ -228,6 +262,23 @@ class BatchVerificationService:
         
         return job
     
+    @staticmethod
+    async def _audit_item(
+        job: BatchJob,
+        item: BatchItem,
+        audit: Callable[[BatchJob, BatchItem], Awaitable[None]],
+    ) -> None:
+        """Append the item's audit row; fail the item if that fails (#477)."""
+        try:
+            await audit(job, item)
+        except Exception as exc:  # any failure fails the item
+            logger.exception("Batch item %s audit append failed: %s", item.id, type(exc).__name__)
+            if item.status == "completed":
+                job.failed_items += 1
+            item.status = "failed"
+            item.result = None
+            item.error = "audit persistence failed"
+
     async def _verify_item(
         self,
         item: BatchItem,
@@ -243,22 +294,52 @@ class BatchVerificationService:
         Returns:
             Verification result
         """
+        # Logic and natural-language items get the DiagnosticResult their
+        # routes return, built by the same helpers, not the control plane's
+        # raw dict (#494). Every item type takes its route's trust step: a
+        # VERIFIED result is signed and its attestation enforced (#320).
         if item.verification_type == VerificationType.NATURAL_LANGUAGE:
-            return await self.control_plane.process_natural_language(
+            from qwed_new.core.control_plane import natural_language_admission
+
+            result = await self.control_plane.process_natural_language(
                 item.query,
                 organization_id=organization_id
             )
-        
+            dr = attest_and_enforce(
+                natural_language_diagnostic(result),
+                engine="natural_language",
+                query=item.query,
+                admission=natural_language_admission,
+            )
+            # As /verify/natural_language: the verdict covers the translated
+            # expression, so admission is decided by its own rule.
+            return merge_diagnostic_result(dr) | {"admission": natural_language_admission(dr).value}
+
         elif item.verification_type == VerificationType.LOGIC:
-            return await self.control_plane.process_logic_query(
+            from qwed_new.core.control_plane import natural_language_admission
+
+            result = await self.control_plane.process_logic_query(
                 item.query,
                 organization_id=organization_id
             )
+            dr = attest_and_enforce(
+                logic_diagnostic(result),
+                engine="logic",
+                query=item.query,
+                admission=natural_language_admission,
+            )
+            # As /verify/logic: the verdict covers the constraints an LLM
+            # translated the question into, so it is admitted by the same rule
+            # as a natural-language verdict (#320).
+            return merge_diagnostic_result(dr) | {"admission": natural_language_admission(dr).value}
         
         elif item.verification_type == VerificationType.MATH:
-            # sympy is CPU-bound; run it in a worker thread so a batch does not
-            # block the event loop per item (#391).
-            return await asyncio.to_thread(self._verify_batch_math, item)
+            # SymPy runs in a math worker process (GHSA-qgjc); the wait for it
+            # runs on a math thread, not asyncio's shared executor, so it does
+            # not block the event loop (#391) or other routes' threads.
+            from qwed_new.core.math_worker import run_in_math_thread
+
+            return await run_in_math_thread(self._verify_batch_math, item)
 
         elif item.verification_type == VerificationType.CODE:
             from qwed_new.core.code_verifier import CodeVerifier
@@ -269,10 +350,11 @@ class BatchVerificationService:
                     item.query,
                     language=item.params.get("language", "python")
                 )
-                serialized = result.to_dict()
+                dr = attest_and_enforce(result, engine="code", query=item.query, admission=admission_decision)
+                serialized = dr.to_dict()
                 # Gate on admission like /verify/code: VERIFIED-as-unsafe code
                 # must never be admitted by authority-only consumers (#254).
-                serialized["admission"] = admission_decision(result).value
+                serialized["admission"] = admission_decision(dr).value
                 return serialized
 
             return await asyncio.to_thread(_verify_code)
@@ -286,20 +368,32 @@ class BatchVerificationService:
                     item.query,
                     item.params.get("context", "")
                 )
-                return result.to_dict()
+                return attest_and_enforce(result, engine="fact", query=item.query).to_dict()
 
             return await asyncio.to_thread(_verify_fact)
 
         elif item.verification_type == VerificationType.SQL:
             from qwed_new.core.sql_verifier import SQLVerifier
 
+            # As /verify/sql, which answers 400: without a schema the verifier
+            # skips the table check, so the item fails with no verdict.
+            schema_ddl = item.params.get("schema_ddl")
+            if not schema_ddl:
+                raise ValueError("Missing 'schema_ddl'")
+
             def _verify_sql() -> Dict[str, Any]:
                 verifier = SQLVerifier()
-                return verifier.verify_sql(
+                result = verifier.verify_sql(
                     item.query,
-                    item.params.get("schema_ddl", ""),
+                    schema_ddl,
                     dialect=item.params.get("dialect", "sqlite")
-                ).to_dict()
+                )
+                dr = attest_and_enforce(result, engine="sql", query=item.query, admission=admission_decision)
+                serialized = dr.to_dict()
+                # As /verify/sql: a proven-malicious query is VERIFIED but
+                # must not be admitted (#307).
+                serialized["admission"] = admission_decision(dr).value
+                return serialized
 
             return await asyncio.to_thread(_verify_sql)
         
@@ -307,65 +401,27 @@ class BatchVerificationService:
             raise ValueError(f"Unknown verification type: {item.verification_type}")
 
     def _verify_batch_math(self, item: BatchItem) -> Dict[str, Any]:
-        """Verify a MATH batch item through the DiagnosticResult + attestation trust boundary (#271)."""
-        from qwed_new.core.safe_parser import safe_parse_expr
-        from sympy import simplify
+        """Verify a MATH batch item through the DiagnosticResult + attestation trust boundary (#271).
 
-        expression = item.query.strip()
-        if "=" not in expression:
-            parsed = safe_parse_expr(expression)
-            simplified = simplify(parsed)
-            dr = DiagnosticResult.unverifiable(
-                "Expression simplified, but no equality or proof claim was provided",
-                developer_fields={"simplified": str(simplified), "type": "math", "is_valid": False, "query": expression},
-            )
-            return merge_diagnostic_result(enforce_trust_decision(dr, require_attestation=False, query=item.query))
+        SymPy runs in a math worker process with a wall-clock limit
+        (GHSA-qgjc): the item's limit is the math time limit, cut to what is
+        left of its job's math budget. An item with no budget left is not run."""
+        from qwed_new.core import math_worker
 
-        left, right = expression.split("=", 1)
-        left_expr = safe_parse_expr(left)
-        right_expr = safe_parse_expr(right)
-        diff = simplify(left_expr - right_expr)
-        is_valid = diff == 0
-        evidence = {"left": left.strip(), "right": right.strip(), "diff": str(diff)}
+        deadline = _math_deadline.get()
+        if deadline is not None and deadline <= time.monotonic():
+            dr = math_worker.timeout_result(0.0)
+            dr.developer_fields.update({"query": item.query.strip(), "type": "math", "constraint_id": BATCH_MATH_BUDGET})
+        else:
+            # Waits for a free worker within the item's limit, so a batch
+            # larger than the pool runs in turn rather than being refused.
+            dr = math_worker.run_math("batch", (item.query.strip(),), deadline=deadline)
 
-        if not is_valid:
-            dr = DiagnosticResult.unverifiable(
-                f"Not equal: {left_expr} != {right_expr}",
-                developer_fields={"query": expression, "type": "math", "is_valid": False, "diff": str(diff)},
-            )
-            return merge_diagnostic_result(enforce_trust_decision(dr, require_attestation=False, query=item.query))
-
-        # VERIFIED math identity: proof_ref + attestation are mandatory (#271)
-        developer_fields = {"query": expression, "type": "math", "is_valid": True, "diff": str(diff)}
-        att_result = create_verification_attestation(
-            status="VERIFIED",
-            verified=True,
-            engine="batch_math",
-            query=item.query,
-            confidence=1.0,
-            proof_data=str(evidence),
-        )
-        if att_result.status is not AttestationStatus.ISSUED:
-            developer_fields["constraint_id"] = "api.attestation.signing_error"
-            developer_fields["attestation_error"] = att_result.error_code
-            dr = DiagnosticResult.unverifiable(
-                "Attestation unavailable — cannot sign batch VERIFIED result",
-                developer_fields=developer_fields,
-            )
-            return merge_diagnostic_result(enforce_trust_decision(dr, require_attestation=False, query=item.query))
-
-        dr = DiagnosticResult.verified(
-            "Identity verified",
-            developer_fields=developer_fields,
-            evidence=evidence,
-            proof_data=str(evidence),
-        )
-        return merge_diagnostic_result(enforce_trust_decision(
-            dr,
-            require_attestation=True,
-            attestation_token=att_result.token,
-            query=item.query,
-        ))
+        # As /verify/math: a VERIFIED identity is signed and its attestation
+        # enforced, and is BLOCKED if signing fails (#271, #320). Admission is
+        # decided apart from the verdict, as there (#307).
+        dr = attest_and_enforce(dr, engine="math", query=item.query, admission=admission_decision)
+        return merge_diagnostic_result(dr) | {"admission": admission_decision(dr).value}
 
     def get_job(self, job_id: str) -> Optional[BatchJob]:
         """Get a batch job by ID."""

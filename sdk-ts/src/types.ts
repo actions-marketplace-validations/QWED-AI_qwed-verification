@@ -43,7 +43,7 @@ export enum VerificationStatus {
 /**
  * The server's decision at its enforcement boundary. Absent (`undefined`)
  * where the endpoint makes no decision, as `/verify/logic`, `/verify/fact`
- * and batch items do today; absent is never admitted.
+ * and batch logic and fact items do; absent is never admitted.
  */
 export enum Admission {
     /** The boundary may proceed with the verdict. */
@@ -152,16 +152,23 @@ export interface VerificationResponse {
     admission?: Admission;
     /** Set only when `status` is VERIFIED. */
     proof_ref?: string | null;
+    /**
+     * The server's signed attestation, an ES256 JWT, on a VERIFIED answer
+     * that passed its trust step (#319). Check it with
+     * `client.verifyAttestation(result)` or `verifyAttestation`. Absent
+     * otherwise, and never a non-string.
+     */
+    attestation?: string;
     agent_message?: string | null;
     is_authoritative?: boolean | null;
     constraint_id?: string | null;
     developer_fields?: Record<string, unknown> | null;
     /**
      * Set by the parser to `isAdmitted(response)`, whatever the body says.
-     * Endpoints that make no admission decision (logic, fact, rag, process
-     * and batch items today) are never admitted. The `verified` that
-     * `/verify/rag` and `/verify/process` send is their guard's own result;
-     * it stays in `developer_fields.verified`.
+     * Endpoints that make no admission decision (fact, rag, process and
+     * batch fact items) are never admitted. A top-level `verified`, which
+     * `/verify/rag` and `/verify/process` sent before they returned
+     * UNVERIFIABLE (#320), stays in `developer_fields.verified`.
      * @deprecated Use {@link isAdmitted}.
      */
     verified?: boolean;
@@ -184,8 +191,8 @@ export interface BatchItemResult {
     error?: string | null;
     latency_ms?: number;
     /**
-     * Set by the parser to `isAdmitted(item.result)`. Batch items carry no
-     * admission decision today, so it is false.
+     * Set by the parser to `isAdmitted(item.result)`. Batch logic and fact
+     * items carry no admission decision, so it is false for them.
      * @deprecated Use `isAdmitted(item.result)`.
      */
     verified?: boolean;
@@ -228,6 +235,8 @@ export interface AttestationClaims {
         result: AttestationResult;
         query_hash?: string;
         proof_hash?: string;
+        /** The server's admission, ADMIT or BLOCKED, on a route that decides one (#321). */
+        admission?: string;
         chain_id?: string;
         chain_index?: number;
     };

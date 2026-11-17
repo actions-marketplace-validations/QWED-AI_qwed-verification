@@ -114,8 +114,16 @@ def test_the_build_context_leaves_out_tests_and_other_sdks_but_not_what_images_c
     assert "**/tests/" in patterns
     assert "sdk-*/" in patterns
     # Nothing the Dockerfile copies may be ignored.
-    copied = set(re.findall(r"^COPY (?:--chown=\S+ )?(\S+) ", DOCKERFILE, re.M))
-    assert copied == {"requirements-server.txt", "src/qwed_new", "qwed_sdk", "requirements.txt", "action_entrypoint.py"}
+    # Every source of every COPY: the last argument is the destination,
+    # and flags such as --chown are not sources.
+    copied = set()
+    for args in re.findall(r"^COPY (.+)$", DOCKERFILE, re.M):
+        sources = [arg for arg in args.split() if not arg.startswith("--")][:-1]
+        copied.update(sources)
+    assert copied == {
+        "requirements-server.txt", "src/qwed_new", "qwed_sdk", "requirements.txt", "action_entrypoint.py",
+        "LICENSE", "NOTICE",
+    }
     for source in copied:
         top = source.split("/")[0]
         assert not any(p.rstrip("/") in (source, top) for p in patterns), source
@@ -273,7 +281,7 @@ def test_kubernetes_pins_the_first_server_image():
     deployment = yaml.safe_load((ROOT / "deploy" / "kubernetes" / "deployment.yaml").read_text(encoding="utf-8"))
     image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
 
-    assert image == "docker.io/qwedai/qwed-verification:7.3.1"
+    assert image == "docker.io/qwedai/qwed-verification:10.0.0"
 
 
 def test_the_kubernetes_secret_has_every_server_secret():

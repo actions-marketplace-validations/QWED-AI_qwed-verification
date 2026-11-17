@@ -85,13 +85,19 @@ print(result.is_verified)  # False
 
 ### `verify_logic(query)`
 
-Verify a QWED-Logic DSL expression using Z3.
+Check whether a claim follows from the conditions a question states. The configured model translates the question into constraints and a claim, and Z3 decides the claim for every value of the variables.
 
 ```python
-result = client.verify_logic("(AND (GT x 5) (LT y 10))")
-print(result.status)  # "SAT"
-print(result.result)  # {"model": {"x": 6, "y": 9}}
+result = client.verify_logic("x is greater than 5. Is x greater than 3?")
+print(result.status)       # "VERIFIED": the claim follows from the constraints
+print(result.is_verified)  # False: the translation is not verified, so it is not admitted
+
+result = client.verify_logic("x is greater than 5. Is x greater than 10?")
+print(result.status, result.result["is_valid"])  # "VERIFIED" False: proven false
+print(result.result["model"])                    # the counterexample, such as {"x": "6"}
 ```
+
+Constraints with no claim are `UNVERIFIABLE`: one satisfying assignment proves nothing.
 
 ### `verify_code(code, language="python")`
 
@@ -174,7 +180,79 @@ class VerificationResult:
     result: dict          # Full response data
     error: str | None     # Error message if any
     latency_ms: float     # Request latency
+    attestation: str | None  # The server's signed token, on a VERIFIED answer
+    proof_ref: str | None    # The proof the token binds
 ```
+
+### Verifying the attestation
+
+Every `VERIFIED` answer carries `attestation`, an ES256 JWT the server
+signed after checking the verdict. Verifying it shows that server issued a
+VERIFIED verdict for this answer's `proof_ref` (and, when you pass `query`,
+for that statement). On a route that decides an admission (maths, code,
+SQL and natural language, the agent route, and their batch items), the
+token signs that too, and `verify_attestation`
+checks it is the answer's `admission`. It covers only what the token signs,
+not other fields of the response such as `agent_message`:
+
+```python
+from qwed_sdk import AttestationError
+
+result = client.verify_math("2+2=4")
+if result.attestation:
+    try:
+        # Fetches /.well-known/jwks.json (cached for five minutes), then
+        # checks the signature, issuer, expiry (and any nbf), a VERIFIED
+        # status, and that the token is this answer's (its proof_hash is
+        # result.proof_ref). If no cached key verifies it, the keys are
+        # fetched once more, at most once every 30 s, to pick up a rotated
+        # key or a restarted server's new one. If the keys cannot be
+        # fetched it raises KeysUnavailableError (an AttestationError).
+        claims = client.verify_attestation(result, query="2+2=4")
+    except AttestationError as exc:
+        print("attestation does not verify for this answer:", exc)
+```
+
+To verify offline, or against keys you pinned, use
+`qwed_sdk.verify_attestation(token, jwks, proof_ref=..., query=..., admission=...)` with the
+JWKS you hold. A token says the server reached the verdict; whether to act
+on it is still the answer's admission.
+
+### Verification Context documents
+
+A document's `proof_ref` is a commitment anyone can compute, so it does not
+show who issued the document. The server returns spec v1.1 documents, which
+carry `attestation`: its signature over every other field of the document
+(the token cannot sign itself). By default
+`validate_verification_context` and `resolve_verification_context` verify
+it against the server's keys before asking the server:
+
+```python
+document = client.create_verification_context_from_diagnostic(
+    diagnostic, query="mean of a == 2", verifier="stats", attestation_token=result.attestation,
+)
+client.resolve_verification_context(document)        # {"resolved": True}
+client.resolve_verification_context(forged_document) # {"resolved": False, "error": "attestation_invalid"}
+client.validate_verification_context(local_v1_0)     # {"valid": False, "error": "attestation_required"}
+client.validate_verification_context(local_v1_0, require_attestation=False)  # the schema alone
+```
+
+The server's routes and the CLI check it too, by default:
+
+```bash
+qwed context resolve --server http://localhost:8000 document.json
+qwed context validate --jwks-file jwks.json document.json
+qwed context validate --no-require-attestation local_v1_0.json
+```
+
+`client.verify_document_attestation(document)` returns the claims or raises
+`AttestationError`; offline, use
+`qwed_sdk.verify_document_attestation(document, jwks)`. Keys that cannot be
+fetched raise `KeysUnavailableError` rather than report a document invalid.
+The signature authenticates the document; it adds nothing to its verdict or
+admission. A server without a configured signing key (`QWED_SIGNING_KEY` or
+`QWED_SIGNING_KEY_FILE`) signs with a key generated per process, so its
+documents stop verifying after a restart, or on another replica.
 
 ### BatchResult
 
@@ -219,44 +297,48 @@ except httpx.RequestError as e:
 
 ## Environment Variables
 
-The SDK can be configured via environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QWED_API_KEY` | - | Your API key (required for CLI) |
-| `QWED_API_URL` | `http://localhost:8000` | API base URL |
+`QWEDClient` and `QWEDAsyncClient` read no environment variables: pass `api_key` and `base_url` when you create them.
 
 ---
 
 ## CLI Usage
 
-The SDK includes a command-line interface:
+The SDK includes the `qwed` command:
 
 ```bash
-# Set API key
-export QWED_API_KEY="qwed_your_key"
+qwed init      # set up a model provider and its model, and a local API key
+qwed doctor    # health check: engines, provider, server, database
+qwed test      # the built-in engine checks; needs no model or server
 
-# Health check
-qwed health
-
-# Verify queries
+# Verify with a model provider, from this machine
 qwed verify "What is 2+2?"
-qwed verify-math "x**2 + 2*x + 1 = (x+1)**2"
-qwed verify-logic "(AND (GT x 5) (LT y 10))"
-qwed verify-code -f script.py
+qwed verify "derivative of x^2" --provider openai --model <model> --api-key <openai-key>
+qwed verify "5!" --base-url http://localhost:11434/v1 --model <model>
+qwed interactive
 
-# Batch processing
-qwed batch input.json -o results.json
+qwed cache stats    # or: qwed cache clear
+qwed pii "My email is john@example.com"    # needs qwed[pii]
 ```
 
-### CLI Flags
+`qwed verify` and `qwed interactive` call the model provider directly, with no QWED server.
 
-| Flag | Description |
-|------|-------------|
-| `-j, --json` | Output raw JSON |
-| `-o, --output` | Write results to file |
-| `-f, --file` | Read input from file |
-| `-l, --language` | Programming language (for code) |
+- **Model.** QWED names no model. They use `--model`, else the selected provider's model variable (`OLLAMA_MODEL`, `CUSTOM_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL` or `GEMINI_MODEL`), and stop with a message naming it when neither is set.
+- **Provider.** Without `--provider` (or `--base-url`, for `qwed verify`), they run the provider `ACTIVE_PROVIDER` selects: the one `qwed init` saved, and Ollama when it is unset. Its key comes from its own variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `CUSTOM_API_KEY`, or for Gemini `GOOGLE_API_KEY`, else `GEMINI_API_KEY`), never from `QWED_API_KEY`. `qwed verify --api-key` overrides it. `qwed interactive` has no `--api-key`: for OpenAI, Anthropic or Gemini it asks for the key when the variable is unset.
+- **Key with `--provider`.** `qwed verify --provider` takes the key from `--api-key` or `QWED_API_KEY`; `qwed interactive --provider` asks for it.
+
+### `qwed verify` options
+
+| Option | Description |
+|--------|-------------|
+| `-p, --provider` | `openai`, `anthropic` or `gemini` |
+| `-m, --model` | The model to run |
+| `--base-url` | An OpenAI-compatible endpoint, such as Ollama's |
+| `--api-key` | The provider's API key |
+| `--no-cache` | Do not use the result cache |
+| `-q, --quiet` | Minimal output |
+| `--mask-pii` | Mask emails, phone numbers and similar before the question goes to the model |
+
+Run `qwed <command> --help` for the other commands' options.
 
 ---
 

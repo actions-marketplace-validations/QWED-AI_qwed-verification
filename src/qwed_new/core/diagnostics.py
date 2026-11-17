@@ -477,11 +477,14 @@ class DiagnosticResult:
         3. proof_ref        — Layer 3 (cryptographic proof artifact hash)
 
     Authority contract:
-        proof_ref is not None  → authoritative, admissible for control flow
+        proof_ref is not None  → authoritative: decided, evidence committed
         proof_ref is None      → non-authoritative, NOT admissible for control flow
 
     This is the mechanical rule downstream gates use (per #190 Keesan
-    discussion): no separate `authoritative` boolean needed.
+    discussion): no separate `authoritative` boolean needed. Authority is
+    necessary, not sufficient: a claim proven false, or a verdict on a
+    model's translation, is authoritative too, so gate control flow on
+    ``admission_decision`` (#630).
 
     Constraints enforced in __post_init__:
         - status == VERIFIED  requires proof_ref is not None
@@ -493,11 +496,25 @@ class DiagnosticResult:
     agent_message: str
     developer_fields: Dict[str, Any] = field(default_factory=dict)
     proof_ref: Optional[str] = None
+    # The signed attestation (an ES256 JWT) for a VERIFIED result, set by the
+    # trust step once it is enforced (core/trust.py) and delivered with the
+    # response, so a consumer can check it against the server's JWKS (#319).
+    # Never read from input: from_dict leaves it out.
+    attestation: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.agent_message or not self.agent_message.strip():
             raise ValueError(
                 "agent_message must be non-empty — Layer 1 diagnostics are mandatory"
+            )
+
+        if self.attestation is not None and (
+            self.status is not DiagnosticStatus.VERIFIED
+            or not isinstance(self.attestation, str)
+            or not self.attestation
+        ):
+            raise ValueError(
+                "attestation is a non-empty token, and only a VERIFIED result carries one"
             )
 
         if self.status is DiagnosticStatus.VERIFIED and not self.proof_ref:
@@ -513,6 +530,22 @@ class DiagnosticResult:
                 "non-VERIFIED states are non-authoritative by construction."
             )
 
+    def with_attestation(self, token: str) -> "DiagnosticResult":
+        """This result, carrying ``token`` as its attestation (#319).
+
+        For the trust step only, once the token has passed its checks; the
+        constructor still refuses a token on a result that is not VERIFIED.
+        Built field by field rather than with dataclasses.replace, so a
+        field added to this class is added here too.
+        """
+        return DiagnosticResult(
+            status=self.status,
+            agent_message=self.agent_message,
+            developer_fields=self.developer_fields,
+            proof_ref=self.proof_ref,
+            attestation=token,
+        )
+
     @property
     def is_verified(self) -> bool:
         """True only when status is VERIFIED (which implies proof_ref is not None)."""
@@ -520,13 +553,13 @@ class DiagnosticResult:
 
     @property
     def is_authoritative(self) -> bool:
-        """Authority bit — True when proof_ref is present (admissible for control flow).
+        """Authority bit: True when proof_ref is present.
 
         This is Keesan's `authoritative=true` from #190, expressed as
-        proof_ref presence rather than a separate boolean. Downstream gates:
-
-            if not result.is_authoritative:
-                block_decision()  # non-authoritative — reject for control flow
+        proof_ref presence rather than a separate boolean. It says the verdict
+        was decided and its evidence committed, not that the claim holds: a
+        claim proven false, or a verdict on a model's translation, is
+        authoritative too. Gate control flow on ``admission_decision`` (#630).
         """
         return self.proof_ref is not None
 
@@ -579,20 +612,26 @@ class DiagnosticResult:
                 item.to_dict() if isinstance(item, AdvisoryCheck) else item
                 for item in checks
             ]
-        return {
+        serialized = {
             "status": self.status.value,
             "agent_message": self.agent_message,
             "developer_fields": fields,
             "proof_ref": self.proof_ref,
             "is_authoritative": self.is_authoritative,
         }
+        # Only where there is one, so other results keep their shape (#319).
+        if self.attestation is not None:
+            serialized["attestation"] = self.attestation
+        return serialized
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DiagnosticResult":
         """Deserialize from dict (e.g., API response, attestation claim).
 
         Tolerates status as str or DiagnosticStatus. Tolerates missing
-        developer_fields (defaults to empty dict).
+        developer_fields (defaults to empty dict). An ``attestation`` in the
+        input is not read: a token is only ever attached by the trust step
+        that issued and checked it (#319).
 
         Raises:
             ValueError: If agent_message is missing or empty — Layer 1
@@ -600,18 +639,24 @@ class DiagnosticResult:
                         during deserialization.
             ValueError: If status is a string not in DiagnosticStatus —
                         use from_legacy_dict() for pre-#204 engine data.
+            TypeError: If status is not a string (None, a number, a list):
+                       it would otherwise pass through unconverted and fail
+                       later, wherever ``status.value`` is read (#509).
         """
         status = data.get("status", "UNVERIFIABLE")
-        if isinstance(status, str):
-            try:
-                status = DiagnosticStatus(status)
-            except ValueError:
-                valid = ", ".join(s.value for s in DiagnosticStatus)
-                raise ValueError(
-                    f"from_dict: invalid status {status!r} — "
-                    f"must be one of: {valid}. "
-                    "Use from_legacy_dict() for pre-#204 engine data."
-                ) from None
+        if not isinstance(status, str):
+            raise TypeError(
+                f"from_dict: status must be a string, not {type(status).__name__}"
+            )
+        try:
+            status = DiagnosticStatus(status)
+        except ValueError:
+            valid = ", ".join(s.value for s in DiagnosticStatus)
+            raise ValueError(
+                f"from_dict: invalid status {status!r} — "
+                f"must be one of: {valid}. "
+                "Use from_legacy_dict() for pre-#204 engine data."
+            ) from None
 
         agent_message = data.get("agent_message")
         if not agent_message or not str(agent_message).strip():
@@ -918,6 +963,7 @@ def _validate_attestation_claims(
     token_claims: Dict[str, Any],
     query: Optional[str],
     policy: str,
+    admission: str | None = None,
 ) -> Optional[DiagnosticResult]:
     """Validate token claims against result. Returns a blocked result or None."""
     raw_qwed = (token_claims or {}).get("qwed")
@@ -996,7 +1042,37 @@ def _validate_attestation_claims(
             },
         )
 
-    return None
+    return _admission_mismatch(result, qwed_claims, admission, policy)
+
+
+def _admission_mismatch(
+    result: DiagnosticResult,
+    qwed_claims: dict[str, Any],
+    admission: str | None,
+    policy: str,
+) -> DiagnosticResult | None:
+    """A blocked result if ``admission`` is given and the token does not sign
+    it (``qwed.admission``, #321); None otherwise. The verdict it blocks is
+    kept beside the reason, unchanged, as evidence (#514 review)."""
+    if admission is None or qwed_claims.get("admission") == admission:
+        return None
+    logger.warning(
+        "trust_gate.blocked constraint_id=%s reason=claims_admission_mismatch policy=%s",
+        result.constraint_id or "unknown",
+        policy,
+    )
+    return DiagnosticResult.blocked(
+        agent_message="Verification blocked — attestation does not sign this admission",
+        developer_fields={
+            "constraint_id": "trust_gate.claims_admission_mismatch",
+            "token_admission": qwed_claims.get("admission"),
+            "expected_admission": admission,
+            "policy": policy,
+            "verdict_status": result.status.value,
+            "verdict_proof_ref": result.proof_ref,
+            "verdict_developer_fields": result.developer_fields,
+        },
+    )
 
 
 def _snapshot_developer_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -1043,6 +1119,7 @@ def enforce_trust_decision(
     require_attestation: bool = True,
     trusted_issuers: Optional[List[str]] = None,
     query: Optional[str] = None,
+    admission: str | None = None,
 ) -> DiagnosticResult:
     """Enforce trust-boundary gate: VERIFIED without required attestation → BLOCKED.
 
@@ -1061,6 +1138,9 @@ def enforce_trust_decision(
         query: Original query string for query_hash binding validation.
             If provided, the attestation token's qwed.query_hash claim must
             match sha256(query). Without it, query binding is not checked.
+        admission: The admission decision the token must sign, "ADMIT" or
+            "BLOCKED" (#321). If provided, the token's qwed.admission claim
+            must equal it. Without it, the admission is not checked.
 
     Returns:
         The original DiagnosticResult if all policy checks pass, or a BLOCKED
@@ -1133,15 +1213,18 @@ def enforce_trust_decision(
         return verification
     _is_valid, token_claims, _error = verification
 
-    validation = _validate_attestation_claims(result, token_claims, query, policy)
+    validation = _validate_attestation_claims(result, token_claims, query, policy, admission)
     if validation is not None:
         return validation
 
     return result
 
 
+# "attestation" too, so developer fields, which a caller can author (#321),
+# never put a token in a response the trust step did not issue (#319).
 DIAGNOSTIC_RESPONSE_KEYS = frozenset({
     "status", "agent_message", "developer_fields", "proof_ref", "is_authoritative",
+    "attestation",
 })
 
 
@@ -1152,9 +1235,16 @@ def admission_decision(result: DiagnosticResult) -> AdmissionDecision:
     deterministic gate turns it into a fail-closed admission outcome:
 
     - fail-closed status (BLOCKED/UNVERIFIABLE)         -> BLOCKED
-    - ``developer_fields.is_valid is not True``          -> BLOCKED (missing/malformed)
-    - authoritative (VERIFIED) and valid                 -> ADMIT
+    - not ``claim_verified``                             -> BLOCKED
+    - authoritative (VERIFIED) and verified              -> ADMIT
     - anything else (non-authoritative)                  -> BLOCKED
+
+    ``claim_verified`` needs ``is_valid`` true, and refuses a verdict reached
+    on a model's translation of the question: ``query_semantics_verified``
+    present and not true, or absent from a result whose
+    ``verification_scope`` is ``translated_expression_only``. So every caller
+    of this rule, a route, batch, the Verification Context bridge or a
+    library user, gets the same answer for the same result (#630).
 
     Returning ``BLOCKED`` for a VERIFIED-but-unsafe result is a policy decision
     at the boundary (QWED #7), not a reinterpretation of the verdict (QWED #15):
@@ -1162,11 +1252,57 @@ def admission_decision(result: DiagnosticResult) -> AdmissionDecision:
     """
     if result.is_fail_closed:
         return AdmissionDecision.BLOCKED
-    if result.developer_fields.get("is_valid") is not True:
+    if not claim_verified(result):
         return AdmissionDecision.BLOCKED
     if result.is_authoritative:
         return AdmissionDecision.ADMIT
     return AdmissionDecision.BLOCKED
+
+
+def _verified_fields(status: Any, fields: Any) -> bool:
+    """``claim_verified``'s rule, on a status and its developer fields."""
+    return (
+        status == DiagnosticStatus.VERIFIED
+        and isinstance(fields, dict)
+        and fields.get("is_valid") is True
+        # Absent where the route checked the user's own input; where present,
+        # only true counts. A result that says it covers a model's translation
+        # must say its meaning was verified (#630).
+        and fields.get(
+            "query_semantics_verified",
+            fields.get("verification_scope") != "translated_expression_only",
+        ) is True
+    )
+
+
+def claim_verified(result: DiagnosticResult) -> bool:
+    """Whether *result* proved that its claim holds (#577): ``VERIFIED``, with
+    ``developer_fields.is_valid`` true, and not reached on a model's
+    translation of the question.
+
+    This is the one meaning of "verified" that the attestation, the audit row
+    and the batch summary use. A ``VERIFIED`` result can also prove a claim
+    false, as it does for SQL proven unsafe, and a result with no ``is_valid``
+    says nothing about its claim, so neither is verified.
+
+    A natural-language or logic verdict records ``query_semantics_verified``
+    false: the engine decided the expression or constraints a model wrote
+    from the question, and nothing checks that they mean what was asked. It
+    proves the translation, not the claim, so it is not verified either, on
+    the same ground on which ``natural_language_admission`` does not admit it.
+    """
+    return _verified_fields(result.status, result.developer_fields)
+
+
+def claim_verified_item(item: Dict[str, Any]) -> bool:
+    """``claim_verified`` for a serialized result, such as a batch item."""
+    return _verified_fields(item.get("status"), item.get("developer_fields"))
+
+
+def _item_validity(item: Dict[str, Any]) -> Any:
+    """The ``is_valid`` of a serialized batch item, or None."""
+    fields = item.get("developer_fields")
+    return fields.get("is_valid") if isinstance(fields, dict) else None
 
 
 def merge_diagnostic_result(dr: DiagnosticResult) -> Dict[str, Any]:
@@ -1241,8 +1377,15 @@ def aggregate_batch_diagnostic(
             },
         )
 
-    verified = sum(1 for item in items if item["status"] == "VERIFIED")
-    blocked = sum(1 for item in items if item["status"] == "BLOCKED")
+    # Verified as claim_verified decides it (#577). A VERIFIED item whose
+    # claim was proven false is refuted, so it counts with the blocked ones; a
+    # VERIFIED item with no is_valid, or one reached on a model's translation
+    # of the question, says nothing about the claim, so it is unverifiable.
+    verified = sum(1 for item in items if claim_verified_item(item))
+    blocked = sum(
+        1 for item in items
+        if item["status"] == "BLOCKED" or (item["status"] == "VERIFIED" and _item_validity(item) is False)
+    )
     unverifiable = total - verified - blocked
     is_verified_all = verified == total
 

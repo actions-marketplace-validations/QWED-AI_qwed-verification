@@ -39,14 +39,15 @@ Every verification returns the server's DiagnosticResult envelope:
 |-------|---------|
 | `status` | `VERIFIED`, `UNVERIFIABLE` or `BLOCKED` (`UNKNOWN` for a missing value or one this SDK does not know) |
 | `rawStatus` | The server's status text exactly as sent, such as `SAT` where `status` is `UNKNOWN`; never used for admission |
-| `admission` | `ADMIT` or `BLOCKED` where the endpoint decides (`UNKNOWN` for a value this SDK does not know); absent where it does not, as on `/verify/logic`, `/verify/fact` and batch items |
+| `admission` | `ADMIT` or `BLOCKED` where the endpoint decides (`UNKNOWN` for a value this SDK does not know); absent where it does not, as on `/verify/fact` and batch fact items |
 | `proof_ref` | Set only when `status` is `VERIFIED` |
+| `attestation` | The server's signed token on a `VERIFIED` answer (see [Attestations](#attestations)) |
 | `agent_message`, `developer_fields`, `is_authoritative`, `constraint_id` | Explanation and detail |
 | any other key | The endpoint's own fields, such as `is_valid`, `issues` or `error`. Numbers come from `JSON.parse`, so an integer above 2^53 or a long decimal is rounded |
 
 **Gate on `isAdmitted(result)`, not on `status`.** `VERIFIED` means the engine reached a deterministic answer, not that the claim holds: `2 + 2 = 5` is `VERIFIED · BLOCKED` (proven false), and unsafe code is `VERIFIED · BLOCKED` (proven unsafe). `isAdmitted()` is true only for `ADMIT` together with `VERIFIED` and a `proof_ref`; a missing or unknown admission is never admitted.
 
-`verified` and `isVerified()` are deprecated. The parser always sets `verified` to `isAdmitted(result)`, whatever the body says, and `isVerified()` returns `isAdmitted()`. Endpoints that make no admission decision (`/verify/logic`, `/verify/fact`, `/verify/rag`, `/verify/process` and batch items today) are therefore never admitted. `/verify/rag` and `/verify/process` do send a top-level `verified`, which is their guard's own result; the parser replaces it, and the guard's value stays in `developer_fields.verified`. If you fetch responses yourself, pass the parsed JSON to `parseVerificationResponse()` or `parseBatchResponse()`.
+`verified` and `isVerified()` are deprecated. The parser always sets `verified` to `isAdmitted(result)`, whatever the body says, and `isVerified()` returns `isAdmitted()`. Endpoints that make no admission decision (`/verify/fact`, `/verify/rag`, `/verify/process`, and batch fact items) are therefore never admitted. `/verify/logic` and batch logic items decide one as `/verify/natural_language` does: their verdict covers the constraints an LLM translated the question into, so the admission is `BLOCKED` until QWED verifies the translation itself ([#585](https://github.com/QWED-AI/qwed-verification/issues/585)). `/verify/rag` and `/verify/process` return `UNVERIFIABLE`: what their guards check comes from the request itself, so the guard's result is advisory only, in `developer_fields.advisory_checks` ([#320](https://github.com/QWED-AI/qwed-verification/issues/320)). An older server also sent the guard's result as a top-level `verified`; the parser replaces it, and the guard's value stays in `developer_fields.verified`. If you fetch responses yourself, pass the parsed JSON to `parseVerificationResponse()` or `parseBatchResponse()`.
 
 ## Verification Methods
 
@@ -68,8 +69,8 @@ console.log(result.is_valid);
 
 ```typescript
 const result = await client.verifyLogic('(AND (GT x 5) (LT y 10))');
-// /verify/logic makes no admission decision: admission is undefined and
-// isAdmitted() is false, whatever the status.
+// The verdict covers the translated constraints only: admission is BLOCKED
+// and isAdmitted() is false, whatever the status.
 console.log(result.status, result.admission);
 ```
 
@@ -128,18 +129,34 @@ for (const item of batch.items) {
 
 ## Attestations
 
-Request cryptographic proof of verification:
+Every `VERIFIED` answer carries `attestation`: an ES256 JWT the server signed
+after checking the verdict (no request option is needed). Verifying it shows
+that server issued a VERIFIED verdict for this answer's `proof_ref` (and,
+when you pass the query, for that statement). On a route that decides an
+admission (maths, code, SQL and natural language, the agent route, and
+their batch items), the token signs that too,
+and `client.verifyAttestation` checks it is the answer's `admission`. It
+covers only what the token signs, not other fields of the response such as
+`agent_message`:
 
 ```typescript
-const result = await client.verify('2+2=4', {
-  includeAttestation: true,
-});
-
-if (typeof result.attestation === 'string') {
-  const parsed = parseAttestation(result.attestation);
-  console.log(parsed?.payload.qwed.result.status); // 'VERIFIED'
+const result = await client.verifyMath('2 + 2 = 4');
+if (result.attestation) {
+  // Fetches the server's keys from /.well-known/jwks.json (cached for five
+  // minutes) and checks the signature, issuer, expiry (and any nbf), a
+  // VERIFIED status, and that the token is this answer's (its proof_hash is
+  // result.proof_ref). If the key the token names is missing or does not
+  // verify it, the keys are fetched once more, at most every 30 s.
+  const claims = await client.verifyAttestation(result, '2 + 2 = 4');
+  console.log(claims.exp); // when the token expires
 }
 ```
+
+To verify offline, or against keys you pinned, call
+`verifyAttestation(token, jwks, { proofRef, query, admission })` with the JWKS you
+hold. A failure throws `AttestationError`. A token says the server reached
+the verdict; whether to act on it is still `isAdmitted(result)`.
+`parseAttestation` only decodes a token, without checking it.
 
 ## Agent Verification
 

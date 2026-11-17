@@ -51,8 +51,9 @@ func TestContractEveryFixture(t *testing.T) {
 		{"code_unsafe", StatusVerified, AdmissionBlocked, true, false},
 		{"sql", StatusVerified, AdmissionAdmit, true, true},
 		{"natural_language", StatusUnverifiable, AdmissionBlocked, false, false},
-		// /verify/logic and /verify/fact make no admission decision.
-		{"logic", StatusBlocked, "", false, false},
+		// /verify/logic decides admission as /verify/natural_language does (#320).
+		{"logic", StatusBlocked, AdmissionBlocked, false, false},
+		// /verify/fact makes no admission decision.
 		{"fact", StatusUnverifiable, "", false, false},
 	}
 	for _, tt := range tests {
@@ -90,6 +91,17 @@ func TestContractEnvelopeDetails(t *testing.T) {
 	}
 	if verified.IsAuthoritative == nil || !*verified.IsAuthoritative {
 		t.Error("a deterministic proof should be authoritative")
+	}
+	// A VERIFIED answer carries its attestation in the typed field (#319);
+	// a BLOCKED one has none.
+	if verified.Attestation == "" {
+		t.Error("attestation: missing on a VERIFIED answer")
+	}
+	if _, ok := verified.Extra["attestation"]; ok {
+		t.Error("attestation is in Extra; it is an envelope field")
+	}
+	if ambiguous := response(t, "math_ambiguous"); ambiguous.Attestation != "" {
+		t.Errorf("attestation on a BLOCKED answer: %q", ambiguous.Attestation)
 	}
 
 	// Endpoint fields go to Extra; envelope fields do not.
@@ -140,7 +152,11 @@ func TestContractBatch(t *testing.T) {
 		t.Fatalf("items: got %d, want 2", len(batch.Items))
 	}
 
-	want := []VerificationStatus{StatusVerified, StatusUnverifiable}
+	// Both are decided: the second is proven false, as on /verify/math (#530).
+	want := []VerificationStatus{StatusVerified, StatusVerified}
+	// Batch math items carry the admission /verify/math decides: the proven
+	// identity is admitted, the disproven one is not.
+	wantAdmission := []Admission{AdmissionAdmit, AdmissionBlocked}
 	for i, item := range batch.Items {
 		if item.Status != "completed" || item.Type != TypeMath || item.Query == "" {
 			t.Errorf("item %d: got status %q type %q query %q", i, item.Status, item.Type, item.Query)
@@ -151,9 +167,10 @@ func TestContractBatch(t *testing.T) {
 		if item.Result.Status != want[i] {
 			t.Errorf("item %d: status %q, want %q", i, item.Result.Status, want[i])
 		}
-		// Batch math items carry no admission decision today, so none is admitted.
-		if item.Result.Admission != "" || item.IsAdmitted() || item.Verified {
-			t.Errorf("item %d: admitted without an admission decision", i)
+		wantAdmitted := i == 0
+		if item.Result.Admission != wantAdmission[i] || item.IsAdmitted() != wantAdmitted || item.Verified != wantAdmitted {
+			t.Errorf("item %d: admission %q, admitted %v, verified %v; want %q, %v",
+				i, item.Result.Admission, item.IsAdmitted(), item.Verified, wantAdmission[i], wantAdmitted)
 		}
 	}
 	if batch.Items[0].Result.ProofRef == "" {
@@ -336,8 +353,8 @@ func TestAQuarantinedResponseStaysUnknown(t *testing.T) {
 }
 
 func TestARagOrProcessGuardResultIsNotAnAdmission(t *testing.T) {
-	// /verify/rag and /verify/process merge the guard's result to the top
-	// level and make no admission decision.
+	// /verify/rag and /verify/process make no admission decision. Before
+	// #320 they also merged the guard's result to the top level, as here.
 	body := `{"status": "VERIFIED", "proof_ref": "sha256:ab", "verified": true,
 		"developer_fields": {"verified": true}}`
 	var r VerificationResponse

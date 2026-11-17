@@ -2,6 +2,8 @@
 Regression tests for Issue #257: Image, Graph, Reasoning, and Consensus
 engines must never return VERIFIED from heuristic/model fallback paths.
 """
+from types import SimpleNamespace
+
 from qwed_new.core.image_verifier import ImageVerifier
 from qwed_new.core.graph_fact_verifier import GraphFactVerifier
 from qwed_new.core.reasoning_verifier import ReasoningVerifier
@@ -200,9 +202,10 @@ class TestConsensusVerifierAdvisoryOnly:
             ),
         ]
         consensus = self.verifier._calculate_consensus(results)
-        # Python is the only active engine → unanimous, but blocked engine prevents VERIFIED
-        assert consensus["diagnostic_status"] == "UNVERIFIABLE"
-        assert consensus["status"] == "unanimous"
+        # Python is the only engine that verified, and one engine is not a
+        # consensus (#320), so the result is BLOCKED, not VERIFIED.
+        assert consensus["diagnostic_status"] == "BLOCKED"
+        assert consensus["status"] == "no_independent_verification"
 
     def test_all_blocked_propagates(self):
         """All BLOCKED → consensus BLOCKED."""
@@ -324,8 +327,9 @@ class TestConsensusVerifierAdvisoryOnly:
             ),
         ]
         consensus = self.verifier._calculate_consensus(results)
-        assert consensus["diagnostic_status"] == "UNVERIFIABLE"
-        assert consensus["status"] == "unanimous"
+        # Only SymPy verified, and one engine is not a consensus (#320).
+        assert consensus["diagnostic_status"] == "BLOCKED"
+        assert consensus["status"] == "no_independent_verification"
 
     def test_verified_evidence_answer_none_stays_null_and_type_differs(self):
         """Verified consensus evidence: answer None→null, repr carries type info (#266)."""
@@ -581,6 +585,11 @@ class TestFactVerifierLLMAdvisoryOnly:
     def test_llm_does_not_change_verdict(self):
         """LLM advisory is separate — verdict stays deterministic."""
         verifier = FactVerifier(use_llm_fallback=True)
+        # "dummy" names no provider QWED runs, which is refused (#574), so a
+        # stand-in translator gives the advisory.
+        verifier._translator = SimpleNamespace(
+            verify_fact=lambda *_args, **_kwargs: {"verdict": "SUPPORTED", "confidence": 0.99, "reasoning": "stub"}
+        )
         result = verifier.verify_fact(
             "Random unrelated claim",
             "Completely different topic here",
@@ -588,6 +597,11 @@ class TestFactVerifierLLMAdvisoryOnly:
         )
         assert hasattr(result, "status")
         assert "deterministic_verdict" in result.developer_fields
+        assert result.developer_fields["deterministic_verdict"] != "SUPPORTED"
+        # The real _llm_fallback ran: its advisory is recorded beside the verdict.
+        llm_checks = [c for c in result.advisory_checks if c.name == "llm_fallback"]
+        assert len(llm_checks) == 1
+        assert llm_checks[0].details["llm_verdict"] == "SUPPORTED"
 
     def test_llm_advisory_check_populated(self, monkeypatch):
         """When LLM returns a result, advisory_checks are populated."""

@@ -18,6 +18,14 @@ Usage:
 from typing import Any, Dict, List, Optional, Callable
 from dataclasses import dataclass, field
 
+from ._tool_answers import (
+    NO_SQL_SCHEMA,
+    code_issue_lines,
+    natural_language_answer,
+    server_message,
+    undecided_answer,
+)
+
 # Import QWED client
 try:
     from qwed_sdk import QWEDClient
@@ -86,17 +94,9 @@ class QWEDVerificationTool(BaseTool if CREWAI_AVAILABLE else object):
         """Run verification on the given query."""
         try:
             result = self._client.verify(query)
-            
-            if result.verified:
-                return f"✅ VERIFIED: The statement '{query[:50]}...' is correct."
-            else:
-                msg = ""
-                if hasattr(result, "result") and result.result:
-                    msg = result.result.get("message", "")
-                    corrected = result.result.get("corrected")
-                    if corrected:
-                        return f"❌ INCORRECT: {msg}. Correct answer: {corrected}"
-                return f"❌ FAILED: {msg or 'Verification failed'}"
+            # /verify/natural_language admits nothing while the translation is
+            # unverified, so not admitted is not "failed" (#606).
+            return natural_language_answer(result, f"✅ VERIFIED: The statement '{query[:50]}...' is correct.")
         except Exception as e:
             return f"⚠️ ERROR: Unable to verify - {str(e)}"
 
@@ -113,10 +113,10 @@ class QWEDMathTool(QWEDVerificationTool):
     def _run(self, expression: str) -> str:
         try:
             result = self._client.verify_math(expression)
-            if result.verified:
+            if result.is_verified:
                 return f"✅ VERIFIED: {expression} is mathematically correct."
-            else:
-                return f"❌ INCORRECT: {expression} is not valid."
+            # Incorrect only when proven false; undecided is not wrong (#606).
+            return undecided_answer(result) or f"❌ INCORRECT: {expression} is false. {server_message(result)}".rstrip()
         except Exception as e:
             return f"⚠️ ERROR: {str(e)}"
 
@@ -133,34 +133,62 @@ class QWEDCodeTool(QWEDVerificationTool):
     def _run(self, code: str) -> str:
         try:
             result = self._client.verify_code(code)
-            if result.verified:
+            if result.is_verified:
                 return "✅ SAFE: No security vulnerabilities detected in the code."
-            else:
-                vulns = result.result.get("vulnerabilities", []) if hasattr(result, "result") else []
-                if vulns:
-                    issues = [f"• {v.get('severity', '').upper()}: {v.get('message', '')}" for v in vulns[:3]]
-                    return f"⚠️ SECURITY ISSUES FOUND:\n" + "\n".join(issues)
-                return "❌ BLOCKED: Code contains security vulnerabilities."
+            # Unsafe only when proven unsafe: code that does not parse is
+            # BLOCKED, not a vulnerability (#606).
+            undecided = undecided_answer(result)
+            if undecided is not None:
+                return undecided
+            lines = code_issue_lines(result, 3)
+            if lines:
+                return "⚠️ SECURITY ISSUES FOUND:\n" + "\n".join(f"• {line}" for line in lines)
+            return f"❌ UNSAFE: {server_message(result) or 'Code contains security vulnerabilities.'}"
         except Exception as e:
             return f"⚠️ ERROR: {str(e)}"
 
 
 class QWEDSQLTool(QWEDVerificationTool):
-    """Specialized tool for SQL validation."""
-    
+    """Specialized tool for SQL validation against a schema.
+
+    /verify/sql checks a query against the tables it runs on, so the tool
+    takes their schema when it is built (#608). Without one it answers
+    UNVERIFIABLE and sends nothing.
+
+    Example:
+        tool = QWEDSQLTool(schema_ddl="CREATE TABLE users (id INT, name TEXT)")
+    """
+
     name: str = "QWED SQL Validator"
     description: str = (
         "Validate SQL queries for security and correctness. "
         "Detects SQL injection patterns and dangerous operations."
     )
-    
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        schema_ddl: str = "",
+        dialect: str = "sqlite",
+    ):
+        super().__init__(api_key=api_key, base_url=base_url)
+        self._schema_ddl = schema_ddl or ""
+        self._dialect = dialect or "sqlite"
+
     def _run(self, query: str) -> str:
+        if not self._schema_ddl.strip():
+            return (
+                f"⚠️ UNVERIFIABLE: {NO_SQL_SCHEMA}. Build the tool with schema_ddl, "
+                "the CREATE TABLE statements the query runs against."
+            )
         try:
-            result = self._client.verify_sql(query, "")
-            if result.verified:
+            result = self._client.verify_sql(query, self._schema_ddl, self._dialect)
+            if result.is_verified:
                 return "✅ SAFE: SQL query is valid and secure."
-            else:
-                return "❌ BLOCKED: SQL query contains security issues (possible injection)."
+            # Unsafe only when proven unsafe: SQL that does not parse is
+            # BLOCKED, not an injection (#606).
+            return undecided_answer(result) or f"❌ UNSAFE: {server_message(result) or 'the SQL query is not safe to execute'}"
         except Exception as e:
             return f"⚠️ ERROR: {str(e)}"
 
@@ -179,6 +207,10 @@ class VerificationConfig:
     auto_correct: bool = False
     block_on_failure: bool = False
     log_results: bool = True
+    # The schema and dialect the agent's SQL tool checks queries against
+    # (#608). Without a schema, its SQL checks are UNVERIFIABLE.
+    sql_schema_ddl: str = ""
+    sql_dialect: str = "sqlite"
 
 
 class QWEDVerifiedAgent:
@@ -244,7 +276,12 @@ class QWEDVerifiedAgent:
             if self.config.verify_code:
                 qwed_tools.append(QWEDCodeTool(api_key=api_key, base_url=base_url))
             if self.config.verify_sql:
-                qwed_tools.append(QWEDSQLTool(api_key=api_key, base_url=base_url))
+                qwed_tools.append(QWEDSQLTool(
+                    api_key=api_key,
+                    base_url=base_url,
+                    schema_ddl=self.config.sql_schema_ddl,
+                    dialect=self.config.sql_dialect,
+                ))
         
         all_tools = (tools or []) + qwed_tools
         
@@ -262,29 +299,34 @@ class QWEDVerifiedAgent:
     
     def verify_output(self, output: str) -> Dict[str, Any]:
         """Verify an agent output."""
+        # Not verified until a check says so (GHSA-83v6-6h23-pvp4): a
+        # disabled config or an error leaves it unverified.
         result = {
             "output": output[:100] + "..." if len(output) > 100 else output,
-            "verified": True,
+            "verified": False,
+            "status": "SKIPPED",
             "checks": []
         }
-        
+
         try:
             # Verify if enabled
             if self.config.enabled:
                 verification = self._client.verify(output)
-                result["verified"] = verification.verified
+                result["verified"] = verification.is_verified
                 result["status"] = verification.status
                 result["checks"].append({
                     "type": "general",
-                    "verified": verification.verified
+                    "verified": verification.is_verified
                 })
                 
                 if self.config.log_results:
-                    status = "✅" if verification.verified else "❌"
+                    status = "✅" if verification.is_verified else "❌"
                     print(f"[QWED] {status} Agent output verified: {verification.status}")
         except Exception as e:
+            result["verified"] = False
+            result["status"] = "ERROR"
             result["error"] = str(e)
-        
+
         self.verification_results.append(result)
         return result
     
@@ -357,12 +399,12 @@ class QWEDVerifiedCrew:
         result_text = str(result)
         
         # Verify final output
-        verification = {"verified": True, "status": "SKIPPED"}
+        verification = {"verified": False, "status": "SKIPPED"}
         if self.verify_final_output:
             try:
                 v = self._client.verify(result_text)
                 verification = {
-                    "verified": v.verified,
+                    "verified": v.is_verified,
                     "status": v.status,
                 }
             except Exception as e:
@@ -424,7 +466,7 @@ def verified_task(
             # Verify before processing
             if verify_output:
                 result = client.verify(output)
-                if not result.verified:
+                if not result.is_verified:
                     print(f"[QWED] ⚠️ Task output verification failed: {result.status}")
             
             return func(output, *args, **kwargs)

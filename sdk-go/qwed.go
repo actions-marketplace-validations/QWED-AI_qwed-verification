@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -87,7 +88,8 @@ func (s *VerificationStatus) UnmarshalJSON(data []byte) error {
 // Admission is the server's decision at its enforcement boundary.
 //
 // The empty value means the endpoint made no admission decision, as
-// /verify/logic, /verify/fact and batch items do today. It is never admitted.
+// /verify/logic, /verify/fact and batch logic and fact items do. It is never
+// admitted.
 type Admission string
 
 const (
@@ -148,7 +150,11 @@ type VerificationResponse struct {
 	// admitted.
 	Admission Admission `json:"admission,omitempty"`
 	// ProofRef is set only when Status is StatusVerified.
-	ProofRef        string                 `json:"proof_ref,omitempty"`
+	ProofRef string `json:"proof_ref,omitempty"`
+	// Attestation is the server's signed attestation, an ES256 JWT, on a
+	// VERIFIED answer that passed its trust step (#319). Verify it against
+	// the server's keys at /.well-known/jwks.json. Empty otherwise.
+	Attestation     string                 `json:"attestation,omitempty"`
 	AgentMessage    string                 `json:"agent_message,omitempty"`
 	IsAuthoritative *bool                  `json:"is_authoritative,omitempty"`
 	ConstraintID    string                 `json:"constraint_id,omitempty"`
@@ -158,10 +164,10 @@ type VerificationResponse struct {
 	Extra map[string]interface{} `json:"-"`
 
 	// Verified is set to IsAdmitted() on every decode, whatever the body
-	// says. Endpoints that make no admission decision (logic, fact, rag,
-	// process and batch items today) are never admitted. The verified field
-	// /verify/rag and /verify/process send is their guard's own result; it is
-	// kept in Extra["verified"] and DeveloperFields["verified"].
+	// says. Endpoints that make no admission decision (fact, rag, process,
+	// and batch fact items) are never admitted. A top-level verified, which
+	// /verify/rag and /verify/process sent before they returned UNVERIFIABLE
+	// (#320), is kept in Extra["verified"] and DeveloperFields["verified"].
 	//
 	// Deprecated: use IsAdmitted.
 	Verified bool `json:"-"`
@@ -172,6 +178,7 @@ type VerificationResponse struct {
 var envelopeFields = map[string]bool{
 	"status": true, "admission": true, "proof_ref": true, "agent_message": true,
 	"is_authoritative": true, "constraint_id": true, "developer_fields": true,
+	"attestation": true,
 }
 
 // decodeKeepingNumbers decodes with UseNumber, so a JSON number in an
@@ -328,8 +335,8 @@ type BatchResult struct {
 	Error     string                `json:"error,omitempty"`
 	LatencyMs float64               `json:"latency_ms,omitempty"`
 
-	// Verified is set to IsAdmitted() when an item is decoded. Batch items
-	// carry no admission decision today, so it is false.
+	// Verified is set to IsAdmitted() when an item is decoded. Batch logic
+	// and fact items carry no admission decision, so it is false for them.
 	//
 	// Deprecated: use IsAdmitted.
 	Verified bool `json:"-"`
@@ -399,6 +406,18 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
+
+	// The server's attestation keys (#319). jwksMu guards the fields after
+	// it and is held only briefly; jwksSlot lets one caller fetch at a time,
+	// and waiting for it ends with the waiter's context.
+	jwksSlot        chan struct{}
+	jwksSlotOnce    sync.Once
+	jwksMu          sync.Mutex
+	jwks            *JWKS
+	jwksFetchedAt   time.Time
+	jwksAttemptedAt time.Time // when the last fetch the server answered ended
+	jwksErr         error
+	now             func() time.Time // tests; time.Now when nil
 }
 
 // ClientOption configures the client.

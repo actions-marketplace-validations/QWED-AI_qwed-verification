@@ -3,16 +3,11 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  # A manual run publishes to TestPyPI only. PyPI is published only from a
+  # published release, through the protected `pypi` environment (its
+  # deployment rule allows `v*` tags only, and it needs the maintainer's
+  # approval), so no branch can publish to PyPI.
   workflow_dispatch:
-    inputs:
-      publish_target:
-        description: 'Publish target'
-        required: true
-        default: 'testpypi'
-        type: choice
-        options:
-          - testpypi
-          - pypi
 
 permissions:
   contents: read
@@ -26,7 +21,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.11'
       
@@ -50,7 +45,7 @@ jobs:
   publish-testpypi:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_target == 'testpypi'
+    if: github.event_name == 'workflow_dispatch'
     environment: testpypi
     permissions:
       id-token: write
@@ -62,14 +57,14 @@ jobs:
           path: dist/
       
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
 
   publish-pypi:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_target == 'pypi')
+    if: github.event_name == 'release'
     environment: pypi
     permissions:
       id-token: write
@@ -81,6 +76,6 @@ jobs:
           path: dist/
       
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           skip-existing: true

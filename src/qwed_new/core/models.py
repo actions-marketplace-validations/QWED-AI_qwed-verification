@@ -74,7 +74,8 @@ class ResourceQuota(SQLModel, table=True):
 class VerificationLog(SQLModel, table=True):
     """
     Logs are scoped to organizations for data isolation.
-    Enhanced with cryptographic audit trail for SOC 2 / GDPR compliance.
+    Each entry is HMAC-signed and hash-chained, so changes can be detected.
+    The trail is a record to support audits; it does not make a system compliant.
     """
     id: Optional[int] = Field(default=None, primary_key=True)
     organization_id: int = Field(foreign_key="organization.id", index=True)
@@ -90,6 +91,24 @@ class VerificationLog(SQLModel, table=True):
     hmac_signature: Optional[str] = None  # HMAC signature
     previous_hash: Optional[str] = None  # Hash of previous entry (chain)
     raw_llm_output: Optional[str] = None  # Preserve raw LLM response
+
+    # Who wrote the row and with what (#484). Null on rows written before
+    # these columns existed, and api_key_id is null when no API key made the
+    # request (a user session, the audit seed). core/schema_migrations.py
+    # adds both columns to an existing table at startup.
+    api_key_id: int | None = None  # ApiKey.id of the key that made the request
+    verifier_version: str | None = None  # qwed_new.__version__ when the row was written
+    # The admission decision the route made (#307): "ADMIT" or "BLOCKED", or
+    # "ADMIT" or "DENY" on /verification-context/from-diagnostic:
+    # the one it returned, except on the agent route, which decides one
+    # without returning it. Null when the route decides none, and on rows written
+    # before the column existed. Not the verdict: a VERIFIED row can be BLOCKED.
+    admission: str | None = None
+    # Whole milliseconds from the start of the request that wrote the row to
+    # its append (#528): the time the route took to reach its answer. Null on
+    # rows written outside a request and on rows written before the column
+    # existed. Covered by the entry hash.
+    latency_ms: int | None = None
 
 class SecurityEvent(SQLModel, table=True):
     """

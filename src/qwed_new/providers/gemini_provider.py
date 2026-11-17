@@ -13,7 +13,14 @@ except ImportError:
     genai = None
 
 from qwed_new.core.schemas import MathVerificationTask, LogicVerificationTask
-from qwed_new.providers.base import LLMProvider, sanitized_provider_error
+from qwed_new.providers.base import (
+    LLMProvider,
+    configured_model,
+    logic_translation_system,
+    sanitized_provider_error,
+    translation_request,
+    translation_system,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +28,7 @@ logger = logging.getLogger(__name__)
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        self.model_name = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+        self.model_name = configured_model(model, "GEMINI_MODEL", "Gemini")
 
         if genai is not None:
             if not self.api_key:
@@ -88,7 +95,7 @@ class GeminiProvider(LLMProvider):
 Convert natural language math to formal expressions.
 Respond with JSON: {"expression": "...", "claimed_answer": ..., "reasoning": "...", "confidence": 0.95}"""
         try:
-            result = self._call_json(system, user_query)
+            result = self._call_json(translation_system(system), translation_request(user_query))
             return MathVerificationTask(**result)
         except Exception:
             raise ValueError("Gemini math translation failed.") from None
@@ -101,18 +108,20 @@ Rules:
   - "approval is required" -> "approval == 1"
   - "approval is not required" -> "approval == 0"
 - Avoid natural-language constraints.
-Respond with JSON: {"variables": {"x": "Int"}, "constraints": ["x > 0"], "goal": "SATISFIABILITY"}"""
+Respond with JSON: {"variables": {"x": "Int"}, "constraints": ["x > 5"], "claim": "x > 3", "goal": "VALIDITY"}"""
         try:
-            result = self._call_json(system, user_query)
+            result = self._call_json(logic_translation_system(system), translation_request(user_query))
             return LogicVerificationTask(**result)
         except Exception:
             raise ValueError("Gemini logic translation failed.") from None
 
     def refine_logic(self, user_query: str, previous_error: str) -> LogicVerificationTask:
-        system = f"""You are a Logic Translator. Fix based on error: "{previous_error}"
-Respond with JSON: {{"variables": {{}}, "constraints": [], "goal": "SATISFIABILITY"}}"""
+        system = """You are a Logic Translator. Your previous translation of this question
+failed with the error in the <previous_error> tags. Fix the translation.
+Respond with JSON: {"variables": {}, "constraints": [], "goal": "SATISFIABILITY"}"""
+        request = translation_request(user_query, previous_error=previous_error)
         try:
-            result = self._call_json(system, user_query)
+            result = self._call_json(translation_system(system), request)
             return LogicVerificationTask(**result)
         except Exception:
             raise ValueError("Gemini logic refinement failed.") from None
@@ -120,7 +129,7 @@ Respond with JSON: {{"variables": {{}}, "constraints": [], "goal": "SATISFIABILI
     def translate_stats(self, query: str, columns: List[str]) -> str:
         system = """You are a Python Data Science Expert. Write code using Pandas. Dataset is in `df`. Assign result to `result`. Output ONLY Python code."""
         try:
-            return self._call_text(system, f"Columns: {columns}\nQuery: {query}")
+            return self._call_text(translation_system(system), translation_request(query, columns=columns))
         except Exception:
             raise ValueError("Gemini stats translation failed.") from None
 

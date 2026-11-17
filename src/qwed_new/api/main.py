@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, F
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from typing import Any, Optional, Annotated
+from typing import Optional, Annotated
 from sqlmodel import Session, select
 from datetime import datetime, timezone
 import asyncio
@@ -13,21 +13,23 @@ import logging
 import time
 from fractions import Fraction
 
+# First of the QWED imports: importing qwed_new.config loads .env (the
+# working directory's, then ~/.qwed/.env). The math worker, the database, the
+# rate limiter and the auth module read their settings when they are imported,
+# so a value written only in .env must be loaded before them (#591).
+import qwed_new.config  # noqa: F401
 from qwed_new.core.security import redact_pii
 from qwed_new.core.diagnostics import (
     AdmissionDecision,
     AdvisoryCheck,
     DiagnosticResult,
     admission_decision,
-    enforce_trust_decision,
+    claim_verified,
     merge_diagnostic_result,
 )
-from qwed_new.core.verifier import (
-    DISPROVEN_STATUS,
-    DOMAIN_RESTRICTED_IDENTITY,
-    identity_domains_match,
-    symbolic_difference_status,
-)
+from qwed_new.core.math_identity import math_parse_error_result
+from qwed_new.core.math_worker import run_math_async
+from qwed_new.core.safe_parser import SafeParserError
 from qwed_new.api.verification_context_routes import router as verification_context_router
 
 # Configure logging
@@ -37,9 +39,12 @@ INTERNAL_VERIFICATION_ERROR = "Internal verification error"
 INTERNAL_PROCESSING_ERROR = "Internal processing error"
 
 from qwed_new.core.control_plane import ControlPlane, natural_language_admission
+from qwed_new.core.route_diagnostics import guard_diagnostic, logic_diagnostic, natural_language_diagnostic
+from qwed_new.core.trust import AdmissionRule, attest_and_enforce
 from qwed_new.core.tenant_context import get_current_tenant, TenantContext
 from qwed_new.core.database import create_db_and_tables, get_session
 from qwed_new.core.audit_logger import get_audit_logger
+from qwed_new.core.attestation import get_attestation_service
 from qwed_new.core.models import VerificationLog, ApiKey, User, Organization
 from qwed_new.core.rate_limiter import check_rate_limit
 from qwed_new.core.json_bounding import bound_json_value
@@ -51,12 +56,18 @@ from qwed_new.auth.middleware import get_api_key
 from qwed_new.auth.routes import get_current_user_token
 from qwed_new.auth.security import hash_api_key, is_api_key_live, validate_api_key_format
 from qwed_new.api.secret_scanning_routes import router as secret_scanning_router
+from qwed_new.api.compliance_routes import router as compliance_router
+from qwed_new.api.security_routes import router as security_router
+from qwed_new.api.org_users_routes import router as org_users_router
+from qwed_new.api.agent_admin_routes import router as agent_admin_router
+from qwed_new.core.request_caller import RequestTimingMiddleware
+from qwed_new.api.attestation_routes import router as attestation_router
 
 TenantDependency = Annotated[TenantContext, Depends(get_current_tenant)]
 SessionDependency = Annotated[Session, Depends(get_session)]
 AgentTokenHeader = Annotated[str, Header(...)]
 
-APP_VERSION = "7.3.0"
+APP_VERSION = "10.0.0"
 
 app = FastAPI(
     title="QWED API",
@@ -274,12 +285,15 @@ app.add_middleware(
     concurrency_paths={"/verify/stats", "/verify/image"},
 )
 
+app.add_middleware(RequestTimingMiddleware)  # #528: audit latency_ms
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=CORS_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Export-Truncated"],  # #508: a cut CSV export
 )
 
 
@@ -291,6 +305,11 @@ app.include_router(auth_router)
 app.include_router(audit_router)
 app.include_router(verification_context_router)
 app.include_router(secret_scanning_router)
+app.include_router(compliance_router)
+app.include_router(security_router)
+app.include_router(org_users_router)
+app.include_router(agent_admin_router)
+app.include_router(attestation_router)
 
 # Verified leak reports -> auto-revoke + owner notify (#368). Assigned here
 # (not import-time in the routes module) so the production wiring is explicit
@@ -313,28 +332,20 @@ STARTUP_ALLOWED_PTH_FILES = {
 }
 
 
-def _get_env_allowlisted_pth_files() -> set[str]:
-    """Parse deployment-provided exact startup hook allowlist entries."""
-    extra = os.environ.get("QWED_ALLOWED_STARTUP_PTH_FILES", "")
-    return {name.strip() for name in extra.split(",") if name.strip()}
-
-
-def _get_startup_hook_allowlist() -> set[str]:
-    """Return additional expected startup hook files for this deployment."""
-    allowlist = set(STARTUP_ALLOWED_PTH_FILES)
-    allowlist.update(_get_env_allowlisted_pth_files())
-    return allowlist
-
-
 def _enforce_environment_integrity() -> None:
     """Fail startup if Python startup hooks cannot be verified as safe."""
     if os.environ.get("QWED_SKIP_ENV_INTEGRITY_CHECK") == "true":
         logger.warning("Bypassing environment integrity check due to QWED_SKIP_ENV_INTEGRITY_CHECK")
         return
 
-    from qwed_sdk.guards.environment_guard import StartupHookGuard
+    from qwed_sdk.guards.environment_guard import (
+        StartupHookGuard,
+        parse_startup_hook_allowlist,
+    )
 
-    guard = StartupHookGuard(allowed_pth_files=_get_startup_hook_allowlist())
+    # Names, and NAME.pth:sha256:<hex> digest pins (#491); a bad pin raises.
+    names, pins = parse_startup_hook_allowlist(os.environ.get("QWED_ALLOWED_STARTUP_PTH_FILES", ""))
+    guard = StartupHookGuard(allowed_pth_files=STARTUP_ALLOWED_PTH_FILES | names, pinned_pth_digests=pins)
     result = guard.verify_environment_integrity()
     if not result.get("verified"):
         logger.critical(f"Startup environment integrity check failed: {result}")
@@ -359,6 +370,9 @@ def on_startup():
     # Fail closed at boot: every verify endpoint appends to the signed audit
     # chain, so the server does not start without QWED_AUDIT_SECRET_KEY.
     get_audit_logger()
+    # Likewise a configured signing key that cannot be used (#319), which
+    # would otherwise surface only as BLOCKED results once traffic arrives.
+    get_attestation_service()
     # After the fail-closed checks: a server that refuses to start does not
     # touch stored data.
     _migrate_agent_tokens()
@@ -366,17 +380,22 @@ def on_startup():
 # Initialize Kernel (Control Plane)
 control_plane = ControlPlane()
 
-# Trust boundary enforcement helper (currently advisory until #265)
 def _enforce_trust(
-    dr: DiagnosticResult, query: str
+    dr: DiagnosticResult,
+    query: str,
+    *,
+    engine: str,
+    admission: AdmissionRule | None = None,
 ) -> DiagnosticResult:
-    """Route a DiagnosticResult through trust boundary enforcement.
+    """Sign a VERIFIED result and enforce its attestation as mandatory (#320).
 
-    Currently operates in advisory mode (require_attestation=False) pending
-    attestation issuance wiring. Callers must use the returned DiagnosticResult
-    for audit logging and response construction.
+    Callers must use the returned DiagnosticResult for audit logging and
+    response construction: a VERIFIED result whose attestation cannot be
+    issued or does not check out comes back BLOCKED (see core/trust.py).
+    A route that decides an admission passes its rule, so the token signs the
+    admission the route returns (#321).
     """
-    return enforce_trust_decision(dr, require_attestation=False, query=query)
+    return attest_and_enforce(dr, engine=engine, query=query, admission=admission)
 
 
 _merge_response = merge_diagnostic_result  # shared merge helper (#271)
@@ -416,6 +435,7 @@ def _safe_commit_log(log):
             is_verified=log.is_verified,
             domain=log.domain,
             raw_llm_output=log.raw_llm_output,
+            admission=log.admission,
         )
     except Exception as exc:
         logger.error("Audit persistence failed: %s", type(exc).__name__)
@@ -626,7 +646,9 @@ async def verify_natural_language(
 
     if dr is None:
         dr = _natural_language_diagnostic(result)
-    dr = _enforce_trust(dr, query=request.query)
+    dr = _enforce_trust(
+        dr, query=request.query, engine="natural_language", admission=natural_language_admission
+    )
     # The verdict covers the LLM's translated expression, not the user's
     # question, so it is never admitted for the question while the
     # translation itself is unverified. The verdict stays as produced
@@ -641,7 +663,8 @@ async def verify_natural_language(
         # The log row is keyed by the user's question, which is only
         # verified when it is admitted.
         is_verified=admission is AdmissionDecision.ADMIT,
-        domain="MATH"
+        domain="NATURAL_LANGUAGE",  # #520: its own domain, not MATH
+        admission=admission.value,  # #307: as returned
     )
     _safe_commit_log(log)
 
@@ -650,30 +673,33 @@ async def verify_natural_language(
     return response
 
 
-def _natural_language_diagnostic(result: Any) -> DiagnosticResult:
-    """The verdict for a control-plane result.
+# Shared with /verify/batch so a batch item gets what its route returns (#494).
+_natural_language_diagnostic = natural_language_diagnostic
 
-    The control plane attaches the DiagnosticResult it enforced (signed and
-    attested for decided verdicts, #437), so it is used as produced. Results
-    without one (security or policy blocks, non-math queries, errors) fall back
-    to the fail-closed legacy mapping, which can never yield VERIFIED.
+
+def _logic_route_response(dr: DiagnosticResult, query: str, organization_id) -> dict:
+    """Enforce, log and return a /verify/logic verdict.
+
+    The verdict covers the constraints an LLM wrote from the question, not the
+    question, so it is admitted only once that translation is verified, as on
+    /verify/natural_language (#320). The verdict stays as produced.
     """
-    if isinstance(result, dict) and "diagnostic" in result:
-        try:
-            return DiagnosticResult.from_dict(result["diagnostic"])
-        except (TypeError, ValueError, KeyError, AttributeError):
-            return DiagnosticResult.blocked(
-                "Verification blocked — control plane returned a malformed diagnostic",
-                {"constraint_id": "api.natural_language.malformed_diagnostic"},
-            )
-    verification_result = result.get("verification", {}) if isinstance(result, dict) else {}
-    try:
-        return DiagnosticResult.from_legacy_dict(verification_result, engine="math")
-    except ValueError:
-        return DiagnosticResult.unverifiable(
-            "Verification result unavailable — legacy engine did not retain proof artifacts",
-            {"constraint_id": "api.natural_language.legacy_conversion_failed", "legacy_status": verification_result.get("status")},
-        )
+    dr = _enforce_trust(dr, query=query, engine="logic", admission=natural_language_admission)
+    admission = natural_language_admission(dr)
+    log = VerificationLog(
+        organization_id=organization_id,
+        query=query,
+        result=_cap_log_result(dr.to_dict()),
+        # The row is keyed by the question, which is verified only when admitted.
+        is_verified=admission is AdmissionDecision.ADMIT,
+        domain="LOGIC",
+        admission=admission.value,
+    )
+    _safe_commit_log(log)
+    response = _merge_response(dr)
+    response["admission"] = admission.value
+    return response
+
 
 @app.post(
     "/verify/logic",
@@ -694,37 +720,8 @@ async def verify_logic(
             preferred_provider=request.provider
         )
 
-        status = result.get("status", "ERROR")
-
-        if status == "SAT":
-            dr = DiagnosticResult.verified(
-                "Logic constraints are satisfiable",
-                developer_fields=result,
-                evidence={"model": str(result.get("model")), "dsl_code": result.get("dsl_code", "")},
-            )
-        elif status == "UNSAT":
-            dr = DiagnosticResult.unverifiable(
-                "Logic constraints are unsatisfiable",
-                developer_fields=result,
-            )
-        else:
-            dr = DiagnosticResult.blocked(
-                result.get("error", "Logic verification failed"),
-                developer_fields=result,
-            )
-        dr = _enforce_trust(dr, query=request.query)
-
-        log = VerificationLog(
-            organization_id=tenant.organization_id,
-            query=request.query,
-            result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
-            domain="LOGIC"
-        )
-        _safe_commit_log(log)
-
-        return _merge_response(dr)
-
+        # Shared with /verify/batch (#494).
+        return _logic_route_response(logic_diagnostic(result), request.query, tenant.organization_id)
 
     except HTTPException:
         raise
@@ -739,16 +736,7 @@ async def verify_logic(
             INTERNAL_VERIFICATION_ERROR,
             {"constraint_id": "api.logic.execution_error", "provider_used": provider_used},
         )
-        dr = _enforce_trust(dr, query=request.query)
-        log = VerificationLog(
-            organization_id=tenant.organization_id,
-            query=request.query,
-            result=_cap_log_result(dr.to_dict()),
-            is_verified=False,
-            domain="LOGIC"
-        )
-        _safe_commit_log(log)
-        return _merge_response(dr)
+        return _logic_route_response(dr, request.query, tenant.organization_id)
 
 # #353 (CodeAnt + CodeRabbit on PR #354): the byte cap bounds TRANSFER,
 # not pandas memory — parse in chunks and abort the moment the accumulated
@@ -862,20 +850,18 @@ async def verify_stats(
         verifier = StatsVerifier()
 
         dr = await asyncio.to_thread(verifier.verify_stats, query, df, None)
-        dr = _enforce_trust(dr, query=query)
+        dr = _enforce_trust(dr, query=query, engine="stats")
 
         # Fail-closed audit semantics (P1 #297): never log a BLOCKED / non-
-        # authoritative result as verified. is_authoritative is False for every
-        # fail-closed status (BLOCKED/UNVERIFIABLE proof_ref=None), so a result
-        # cannot be persisted as verified unless it is a proven claim AND its
-        # claim-validity signal is true. developer_fields.is_valid alone is
-        # mutable engine metadata and must not drive the audit bit.
+        # authoritative result as verified. claim_verified (#577) needs a
+        # VERIFIED status, so a proven claim, AND a true claim-validity
+        # signal; developer_fields.is_valid alone is mutable engine metadata
+        # and must not drive the audit bit.
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=query,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative
-            and dr.developer_fields.get("is_valid") is True,
+            is_verified=claim_verified(dr),
             domain="STATS"
         )
         _safe_commit_log(log)
@@ -890,7 +876,7 @@ async def verify_stats(
             INTERNAL_PROCESSING_ERROR,
             {"constraint_id": "api.stats.execution_error"},
         )
-        dr = _enforce_trust(dr, query=query)
+        dr = _enforce_trust(dr, query=query, engine="stats")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=query,
@@ -959,13 +945,13 @@ async def verify_fact(
                 "Fact verification inconclusive",
                 developer_fields={"result": str(result)},
             )
-        dr = _enforce_trust(dr, query=claim)
+        dr = _enforce_trust(dr, query=claim, engine="fact")
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=claim,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="FACT"
         )
         _safe_commit_log(log)
@@ -980,7 +966,7 @@ async def verify_fact(
             INTERNAL_VERIFICATION_ERROR,
             {"constraint_id": "api.fact.execution_error", "verdict": "ERROR"},
         )
-        dr = _enforce_trust(dr, query=claim)
+        dr = _enforce_trust(dr, query=claim, engine="fact")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=claim,
@@ -1029,15 +1015,16 @@ async def verify_code(
         # AdmissionDecision rather than letting authority-only consumers treat
         # proof_ref as "safe to execute".
         dr = result
-        dr = _enforce_trust(dr, query=code)
+        dr = _enforce_trust(dr, query=code, engine="code", admission=admission_decision)
         admission = admission_decision(dr)
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=code[:200],
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.developer_fields.get("is_valid") is True,
-            domain="CODE"
+            is_verified=claim_verified(dr),
+            domain="CODE",
+            admission=admission.value,  # #307: as returned
         )
         _safe_commit_log(log)
 
@@ -1053,13 +1040,14 @@ async def verify_code(
             INTERNAL_VERIFICATION_ERROR,
             {"constraint_id": "api.code.execution_error", "is_safe": False},
         )
-        dr = _enforce_trust(dr, query=code)
+        dr = _enforce_trust(dr, query=code, engine="code", admission=admission_decision)
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=(code or "")[:200],
             result=_cap_log_result(dr.to_dict()),
             is_verified=False,
-            domain="CODE"
+            domain="CODE",
+            admission=admission_decision(dr).value,  # #307: as returned
         )
         _safe_commit_log(log)
         response = _merge_response(dr)
@@ -1079,109 +1067,9 @@ async def verify_math(
         raise HTTPException(status_code=400, detail="Missing 'expression'")
 
     try:
-        import sympy
-        from qwed_new.core.safe_parser import safe_parse_expr
-        from sympy import simplify, symbols, Eq, solve
-
-        context_data = request.get("context", {})
-
-        if "=" in expression:
-            left_str, right_str = expression.split("=", 1)
-            left = safe_parse_expr(left_str)
-            right = safe_parse_expr(right_str)
-            difference = simplify(left - right)
-            identity_status = symbolic_difference_status(difference)
-
-            fields = {
-                "left_side": str(left),
-                "right_side": str(right),
-                "simplified_difference": str(difference),
-            }
-            if identity_status == "VERIFIED" and not identity_domains_match(left_str, right_str):
-                # simplify cancelled a removable singularity (x/x = 1 is
-                # false at x = 0): the identity holds only on a restricted
-                # domain, so it is not proven unconditionally (#429).
-                dr = DiagnosticResult.unverifiable(
-                    "Identity holds only where both sides are defined",
-                    developer_fields={
-                        "is_valid": False,
-                        "result": None,
-                        "constraint_id": DOMAIN_RESTRICTED_IDENTITY,
-                        **fields,
-                    },
-                )
-            elif identity_status == "VERIFIED":
-                dr = DiagnosticResult.verified(
-                    "Identity is true",
-                    developer_fields={"is_valid": True, "result": True, **fields},
-                    evidence=fields,
-                )
-            elif identity_status == DISPROVEN_STATUS:
-                # Proven false is a decided verdict: VERIFIED with is_valid
-                # False, admission DENY — never "inconclusive" (#437).
-                dr = DiagnosticResult.disproven(
-                    "Identity is false",
-                    developer_fields={"result": False, **fields},
-                    evidence={**fields, "verdict": "disproven"},
-                )
-            else:
-                dr = DiagnosticResult.unverifiable(
-                    "Identity could not be proven or disproven",
-                    developer_fields={"is_valid": False, "result": None, **fields},
-                )
-        else:
-            import re
-            expression_normalized = re.sub(r'(\d)(\()', r'\1*\2', expression)
-            is_ambiguous = False
-            if "/" in expression and "(" in expression:
-                if re.search(r'/\d+\(', expression.replace(" ", "")):
-                    is_ambiguous = True
-
-            parsed = safe_parse_expr(expression_normalized)
-            simplified = simplify(parsed)
-
-            if simplified.has(sympy.zoo) or simplified.has(sympy.nan):
-                dr = DiagnosticResult.blocked(
-                    "Expression contains division by zero",
-                    developer_fields={"is_valid": False, "error": "Division by zero"},
-                )
-            elif simplified.has(sympy.oo) or simplified.has(-sympy.oo):
-                dr = DiagnosticResult.blocked(
-                    "Expression is undefined",
-                    developer_fields={"is_valid": False, "error": "undefined"},
-                )
-            elif simplified.is_real is False and context_data.get("domain") == "real":
-                dr = DiagnosticResult.blocked(
-                    "Expression is not real-valued in the requested real domain",
-                    developer_fields={"is_valid": False, "error": "domain error"},
-                )
-            elif is_ambiguous:
-                dr = DiagnosticResult.blocked(
-                    "Expression may be ambiguous due to implicit multiplication after division",
-                    developer_fields={"is_valid": False, "result": False, "status": "BLOCKED", "warning": "ambiguous", "simplified": str(simplified), "note": "Interpreted using standard order of operations", "original": str(parsed)},
-                )
-            else:
-                is_numeric = simplified.free_symbols == set()
-                if not is_numeric:
-                    dr = DiagnosticResult.verified(
-                        "Expression simplified",
-                        developer_fields={"is_valid": True, "simplified": str(simplified), "original": str(parsed), "is_symbolic": True},
-                        evidence={"simplified": str(simplified)},
-                    )
-                else:
-                    try:
-                        exact = sympy.nsimplify(simplified)
-                        value = float(simplified)
-                        dr = DiagnosticResult.verified(
-                            "Expression evaluated",
-                            developer_fields={"is_valid": True, "value": value, "exact_value": str(exact), "simplified": str(simplified), "original": str(parsed)},
-                            evidence={"exact_value": str(exact), "simplified": str(simplified)},
-                        )
-                    except (TypeError, ValueError, OverflowError):
-                        dr = DiagnosticResult.unverifiable(
-                            "Expression is not numeric",
-                            developer_fields={"is_valid": False, "simplified": str(simplified), "original": str(parsed)},
-                        )
+        # SymPy runs in a worker process with a wall-clock limit (GHSA-qgjc):
+        # off the event loop, and killed if it does not finish.
+        dr = await run_math_async("request", (expression, request.get("context", {})))
 
         # Precision advisory (issue #347): flag binary floating-point
         # constants WITHOUT affecting the verdict — advisory_checks are
@@ -1193,7 +1081,7 @@ async def verify_math(
         if float_advisory is not None:
             dr.developer_fields.setdefault("advisory_checks", []).append(float_advisory)
 
-        dr = _enforce_trust(dr, query=expression)
+        dr = _enforce_trust(dr, query=expression, engine="math", admission=admission_decision)
         # A proven-false identity is VERIFIED too, so the verdict alone is
         # not "safe to use": expose admission separately (QWED #15).
         admission = admission_decision(dr)
@@ -1202,8 +1090,9 @@ async def verify_math(
             organization_id=tenant.organization_id,
             query=expression,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.developer_fields.get("is_valid") is True,
-            domain="MATH"
+            is_verified=claim_verified(dr),
+            domain="MATH",
+            admission=admission.value,  # #307: as returned
         )
         _safe_commit_log(log)
 
@@ -1215,17 +1104,23 @@ async def verify_math(
         raise
     except Exception as e:
         logger.error(f"Math verification error: {redact_pii(str(e))}", exc_info=False)
-        dr = DiagnosticResult.blocked(
-            INTERNAL_VERIFICATION_ERROR,
-            {"constraint_id": "api.math.execution_error"},
-        )
-        dr = _enforce_trust(dr, query=expression)
+        if isinstance(e, SafeParserError):
+            # Input the parser refused is the caller's to fix, not an
+            # internal error (#522); SQL and schema use the same shape.
+            dr = math_parse_error_result(e)
+        else:
+            dr = DiagnosticResult.blocked(
+                INTERNAL_VERIFICATION_ERROR,
+                {"constraint_id": "api.math.execution_error"},
+            )
+        dr = _enforce_trust(dr, query=expression, engine="math", admission=admission_decision)
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=expression,
             result=_cap_log_result(dr.to_dict()),
             is_verified=False,
-            domain="MATH"
+            domain="MATH",
+            admission=admission_decision(dr).value,  # #307: as returned
         )
         _safe_commit_log(log)
         response = _merge_response(dr)
@@ -1264,15 +1159,16 @@ async def verify_sql(
         # SQL must never be admitted, so we expose an explicit AdmissionDecision rather
         # than letting authority-only consumers treat proof_ref as "safe to execute".
         dr = result
-        dr = _enforce_trust(dr, query=query)
+        dr = _enforce_trust(dr, query=query, engine="sql", admission=admission_decision)
         admission = admission_decision(dr)
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=query,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
-            domain="SQL"
+            is_verified=claim_verified(dr),
+            domain="SQL",
+            admission=admission.value,  # #307: as returned
         )
         _safe_commit_log(log)
 
@@ -1288,13 +1184,14 @@ async def verify_sql(
             INTERNAL_VERIFICATION_ERROR,
             {"constraint_id": "api.sql.execution_error", "is_valid": False},
         )
-        dr = _enforce_trust(dr, query=query)
+        dr = _enforce_trust(dr, query=query, engine="sql", admission=admission_decision)
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=query,
             result=_cap_log_result(dr.to_dict()),
             is_verified=False,
-            domain="SQL"
+            domain="SQL",
+            admission=admission_decision(dr).value,  # #307: as returned
         )
         _safe_commit_log(log)
         response = _merge_response(dr)
@@ -1341,13 +1238,13 @@ async def verify_image(
         result = verifier.verify_image(image_bytes, claim)
 
         dr = result
-        dr = _enforce_trust(dr, query=claim)
+        dr = _enforce_trust(dr, query=claim, engine="image")
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=f"Image claim: {claim}",
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="IMAGE"
         )
         _safe_commit_log(log)
@@ -1362,7 +1259,7 @@ async def verify_image(
             INTERNAL_PROCESSING_ERROR,
             {"constraint_id": "api.image.execution_error", "verdict": "INCONCLUSIVE", "confidence": 0.0},
         )
-        dr = _enforce_trust(dr, query=claim)
+        dr = _enforce_trust(dr, query=claim, engine="image")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=f"Image claim: {claim}",
@@ -1438,7 +1335,7 @@ async def verify_rag(
                 "RAG configuration error",
                 developer_fields={"constraint_id": "api.rag.config_error"},
             )
-            dr = _enforce_trust(dr, query=request.target_document_id)
+            dr = _enforce_trust(dr, query=request.target_document_id, engine="rag")
             log = VerificationLog(
                 organization_id=tenant.organization_id,
                 query=f"RAG Document Verify: {request.target_document_id}",
@@ -1449,25 +1346,20 @@ async def verify_rag(
             _safe_commit_log(log)
             return _merge_response(dr)
         
-        is_verified = result.get("verified", False)
-        if is_verified:
-            dr = DiagnosticResult.verified(
-                "RAG context verified",
-                developer_fields=result,
-                evidence={"verified": True, "drm_rate": result.get("drm_rate")},
-            )
-        else:
-            dr = DiagnosticResult.unverifiable(
-                "RAG context mismatch detected",
-                developer_fields=result,
-            )
-        dr = _enforce_trust(dr, query=request.target_document_id)
+        # The labels and the threshold come from the request: advisory only (#320).
+        dr = guard_diagnostic(
+            result,
+            route="rag",
+            passed="The RAG label and threshold check passed, but the request supplies both the labels and the threshold, so this is not verified",
+            failed="RAG context mismatch detected",
+        )
+        dr = _enforce_trust(dr, query=request.target_document_id, engine="rag")
 
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=f"RAG Document Verify: {request.target_document_id}",
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="RAG"
         )
         _safe_commit_log(log)
@@ -1481,9 +1373,9 @@ async def verify_rag(
         doc_id = getattr(request, 'target_document_id', 'unknown')
         dr = DiagnosticResult.blocked(
             INTERNAL_PROCESSING_ERROR,
-            {"constraint_id": "api.rag.execution_error", "verified": False},
+            {"constraint_id": "api.rag.execution_error"},
         )
-        dr = _enforce_trust(dr, query=doc_id)
+        dr = _enforce_trust(dr, query=doc_id, engine="rag")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=f"RAG Document Verify: {doc_id}",
@@ -1535,24 +1427,20 @@ async def verify_process(
                 detail="Invalid mode. Use 'irac' or 'milestones'."
             )
         
-        if result.get("verified"):
-            dr = DiagnosticResult.verified(
-                "Process verification passed",
-                developer_fields=result,
-                evidence={"mode": request.mode, "verified": True},
-            )
-        else:
-            dr = DiagnosticResult.unverifiable(
-                "Process verification did not pass",
-                developer_fields=result,
-            )
-        dr = _enforce_trust(dr, query=request.trace)
+        # Keyword matching cannot show the reasoning is right: advisory only (#320).
+        dr = guard_diagnostic(
+            result,
+            route="process",
+            passed="The trace has the expected markers, but keyword matching does not verify the reasoning",
+            failed="Process verification did not pass",
+        )
+        dr = _enforce_trust(dr, query=request.trace, engine="process")
             
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=f"Process Verification ({request.mode})",
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="PROCESS"
         )
         _safe_commit_log(log)
@@ -1565,9 +1453,9 @@ async def verify_process(
         logger.error(f"Process verification error: {redact_pii(str(e))}", exc_info=False)
         dr = DiagnosticResult.blocked(
             INTERNAL_PROCESSING_ERROR,
-            {"constraint_id": "api.process.execution_error", "verified": False},
+            {"constraint_id": "api.process.execution_error"},
         )
-        dr = _enforce_trust(dr, query=request.trace)
+        dr = _enforce_trust(dr, query=request.trace, engine="process")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=f"Process Verification ({request.mode})",
@@ -1746,7 +1634,7 @@ async def get_tenant_logs(
 # ============================================================
 
 from qwed_new.core.agent_registry import agent_registry
-from qwed_new.core.agent_models import Agent, AgentActivity
+from qwed_new.core.agent_models import Agent
 from qwed_new.core.tool_approval import tool_approval
 import json
 
@@ -1894,30 +1782,58 @@ async def agent_verify(
 ):
     """
     Agent makes a verification request through QWED.
-    Includes full audit trail.
+
+    Appends a chained, signed row to the organisation's audit trail, as
+    /verify/natural_language does, and also logs the call to the agent's
+    activity. The result is not returned if the audit append fails (#477).
     """
     import time
     start_time = time.time()
-    
+
     agent = _require_authenticated_agent(session, agent_id, x_agent_token)
     _enforce_agent_budget(session, agent_id, agent, request.query)
     _run_agent_security_checks(session, agent_id, agent, request)
     result = await _process_agent_verification(agent, request)
-    
+
+    # The same row /verify/natural_language writes, plus the agent id.
+    # AgentActivity is neither chained nor signed, so it is not the audit
+    # record (#477).
+    dr = _enforce_trust(
+        _natural_language_diagnostic(result),
+        query=request.query,
+        engine="natural_language",
+        admission=natural_language_admission,
+    )
+    admission = natural_language_admission(dr)
+    await asyncio.to_thread(_safe_commit_log, VerificationLog(
+        organization_id=agent.organization_id,
+        user_id=None,
+        query=request.query,
+        result=_cap_log_result({**dr.to_dict(), "agent_id": agent_id}),
+        is_verified=admission is AdmissionDecision.ADMIT,
+        domain="NATURAL_LANGUAGE",  # #520
+        admission=admission.value,  # #307
+    ))
+    # The enforced verdict with its admission, as /verify/natural_language
+    # returns: not the control plane's raw dict, which a failed attestation
+    # would not have blocked (#320).
+    response = _merge_response(dr)
+    response["admission"] = admission.value
+
     # 4. Log activity
     latency = (time.time() - start_time) * 1000
     agent_registry.log_activity(
         session, agent_id, agent.organization_id,
         "verification_request",
         f"Query: {request.query}",
-        result.get("status", "unknown"),
+        dr.status.value,
         input_data=request.query,
-        output_data=json.dumps(result),
+        output_data=json.dumps(response, default=str),
         cost=0.01,  # Placeholder cost
         latency_ms=latency
     )
-    
-    return result
+
+    return response
 
 @app.post("/agents/{agent_id}/tools/{tool_name}")
 async def agent_tool_call(
@@ -1990,53 +1906,13 @@ async def agent_tool_call(
         "result": result
     }
 
-@app.get("/agents/{agent_id}/activity")
-async def get_agent_activity(
-    agent_id: int,
-    limit: int = 20,
-    x_agent_token: str = Header(...),
-    session: Session = Depends(get_session)
-):
-    """
-    Get activity log for an agent.
-    Provides full audit trail.
-    """
-    # Authenticate agent
-    agent = agent_registry.authenticate_agent(session, x_agent_token)
-    if not agent or agent.id != agent_id:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
-    
-    # Get activity
-    statement = select(AgentActivity).where(
-        AgentActivity.agent_id == agent_id
-    ).order_by(AgentActivity.timestamp.desc()).limit(limit)
-    
-    activities = session.execute(statement).scalars().all()
-    
-    return {
-        "agent_id": agent_id,
-        "agent_name": agent.name,
-        "total_activities": len(activities),
-        "current_cost_today": agent.current_cost_today,
-        "max_cost_per_day": agent.max_cost_per_day,
-        "activities": [
-            {
-                "type": act.activity_type,
-                "description": act.description,
-                "status": act.status,
-                "cost": act.cost,
-                "timestamp": act.timestamp.isoformat()
-            }
-            for act in activities
-        ]
-    }
 # Append to main.py - Consensus Verification Endpoint
 
 # ============================================================
 # ENHANCED VERIFICATION ENDPOINTS (Phase 2B)
 # ============================================================
 
-from qwed_new.core.consensus_verifier import consensus_verifier, VerificationMode
+from qwed_new.core.consensus_verifier import NO_INDEPENDENT_VERIFICATION, consensus_verifier, VerificationMode
 
 class ConsensusVerifyRequest(BaseModel):
     query: str
@@ -2060,7 +1936,8 @@ async def verify_with_consensus(
     Multi-engine consensus verification.
     
     Verification modes:
-    - "single": Fast, single engine (default)
+    - "single": Fast, single engine (default). One engine is not a
+      consensus, so an answer it verifies alone is BLOCKED (#320).
     - "high": 2 engines for higher confidence
     - "maximum": 3+ engines for critical domains (medical, financial)
     
@@ -2095,12 +1972,12 @@ async def verify_with_consensus(
             "Consensus verification: blocked — secure execution",
             developer_fields={"agreement_status": result.agreement_status, "confidence": result.confidence, "engines_used": result.engines_used},
         )
-        dr = _enforce_trust(dr, query=request.query)
+        dr = _enforce_trust(dr, query=request.query, engine="consensus")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=request.query,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="CONSENSUS"
         )
         _safe_commit_log(log)
@@ -2112,28 +1989,30 @@ async def verify_with_consensus(
             "Consensus verification: all engines blocked",
             developer_fields={"agreement_status": result.agreement_status, "confidence": result.confidence, "engines_used": result.engines_used},
         )
-        dr = _enforce_trust(dr, query=request.query)
+        dr = _enforce_trust(dr, query=request.query, engine="consensus")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=request.query,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="CONSENSUS"
         )
         _safe_commit_log(log)
         return _merge_response(dr)
 
-    if result.confidence < request.min_confidence:
+    # An answer one engine verified alone is BLOCKED, whatever the
+    # confidence (#320).
+    if result.confidence < request.min_confidence and result.agreement_status != NO_INDEPENDENT_VERIFICATION:
         dr = DiagnosticResult.unverifiable(
             f"Confidence ({result.confidence:.1%}) below required minimum ({request.min_confidence:.1%})",
             developer_fields={"agreement_status": result.agreement_status, "confidence": result.confidence, "engines_used": result.engines_used, "min_confidence": request.min_confidence},
         )
-        dr = _enforce_trust(dr, query=request.query)
+        dr = _enforce_trust(dr, query=request.query, engine="consensus")
         log = VerificationLog(
             organization_id=tenant.organization_id,
             query=request.query,
             result=_cap_log_result(dr.to_dict()),
-            is_verified=dr.is_authoritative,
+            is_verified=claim_verified(dr),
             domain="CONSENSUS"
         )
         _safe_commit_log(log)
@@ -2142,13 +2021,13 @@ async def verify_with_consensus(
     # Convert consensus result via its own to_diagnostic_result() method —
     # it handles proof_ref, attestation evidence, and DiagnosticStatus mapping.
     dr = result.to_diagnostic_result()
-    dr = _enforce_trust(dr, query=request.query)
+    dr = _enforce_trust(dr, query=request.query, engine="consensus")
 
     log = VerificationLog(
         organization_id=tenant.organization_id,
         query=request.query,
         result=_cap_log_result(dr.to_dict()),
-        is_verified=dr.is_authoritative,
+        is_verified=claim_verified(dr),
         domain="CONSENSUS"
     )
     _safe_commit_log(log)
@@ -2172,100 +2051,46 @@ async def verify_with_consensus(
             for r in result.verification_chain
         ],
         "total_latency_ms": round(result.total_latency_ms, 2),
-        # TRUE only when consensus is both VERIFIED at the trust boundary AND
-        # confidence meets the threshold — never confidence alone (#269).
-        "meets_requirement": dr.is_verified and result.confidence >= request.min_confidence,
+        # TRUE only when the consensus is verified as claim_verified decides
+        # it AND the confidence meets the threshold, never confidence alone
+        # (#269). The SDK reads this as the result's is_verified, so it agrees
+        # with the attestation and the audit row (#577): a consensus is reached
+        # on the model's translation of the query (#585), and has no is_valid,
+        # so it does not meet the requirement.
+        "meets_requirement": claim_verified(dr) and result.confidence >= request.min_confidence,
     }
     return _merge_response(dr) | response
 # --- Enterprise Security Endpoints (Week 2) ---
 
-from qwed_new.core.compliance_exporter import ComplianceExporter
+from qwed_new.api.compliance_routes import FOREIGN_ORG_DETAIL as _FOREIGN_ORG_DETAIL, compliance_exporter
 from qwed_new.core.threat_detector import threat_detector
 from qwed_new.core.key_rotation import key_manager
 from qwed_new.auth.roles import ROLE_RANK
+from qwed_new.api.admin_auth import AdminContext, require_admin_role
 
-compliance_exporter = ComplianceExporter()
 
-
-# Shared across the admin handlers so the message lives in one place.
-_FOREIGN_ORG_DETAIL = "Cannot access another organization's data"
 # Role hierarchy for admin operations (higher number = more privilege); one
 # ranking shared with the user-session routes (#478).
 _ROLE_RANK = ROLE_RANK
 
 
-# Liveness for admin endpoints is the same rule the tenant boundary enforces;
-# import the one shared implementation (qwed_new.auth.security.is_api_key_live)
-# rather than keeping a second copy here (#389).
-_api_key_is_live = is_api_key_live
-
-
-class AdminContext:
-    """The authenticated principal for an admin endpoint: the API key, its owning
-    user (which carries the role) and the organization both are scoped to."""
-
-    def __init__(self, api_key: ApiKey, user: User):
-        self.api_key = api_key
-        self.user = user
-        self.organization_id = api_key.organization_id
-        self.role = user.role
-
-
-def require_admin_role(allowed_roles: list[str]):
-    """Dependency for admin endpoints (#222). get_api_key authenticates the key;
-    this authorizes it by the owning user's role. It replaces the old
-    @require_role decorator, which read request.state.user — never populated, so
-    every admin endpoint returned 401 (dead code). The returned AdminContext
-    carries organization_id so the handler can scope the action to the caller's
-    own org and never act on a caller-supplied id for another tenant (IDOR).
-
-    Fails closed before granting admin access: the key must be live (not expired
-    or revoked), the owning user must be active and in the key's own organization
-    (so a key cannot borrow a role from another tenant), the organization must be
-    active, and the role must be allowed."""
-
-    def dependency(
-        api_key: ApiKey = Depends(get_api_key),
-        session: Session = Depends(get_session),
-    ) -> AdminContext:
-        if not _api_key_is_live(api_key):
-            raise HTTPException(status_code=403, detail="API key is expired or revoked")
-        user = session.get(User, api_key.user_id) if api_key.user_id else None
-        if user is None or not user.is_active or user.organization_id != api_key.organization_id:
-            raise HTTPException(status_code=403, detail="API key is not authorized for admin operations")
-        org = session.get(Organization, api_key.organization_id)
-        if org is None or not org.is_active:
-            raise HTTPException(status_code=403, detail="Organization is not active")
-        if user.role not in allowed_roles:
-            raise HTTPException(status_code=403, detail="Insufficient permissions for this operation")
-        return AdminContext(api_key, user)
-
-    return dependency
+# AdminContext and require_admin_role live in api/admin_auth.py (#485).
 
 
 # Module-level dependency singletons (avoids calling require_admin_role in
 # argument defaults — Ruff B008 — and builds each dependency once).
-_REQUIRE_ADMIN = Depends(require_admin_role(["owner", "admin"]))
 _REQUIRE_ADMIN_OR_MEMBER = Depends(require_admin_role(["owner", "admin", "member"]))
+# Also a signed-in user: compliance (#485), threat summary (#506), key rotation (#505).
+_REQUIRE_ADMIN_OR_SESSION = Depends(require_admin_role(["owner", "admin"], allow_session=True))
+_REQUIRE_MEMBER_OR_SESSION = Depends(require_admin_role(["owner", "admin", "member"], allow_session=True))
 _FOREIGN_ORG_RESPONSE = {403: {"description": _FOREIGN_ORG_DETAIL}}
 
-
-@app.get("/admin/compliance/export/csv", tags=["Compliance"], responses=_FOREIGN_ORG_RESPONSE)
-async def export_audit_csv(
-    organization_id: int,
-    ctx: AdminContext = _REQUIRE_ADMIN,
-):
-    """Export audit trail as CSV (admin, own organization only)."""
-    if organization_id != ctx.organization_id:
-        raise HTTPException(status_code=403, detail=_FOREIGN_ORG_DETAIL)
-    csv_data = compliance_exporter.export_audit_trail_csv(organization_id)
-    return Response(content=csv_data, media_type="text/csv")
 
 @app.get("/admin/compliance/verify/{log_id}", tags=["Compliance"],
          responses={404: {"description": "Audit log entry not found"}})
 async def verify_audit_log_entry(
     log_id: int,
-    ctx: AdminContext = _REQUIRE_ADMIN,
+    ctx: AdminContext = _REQUIRE_ADMIN_OR_SESSION,
     session: Session = Depends(get_session)
 ):
     """
@@ -2280,20 +2105,32 @@ async def verify_audit_log_entry(
     verifier = AuditLogger()
     return verifier.verify_log_entry(log_id, session)
 
-@app.get("/admin/compliance/report/soc2/{org_id}", tags=["Compliance"], responses=_FOREIGN_ORG_RESPONSE)
+@app.get(
+    "/admin/compliance/report/soc2/{org_id}",
+    tags=["Compliance"],
+    summary="Security activity summary",
+    responses=_FOREIGN_ORG_RESPONSE,
+)
 async def generate_soc2_report(
     org_id: int,
-    ctx: AdminContext = _REQUIRE_ADMIN,
+    ctx: AdminContext = _REQUIRE_ADMIN_OR_SESSION,
 ):
-    """Generate SOC 2 Type II compliance report (own organization only)."""
+    """Security activity summary for the caller's organisation (own organisation only).
+
+    Activity counts and a check of the audit trail over the last 90 days,
+    all computed from the server's records (#476). It is not a SOC 2 report;
+    the path keeps its old name for compatibility.
+    """
     if org_id != ctx.organization_id:
         raise HTTPException(status_code=403, detail=_FOREIGN_ORG_DETAIL)
-    return compliance_exporter.generate_soc2_report(org_id)
+    # Off the event loop: the audit check verifies every entry in the period,
+    # with database queries per entry, so a large trail would stall the worker.
+    return await asyncio.to_thread(compliance_exporter.generate_soc2_report, org_id)
 
 @app.get("/admin/security/threats/{org_id}", tags=["Security"], responses=_FOREIGN_ORG_RESPONSE)
 async def get_threat_summary(
     org_id: int,
-    ctx: AdminContext = _REQUIRE_ADMIN,
+    ctx: AdminContext = _REQUIRE_ADMIN_OR_SESSION,
 ):
     """Get real-time threat summary (own organization only)."""
     if org_id != ctx.organization_id:
@@ -2305,7 +2142,7 @@ async def get_threat_summary(
                      404: {"description": "Key not found"}})
 async def rotate_api_key(
     key_id: int,
-    ctx: AdminContext = _REQUIRE_ADMIN_OR_MEMBER,
+    ctx: AdminContext = _REQUIRE_MEMBER_OR_SESSION,
     session: Session = Depends(get_session)
 ):
     """Rotate an API key and return the new secret once.
@@ -2392,6 +2229,7 @@ async def startup_security_tasks():
 # ============================================================
 
 from qwed_new.core.batch import batch_service, BatchCapacityError
+from qwed_new.api.batch_audit import batch_audit_hook
 from typing import List
 
 class BatchVerifyRequest(BaseModel):
@@ -2450,8 +2288,12 @@ async def batch_verify(
         raise HTTPException(status_code=503, detail="Batch capacity reached — retry shortly.") from None
     
     # Process synchronously (for simplicity)
-    # For very large batches, return job_id and process async
-    job = await batch_service.process_job(job)
+    # For very large batches, return job_id and process async.
+    # Every item appends its audit row; an item whose append fails is
+    # returned as failed, without its result (#477).
+    job = await batch_service.process_job(job, audit=batch_audit_hook(
+        tenant, commit_log=_safe_commit_log, cap_result=_cap_log_result, max_chars=_MAX_LOG_RESULT_CHARS,
+    ))
     
     # Return results
     return batch_service.get_job_results(job.job_id)

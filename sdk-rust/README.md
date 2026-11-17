@@ -11,7 +11,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-qwed = "7.3.0"
+qwed = "10.0.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -42,12 +42,51 @@ Every verification returns the server's DiagnosticResult envelope:
 | `raw_status` | The server's status text exactly as sent, such as `SAT` where `status` is `Unknown`; never used for admission |
 | `admission` | `Some(Admit)` or `Some(Blocked)` where the endpoint decides; `None` where it does not |
 | `proof_ref` | Set only when `status` is `Verified` |
+| `attestation` | On a `Verified` answer, the server's signed token: an ES256 JWT whose header `kid` names a key at `GET /.well-known/jwks.json`, and whose `qwed.proof_hash` claim is the answer's `proof_ref`. Verify it with `client.verify_attestation` (below). |
 | `agent_message`, `developer_fields`, `is_authoritative`, `constraint_id` | Explanation and detail |
 | `extra` | Endpoint-specific fields, such as `is_valid` or `issues` |
 
 **Gate on `is_admitted()`, not on `status`.** `Verified` means the engine reached a deterministic answer, not that the claim holds: `2 + 2 = 5` is `Verified` (proven false) with admission `Blocked`, and unsafe code is `Verified` (proven unsafe) and `Blocked`. `is_admitted()` is true only for `Admit` together with `Verified` and a `proof_ref`; a missing or unknown admission is never admitted.
 
-Endpoints that make no admission decision (`/verify/logic`, `/verify/fact`, `/verify/rag`, `/verify/process` and batch items today) are therefore never admitted. `/verify/rag` and `/verify/process` also send a `verified` field, which is their guard's own result, not an admission; it is in `extra["verified"]` and `developer_fields`. The deprecated `is_verified()` returns `is_admitted()`.
+Endpoints that make no admission decision (`/verify/fact`, `/verify/rag`, `/verify/process`, and batch fact items) are therefore never admitted. `/verify/logic` and batch logic items decide one as `/verify/natural_language` does: their verdict covers the constraints an LLM translated the question into, so the admission is `Blocked` until QWED verifies the translation itself ([#585](https://github.com/QWED-AI/qwed-verification/issues/585)). `/verify/rag` and `/verify/process` return `Unverifiable`: what their guards check comes from the request itself, so the guard's result is advisory only, in `developer_fields.advisory_checks` ([#320](https://github.com/QWED-AI/qwed-verification/issues/320)). An older server also sent the guard's result as a `verified` field, which is not an admission; it is in `extra["verified"]` and `developer_fields`. The deprecated `is_verified()` returns `is_admitted()`.
+
+### Verifying the attestation
+
+Every `Verified` answer carries `attestation`, an ES256 JWT the server
+signed after checking the verdict. Verifying it shows that server issued a
+VERIFIED verdict for this answer's `proof_ref` (and, when you pass the
+query, for that statement). On a route that decides an admission (maths,
+code, SQL and natural language, the agent route, and their batch items), the
+token signs that too, and
+`verify_attestation` checks it is the answer's `admission`. It covers only
+what the token signs, not other fields of the response such as
+`agent_message`:
+
+```rust
+use qwed::{AttestationError, AttestationOptions};
+
+let result = client.verify_math("2+2=4").await?;
+// Fetches /.well-known/jwks.json (cached for five minutes), then checks the
+// signature, issuer, expiry (and any nbf), a VERIFIED status, and that the
+// token is this answer's (its proof_hash is result.proof_ref). If no cached
+// key verifies it, the keys are fetched once more, at most once every 30 s,
+// to pick up a rotated key or a restarted server's new one.
+match client.verify_attestation(&result, &AttestationOptions::new().query("2+2=4")).await {
+    Ok(claims) => println!("attested by {}", claims.iss),
+    Err(error) => println!("attestation does not verify for this answer: {error}"),
+}
+```
+
+`AttestationError::KeysUnavailable` says the keys could not be fetched; that
+failure is returned to every caller for 30 seconds after the fetch ends,
+without another request (a token the cached keys do not verify gets it too),
+and keys past their five minutes are not used instead. To verify offline, or
+against keys you pinned, call `qwed::verify_attestation(token, &jwks,
+proof_ref, &options)` with the JWKS you hold (`options.admission(...)` checks
+the admission too; for an answer without one, `qwed::check_admission(&claims,
+None)` requires that the token signs none). A token says the server reached
+the verdict; whether to act on it is still `is_admitted()`. The checks use
+the RustCrypto `p256` crate.
 
 ## Verification Methods
 
@@ -67,7 +106,8 @@ let result = client.verify_math("x**2 + 2*x + 1 = (x+1)**2").await?;
 
 ```rust
 let result = client.verify_logic("(AND (GT x 5) (LT y 10))").await?;
-// /verify/logic makes no admission decision, so is_admitted() is false.
+// The verdict covers the translated constraints only: admission is Blocked,
+// so is_admitted() is false.
 ```
 
 ### Code Security
@@ -153,6 +193,10 @@ Err(Error::Auth) => eprintln!("Invalid API key"),
 | `VerificationResponse` | The DiagnosticResult envelope, with `is_admitted()` |
 | `BatchResponse`, `BatchResult` | A batch job and its items; each item (`BatchResult`) has `is_admitted()` |
 | `Error` | Error enum with Http, Auth, RateLimit, Api and Serialization variants |
+| `AttestationOptions` | How to verify an attestation: `AttestationOptions::new()`, then `.query(...)`, `.issuer(...)`, `.leeway(...)` |
+| `AttestationClaims` | A verified token's claims: `iss`, `sub`, `iat`, `exp`, `nbf`, `jti` and `qwed` (`QwedClaims`, with the attested `AttestedResult`) |
+| `AttestationError` | Why an attestation was not accepted: `Rejected`, `KeyMismatch` (fetching the keys again may help) or `KeysUnavailable` |
+| `Jwks`, `Jwk` | A server's public keys, read from `/.well-known/jwks.json` or from JSON you hold |
 
 ## Async Runtime
 

@@ -35,6 +35,19 @@ except ImportError:
     sys.exit(1)
 
 from qwed_new.core.security import redact_pii
+from qwed_sdk.cli_model import (
+    OLLAMA_DEFAULT_BASE_URL,
+    PROVIDER_KEY_ENV as _PROVIDER_KEY_ENV,
+    PROVIDER_MODEL_ENV as _PROVIDER_MODEL_ENV,
+    exit_without_model as _exit_without_model,
+    from_command_line as _from_command_line,
+    load_saved_env as _load_saved_env,
+    model_or_variable as _model_or_variable,
+    normalized_provider as _normalized_provider,
+    require_provider_model as _require_provider_model,
+    saved_provider as _saved_provider,
+)
+from qwed_sdk.init_owner import resolve_owner, signup_failure
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +65,6 @@ def cli():
 
 SEPARATOR = "-" * 41
 ANTHROPIC_CLAUDE_LABEL = "Anthropic Claude"
-OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 SQLITE_URL_PREFIX = "sqlite:///"
 SQLITE_MEMORY_URL = f"{SQLITE_URL_PREFIX}:memory:"
 DEFAULT_DATABASE_URL = f"{SQLITE_URL_PREFIX}./qwed.db"
@@ -100,7 +112,6 @@ class OnboardingProvider:
     key_env: str
     model_env: str
     base_url_env: Optional[str]
-    default_model: str
     default_base_url: Optional[str]
     connection_slug: Optional[str]
     key_pattern: Optional[str] = None
@@ -164,7 +175,6 @@ def _build_onboarding_provider_map(get_provider) -> Dict[str, OnboardingProvider
             key_env="CUSTOM_API_KEY",
             model_env="CUSTOM_MODEL",
             base_url_env="CUSTOM_BASE_URL",
-            default_model="nvidia/nemotron-3-super-120b-a12b",
             default_base_url="https://integrate.api.nvidia.com/v1",
             connection_slug="openai-compatible",
             key_pattern=None,
@@ -176,7 +186,6 @@ def _build_onboarding_provider_map(get_provider) -> Dict[str, OnboardingProvider
             key_env="OPENAI_API_KEY",
             model_env="OPENAI_MODEL",
             base_url_env=None,
-            default_model="gpt-4o-mini",
             default_base_url=None,
             connection_slug="openai",
             key_pattern=key_patterns.get("openai"),
@@ -188,7 +197,6 @@ def _build_onboarding_provider_map(get_provider) -> Dict[str, OnboardingProvider
             key_env="ANTHROPIC_API_KEY",
             model_env="ANTHROPIC_MODEL",
             base_url_env=None,
-            default_model="claude-sonnet-4-20250514",
             default_base_url=None,
             connection_slug="anthropic",
             key_pattern=key_patterns.get("anthropic"),
@@ -200,7 +208,6 @@ def _build_onboarding_provider_map(get_provider) -> Dict[str, OnboardingProvider
             key_env="GOOGLE_API_KEY",
             model_env="GEMINI_MODEL",
             base_url_env=None,
-            default_model="gemini-1.5-pro",
             default_base_url=None,
             connection_slug="gemini",
             key_pattern=None,
@@ -212,7 +219,6 @@ def _build_onboarding_provider_map(get_provider) -> Dict[str, OnboardingProvider
             key_env="CUSTOM_API_KEY",
             model_env="CUSTOM_MODEL",
             base_url_env="CUSTOM_BASE_URL",
-            default_model="gpt-4o-mini",
             default_base_url="https://api.openai.com/v1",
             connection_slug="openai-compatible",
             key_pattern=key_patterns.get("openai-compatible"),
@@ -429,6 +435,8 @@ def _ensure_local_server_running(
     runtime_dir = _resolve_server_runtime_dir()
 
     env = os.environ.copy()
+    # The server never needs the owner's password (#524): signup sends it.
+    env.pop("QWED_OWNER_PASSWORD", None)
     src = _src_path()
     current_pythonpath = env.get("PYTHONPATH", "")
     if src not in current_pythonpath.split(os.pathsep):
@@ -482,15 +490,28 @@ def _ensure_local_server_running(
     return False, True
 
 
-def _bootstrap_api_key(server_url: str, organization_name: str) -> tuple[str, str]:
+def _bootstrap_api_key(
+    server_url: str,
+    organization_name: str,
+    owner: Optional[tuple[str, str]] = None,
+) -> tuple[str, str]:
+    """Sign up the organisation and create its first API key.
+
+    ``owner`` is the owner's email and password (#524), so the owner can sign
+    in later. Without it the owner gets a generated email and password that
+    are never shown or saved: nobody can sign in to that organisation.
+    """
     import httpx
 
     base = server_url.rstrip("/")
-    org_slug = _sanitize_org_slug(organization_name)
-    # An email local part may be at most 64 characters; "-<8 hex>" uses 9.
-    local_slug = org_slug[:_MAX_EMAIL_SLUG].rstrip("-") or "qwed-org"
-    email = f"{local_slug}-{secrets.token_hex(4)}@example.com"
-    password = secrets.token_urlsafe(24)
+    if owner is not None:
+        email, password = owner
+    else:
+        org_slug = _sanitize_org_slug(organization_name)
+        # An email local part may be at most 64 characters; "-<8 hex>" uses 9.
+        local_slug = org_slug[:_MAX_EMAIL_SLUG].rstrip("-") or "qwed-org"
+        email = f"{local_slug}-{secrets.token_hex(4)}@example.com"
+        password = secrets.token_urlsafe(24)
     signup_payload = {
         "email": email,
         "password": password,
@@ -509,7 +530,7 @@ def _bootstrap_api_key(server_url: str, organization_name: str) -> tuple[str, st
                     raise RuntimeError(f"Signup failed: {_safe_json_detail(signup_resp.text)}")
                 organization_name = fallback_org
             else:
-                raise RuntimeError(f"Signup failed: {detail}")
+                raise RuntimeError(signup_failure(detail, owner is not None))
 
         token = signup_resp.json().get("access_token")
         if not token:
@@ -786,11 +807,8 @@ def _resolve_provider_credentials(
     if not resolved_key and not non_interactive:
         resolved_key = click.prompt(f"{profile.name} API key", hide_input=True).strip()
     if not resolved_model and not non_interactive:
-        resolved_model = click.prompt(
-            f"{profile.name} default model",
-            default=profile.default_model,
-            show_default=True,
-        ).strip()
+        # No default: QWED names no model, so the user types one.
+        resolved_model = click.prompt(f"{profile.name} default model").strip()
 
     return resolved_key, resolved_base_url, resolved_model
 
@@ -858,7 +876,8 @@ def _resolve_provider_base_url(
 
 
 def _resolve_provider_model(profile: OnboardingProvider, model: Optional[str]) -> str:
-    return (model or os.getenv(profile.model_env) or profile.default_model).strip()
+    # A blank --model is no model, as for qwed verify: the variable's is used.
+    return (model or "").strip() or (os.getenv(profile.model_env) or "").strip()
 
 
 def _validate_provider_credentials(
@@ -955,9 +974,11 @@ def _prompt_retry_credentials(
         ).strip()
     updated_model = click.prompt(
         f"{profile.name} default model",
-        default=resolved_model or profile.default_model,
+        default=resolved_model or None,
         show_default=True,
     ).strip()
+    # A blank answer leaves no model: stop before a retry could save it.
+    _require_provider_model(profile, updated_model)
     return updated_key, updated_base_url, updated_model
 
 
@@ -1227,6 +1248,7 @@ def _start_server_and_bootstrap(
     lookup_secret: str,
     organization_name: str,
     secrets_fresh: bool,
+    owner: Optional[tuple[str, str]] = None,
 ) -> tuple[str, str]:
     """Start (or reuse) the local server, guard stale secrets, bootstrap a key.
 
@@ -1286,7 +1308,7 @@ def _start_server_and_bootstrap(
     click.echo("  [ok] Server identity verified")
 
     try:
-        qwed_api_key, actual_org_name = _bootstrap_api_key(normalized_server_url, organization_name)
+        qwed_api_key, actual_org_name = _bootstrap_api_key(normalized_server_url, organization_name, owner)
     except Exception as exc:
         logger.exception("API key bootstrap failed")
         click.echo(f"  [x] API key bootstrap failed: {exc}", err=True)
@@ -1295,6 +1317,13 @@ def _start_server_and_bootstrap(
     click.echo("  [ok] Organization created")
     if actual_org_name != organization_name:
         click.echo(f"  [ok] Organization alias used: {actual_org_name}")
+    if owner is not None:
+        click.echo(f"  [ok] Owner: {owner[0]} (sign in with the password you set)")
+    else:
+        click.echo("  Warning: No owner email was given, so nobody can sign in to this organisation.")
+        click.echo("    Its records cannot be read in qwed-dashboard. An owner who can sign in is")
+        click.echo("    named only when an organisation is created: running init again with")
+        click.echo("    --owner-email creates a new organisation; it does not recover these records.")
     return qwed_api_key, actual_org_name
 
 
@@ -1310,6 +1339,12 @@ def _start_server_and_bootstrap(
 @click.option("--base-url", default=None, help="Base URL for custom/openai-compatible providers.")
 @click.option("--model", default=None, help="Default model for provider.")
 @click.option("--organization-name", default=None, help="Organization name for local API key bootstrap.")
+@click.option(
+    "--owner-email",
+    default=None,
+    help="Email of the organisation's owner, to sign in later (e.g. to qwed-dashboard). "
+    "The password is prompted for, or read from QWED_OWNER_PASSWORD with --non-interactive.",
+)
 @click.option("--server-url", default="http://localhost:8000", show_default=True, help="Local QWED server URL.")
 @click.option("--non-interactive", is_flag=True, help="Run without prompts (CI-friendly).")
 @click.option("--skip-tests", is_flag=True, help="Skip deterministic verification smoke tests.")
@@ -1319,6 +1354,7 @@ def init(
     base_url: Optional[str],
     model: Optional[str],
     organization_name: Optional[str],
+    owner_email: Optional[str],
     server_url: str,
     non_interactive: bool,
     skip_tests: bool,
@@ -1401,6 +1437,7 @@ def init(
             non_interactive=non_interactive,
             validate_key_format=validate_key_format,
         )
+        _require_provider_model(profile, resolved_model)
         resolved_key, resolved_base_url, resolved_model = _test_provider_connection_loop(
             profile=profile,
             resolved_key=resolved_key,
@@ -1431,6 +1468,7 @@ def init(
 
     try:
         organization_name = _resolve_organization_name(organization_name, non_interactive)
+        owner = resolve_owner(owner_email, non_interactive)
         normalized_server_url = _normalize_local_server_url(server_url)
     except RuntimeError as exc:
         click.echo(redact_pii(str(exc)), err=True)
@@ -1446,6 +1484,7 @@ def init(
         lookup_secret=lookup_secret,
         organization_name=organization_name,
         secrets_fresh=not all(had_secrets_before_init.values()),
+        owner=owner,
     )
 
     click.echo(f"\n  Your API key: {qwed_api_key}")
@@ -1523,14 +1562,6 @@ def _provider_connection_profile(active_provider: str) -> dict:
             "base_url_env": None,
             "default_base_url": None,
         },
-        "claude_opus": {
-            "label": ANTHROPIC_CLAUDE_LABEL,
-            "connection_slug": "anthropic",
-            "key_env": "ANTHROPIC_API_KEY",
-            "model_env": "ANTHROPIC_MODEL",
-            "base_url_env": None,
-            "default_base_url": None,
-        },
         "gemini": {
             "label": "Google Gemini",
             "connection_slug": "gemini",
@@ -1568,10 +1599,7 @@ def _provider_connection_profile(active_provider: str) -> dict:
 
 
 def _normalized_active_provider_key() -> str:
-    active_provider = os.getenv("ACTIVE_PROVIDER", "ollama").strip().lower().replace("-", "_")
-    if active_provider == "openai_compatible":
-        return "openai_compat"
-    return active_provider
+    return _normalized_provider(os.getenv("ACTIVE_PROVIDER", "ollama"))
 
 
 def _resolve_provider_env_values(profile: dict) -> tuple[str, str, str]:
@@ -2103,63 +2131,35 @@ def verify(query: str, provider: Optional[str], model: Optional[str],
         import os
         os.environ["QWED_QUIET"] = "1"
     
-    # Load .env file so credentials from qwed init are available
-    from qwed_new.config import load_dotenv_ordered
-    load_dotenv_ordered()
-    
+    # The .env files qwed init writes, without the server's settings.
+    _load_saved_env()
+
+    model_env = None
+    key_hint = "Set QWED_API_KEY env var or use --api-key"
     try:
-        # Auto-detect provider/base_url from ACTIVE_PROVIDER
+        # The provider `qwed init` saved (ACTIVE_PROVIDER), with its endpoint and key.
+        # It gets only a key given with --api-key: the option also reads
+        # QWED_API_KEY, which may be the QWED server's key.
         if not provider and not base_url:
-            import os as _os
-            active = _os.getenv("ACTIVE_PROVIDER", "").strip()
-            if active == "ollama" or not active:
-                # Use Ollama (LOCAL): respect user-configured env vars
-                base_url = _os.getenv("OLLAMA_BASE_URL", OLLAMA_DEFAULT_BASE_URL)
-                model = model or _os.getenv("OLLAMA_MODEL", "llama3")
-                if HAS_COLOR and not quiet:
-                    click.echo(f"{QWED.INFO}\u2139\ufe0f  Using Ollama at {base_url}{QWED.RESET}")
-            elif active == "openai-compatible" or active == "openai_compat":
-                base_url = _os.getenv("CUSTOM_BASE_URL", "")
-                if not base_url:
-                    err_msg = (
-                        f"{QWED.ERROR}ERROR: CUSTOM_BASE_URL is required for openai-compatible provider{QWED.RESET}"
-                        if HAS_COLOR
-                        else "ERROR: CUSTOM_BASE_URL is required for openai-compatible provider"
-                    )
-                    click.echo(err_msg, err=True)
-                    click.echo("Set CUSTOM_BASE_URL env var or run: qwed init", err=True)
-                    sys.exit(1)
-                api_key = api_key or _os.getenv("CUSTOM_API_KEY", "")
-                model = model or _os.getenv("CUSTOM_MODEL", "gpt-4o-mini")
-                if HAS_COLOR and not quiet:
-                    click.echo(f"{QWED.INFO}\u2139\ufe0f  Using configured provider: {active}{QWED.RESET}")
-            else:
-                # Named provider (openai, anthropic, etc.)
-                provider = active
-                provider_key_env = {
-                    "openai": "OPENAI_API_KEY",
-                    "anthropic": "ANTHROPIC_API_KEY",
-                    "gemini": "GOOGLE_API_KEY",
-                }
-                provider_model_env = {
-                    "openai": "OPENAI_MODEL",
-                    "anthropic": "ANTHROPIC_MODEL",
-                    "gemini": "GEMINI_MODEL",
-                }
-                if not api_key:
-                    env_key = provider_key_env.get(provider, "QWED_API_KEY")
-                    api_key = _os.getenv(env_key, _os.getenv("QWED_API_KEY", ""))
-                if not model:
-                    model_env = provider_model_env.get(provider, "")
-                    model = _os.getenv(model_env, model) if model_env else model
-                if HAS_COLOR and not quiet:
-                    click.echo(f"{QWED.INFO}INFO: Using configured provider: {active}{QWED.RESET}")
+            explicit_key = _from_command_line("api_key", api_key)
+            provider, base_url, api_key, model_env, notice = _saved_provider(explicit_key)
+            if provider:
+                key_hint = f"Set {' or '.join(_PROVIDER_KEY_ENV[provider])} or use --api-key"
+            if HAS_COLOR and not quiet:
+                click.echo(f"{QWED.INFO}{notice}{QWED.RESET}")
+
+        # QWED names no model: it is --model, else the selected provider's
+        # model variable, and with neither the command stops.
+        if provider and not base_url:
+            model_env = _PROVIDER_MODEL_ENV.get(provider)
+        model = _model_or_variable(model, model_env)
         
         # Create client
         if base_url:
+            _exit_without_model(model, model_env)
             client = QWEDLocal(
                 base_url=base_url,
-                model=model or "llama3",
+                model=model,
                 api_key=api_key or None,
                 cache=not no_cache,
                 mask_pii=mask_pii
@@ -2167,13 +2167,14 @@ def verify(query: str, provider: Optional[str], model: Optional[str],
         elif provider:
             if not api_key:
                 click.echo(f"{QWED.ERROR}ERROR: API key required for {provider}{QWED.RESET}", err=True)
-                click.echo("Set QWED_API_KEY env var or use --api-key", err=True)
+                click.echo(key_hint, err=True)
                 sys.exit(1)
+            _exit_without_model(model, model_env)
             
             client = QWEDLocal(
                 provider=provider,
                 api_key=api_key,
-                model=model or "gpt-3.5-turbo",
+                model=model,
                 cache=not no_cache,
                 mask_pii=mask_pii
             )
@@ -2252,20 +2253,30 @@ def interactive(provider: Optional[str], model: Optional[str]):
         click.echo("\nQWED Interactive Mode")
         click.echo("Type 'exit' or 'quit' to quit\n")
     
+    # QWED names no model: it is --model, else the provider's model variable.
+    # Without --provider, the provider is the one `qwed init` saved
+    # (ACTIVE_PROVIDER), as for qwed verify. Both may be in its .env file.
+    _load_saved_env()
+    saved = None if provider else _saved_provider()
+    model_env = _PROVIDER_MODEL_ENV.get(provider) if provider else saved.model_env
+    model = _model_or_variable(model, model_env)
+    _exit_without_model(model, model_env)
+    if saved and HAS_COLOR:
+        click.echo(f"{QWED.INFO}{saved.notice}{QWED.RESET}")
+
     # Create client once
     try:
-        if provider:
-            api_key = click.prompt("API Key", hide_input=True)
+        if provider or saved.provider:
             client = QWEDLocal(
-                provider=provider,
-                api_key=api_key,
-                model=model or "gpt-3.5-turbo"
+                provider=provider or saved.provider,
+                api_key=(saved and saved.api_key) or click.prompt("API Key", hide_input=True),
+                model=model
             )
         else:
-            # Default to Ollama
             client = QWEDLocal(
-                base_url=OLLAMA_DEFAULT_BASE_URL,
-                model=model or "llama3"
+                base_url=saved.base_url,
+                model=model,
+                api_key=saved.api_key or None
             )
     except Exception as e:
         click.echo(f"Error initializing client: {e}", err=True)
@@ -2407,25 +2418,103 @@ _CONTEXT_MALFORMED_DIAGNOSTIC_CONSTRAINT = "verification_context.malformed_diagn
 
 @cli.group()
 def context():
-    """Verification Context v1.0 utilities."""
+    """Verification Context utilities (spec v1.0 and v1.1)."""
     pass
+
+
+def _context_attestation_options(command):
+    """The options validate and resolve take to check a document's
+    attestation (#319)."""
+    command = click.option(
+        "--require-attestation/--no-require-attestation", default=True,
+        help="Require an attestation that verifies and signs this document (default). "
+             "--no-require-attestation checks the schema or proof_ref alone.",
+    )(command)
+    command = click.option(
+        "--server", default=None,
+        help="QWED server URL whose keys (/.well-known/jwks.json) verify the attestation.",
+    )(command)
+    return click.option(
+        "--jwks-file", default=None, type=click.Path(exists=True, dir_okay=False),
+        help="JWKS file whose keys verify the attestation, for offline or pinned keys.",
+    )(command)
+
+
+def _context_attestation_refusal(document: Any, jwks_file: Optional[str], server: Optional[str]) -> Optional[str]:
+    """Why ``document``'s attestation is refused, or None if it verifies
+    with the keys given and signs this document (spec v1.1 section 4)."""
+    import httpx
+
+    from qwed_sdk.attestation import (
+        AttestationError,
+        JWKS_PATH,
+        document_attestation,
+        verify_document_attestation,
+    )
+
+    if document_attestation(document) is None:
+        return "attestation_required"
+    if not jwks_file and not server:
+        # The document is signed, but nothing here can check whose key.
+        return "attestation_keys_required"
+    try:
+        if jwks_file:
+            with open(jwks_file, encoding="utf-8") as handle:
+                jwks = json.load(handle)
+        else:
+            response = httpx.get(f"{server.rstrip('/')}{JWKS_PATH}", timeout=10.0)
+            response.raise_for_status()
+            jwks = response.json()
+    # InvalidURL (a malformed --server) is neither an HTTPError nor a
+    # ValueError, and a JWKS nested too deeply to parse raises
+    # RecursionError (#523 review).
+    except (OSError, ValueError, httpx.HTTPError, httpx.InvalidURL, RecursionError):
+        return "attestation_keys_unavailable"
+    try:
+        verify_document_attestation(document, jwks)
+    except AttestationError:
+        return "attestation_invalid"
+    return None
+
+
+def _check_key_options(jwks_file: Optional[str], server: Optional[str]) -> None:
+    """Refuse both key sources at once, whether or not the attestation is
+    required, so the usage error does not depend on another flag (#523
+    review)."""
+    if jwks_file and server:
+        raise click.UsageError("pass --jwks-file or --server, not both")
+
+
+def _load_context_document(path: str, failure: Dict[str, Any]) -> Any:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    # RecursionError: a document nested too deeply for the JSON parser is
+    # an unreadable file too, not a traceback (#523 review).
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        click.echo(json.dumps({**failure, "error": "invalid_document_file"}, indent=2))
+        raise SystemExit(1) from None
 
 
 @context.command(name="validate")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False))
-def context_validate(path: str):
-    """Validate a Verification Context document."""
+@_context_attestation_options
+def context_validate(path: str, jwks_file: Optional[str], server: Optional[str], require_attestation: bool):
+    """Validate a Verification Context document.
+
+    By default its attestation must verify, with the keys of --jwks-file or
+    --server, and sign this document (#319).
+    """
     from qwed_new.core.verification_context import (
         VerificationContextValidationError,
         validate_document,
     )
 
-    try:
-        with open(path, encoding="utf-8") as handle:
-            document = json.load(handle)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        click.echo(json.dumps({"valid": False, "error": "invalid_document_file"}, indent=2))
-        raise SystemExit(1) from None
+    _check_key_options(jwks_file, server)
+    document = _load_context_document(path, {"valid": False})
+    if require_attestation and (refusal := _context_attestation_refusal(document, jwks_file, server)):
+        click.echo(json.dumps({"valid": False, "error": refusal}, indent=2))
+        raise SystemExit(1)
     try:
         validate_document(document)
     except VerificationContextValidationError:
@@ -2436,16 +2525,20 @@ def context_validate(path: str):
 
 @context.command(name="resolve")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False))
-def context_resolve(path: str):
-    """Resolve the proof_ref commitment for a Verification Context document."""
+@_context_attestation_options
+def context_resolve(path: str, jwks_file: Optional[str], server: Optional[str], require_attestation: bool):
+    """Resolve the proof_ref commitment for a Verification Context document.
+
+    A proof_ref is a commitment anyone can compute; by default the
+    document's attestation must also verify and sign it, as for validate.
+    """
     from qwed_new.core.verification_context import resolve_document_proof_ref
 
-    try:
-        with open(path, encoding="utf-8") as handle:
-            document = json.load(handle)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        click.echo(json.dumps({"resolved": False, "error": "invalid_document_file"}, indent=2))
-        raise SystemExit(1) from None
+    _check_key_options(jwks_file, server)
+    document = _load_context_document(path, {"resolved": False})
+    if require_attestation and (refusal := _context_attestation_refusal(document, jwks_file, server)):
+        click.echo(json.dumps({"resolved": False, "error": refusal}, indent=2))
+        raise SystemExit(1)
     click.echo(json.dumps({"resolved": resolve_document_proof_ref(document)}, indent=2))
 
 

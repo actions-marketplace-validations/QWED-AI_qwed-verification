@@ -47,6 +47,16 @@ fn an_ambiguous_expression_is_blocked() {
 }
 
 #[test]
+fn a_verified_answer_carries_its_attestation_in_the_typed_field() {
+    // #319: the token is an envelope field, not an endpoint one; a BLOCKED
+    // answer has none.
+    let verified = response("math_verified");
+    assert!(verified.attestation.as_deref().is_some_and(|t| !t.is_empty()));
+    assert!(!verified.extra.contains_key("attestation"));
+    assert!(response("math_ambiguous").attestation.is_none());
+}
+
+#[test]
 fn safe_code_is_admitted_and_unsafe_code_is_not() {
     let safe = response("code_safe");
     assert_eq!(safe.status, VerificationStatus::Verified);
@@ -75,14 +85,18 @@ fn unverifiable_natural_language_is_not_admitted() {
 }
 
 #[test]
-fn responses_without_an_admission_are_not_admitted() {
-    // /verify/logic and /verify/fact make no admission decision.
+fn a_logic_response_is_blocked_like_a_natural_language_one() {
+    // /verify/logic decides admission as /verify/natural_language does (#320).
     let logic = response("logic");
     assert_eq!(logic.status, VerificationStatus::Blocked);
-    assert_eq!(logic.admission, None);
+    assert_eq!(logic.admission, Some(Admission::Blocked));
     assert!(logic.extra["error"].is_string());
     assert!(!logic.is_admitted());
+}
 
+#[test]
+fn responses_without_an_admission_are_not_admitted() {
+    // /verify/fact makes no admission decision.
     let fact = response("fact");
     assert_eq!(fact.status, VerificationStatus::Unverifiable);
     assert_eq!(fact.admission, None);
@@ -101,9 +115,18 @@ fn a_batch_job_and_its_items_parse() {
         .iter()
         .map(|item| item.result.as_ref().unwrap().status.clone())
         .collect();
-    assert_eq!(statuses, [VerificationStatus::Verified, VerificationStatus::Unverifiable]);
+    // Both are decided: the second is proven false, as on /verify/math (#530).
+    assert_eq!(statuses, [VerificationStatus::Verified, VerificationStatus::Verified]);
     assert_eq!(batch.items[0].item_type.as_deref(), Some("math"));
 
-    // Batch math items carry no admission decision today, so none is admitted.
-    assert!(batch.items.iter().all(|item| !item.is_admitted()));
+    // Batch math items carry the admission /verify/math decides: the proven
+    // identity is admitted, the disproven one is not.
+    let admissions: Vec<_> = batch
+        .items
+        .iter()
+        .map(|item| item.result.as_ref().unwrap().admission.clone())
+        .collect();
+    assert_eq!(admissions, [Some(Admission::Admit), Some(Admission::Blocked)]);
+    let admitted: Vec<_> = batch.items.iter().map(|item| item.is_admitted()).collect();
+    assert_eq!(admitted, [true, false]);
 }

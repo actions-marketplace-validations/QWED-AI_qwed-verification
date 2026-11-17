@@ -30,6 +30,7 @@ Framework Integrations:
 """
 
 from qwed_sdk.client import QWEDClient, QWEDAsyncClient
+from qwed_sdk.attestation import AttestationError, verify_attestation, verify_document_attestation
 from qwed_sdk.qwed_local import QWEDLocal  # NEW!
 from qwed_sdk.models import (
     VerificationResult,
@@ -56,10 +57,13 @@ from qwed_new.core.verification_context import (
     is_valid_document,
 )
 
-__version__ = "7.3.0"
+__version__ = "10.0.0"
 __all__ = [
     "QWEDClient",
     "QWEDAsyncClient",
+    "AttestationError",
+    "verify_attestation",
+    "verify_document_attestation",
     "QWEDLocal",  # NEW!
     "VerificationResult",
     "BatchResult",
